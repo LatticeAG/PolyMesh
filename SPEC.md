@@ -1,712 +1,1222 @@
-# PolyMesh Protocol Specification
+# PolyMesh Protocol Specification v0.1.0
 
-> **Version:** 0.1.0 (Draft)  
-> **Status:** Proposal  
-> **Type:** Protocol Standard  
-> **Repository:** github.com/mosesman831/polymesh  
-> **Tags:** `agent-to-agent`, `protocol`, `discovery`, `messaging`, `local-first`
+> **Status:** Draft Specification  
+> **Type:** Protocol Standard (local agent-to-agent communication)  
+> **Repository:** https://github.com/mosesman831/polymesh  
+> **Version:** 0.1.0  
+> **Tags:** `agent-to-agent`, `protocol`, `messaging`, `local-first`, `distributed-systems`
 
 ---
 
 ## Abstract
 
-PolyMesh is a lightweight, open protocol for local agent-to-agent communication. It enables heterogeneous AI agents — Hermes, Claude Code, Codex, custom agents — to discover each other, declare capabilities, send structured messages, and delegate tasks without a central authority, blockchain, or global registry.
+PolyMesh is a lightweight, open protocol for local agent-to-agent communication. It enables heterogeneous AI agents — Hermes, Codex, Claude Code, custom agents — to discover each other on the same machine or LAN, declare capabilities, exchange structured messages, delegate tasks, and coordinate without a central authority, blockchain, or global registry.
 
-The protocol is transport-agnostic but defines WebSocket as the mandatory baseline transport. Agent identity is self-asserted (no PKI). Capabilities are declared via a standard Agent Card schema. Messages follow a JSON-RPC-inspired envelope with delivery semantics.
+This specification defines:
 
-PolyMesh is **not a product**. It is a specification that any agent can implement in ~200 lines of code.
+1. **Message Envelope & Wire Format** — JSON-based, JSON-RPC inspired, with strict validation
+2. **Agent Card Schema** — Self-describing capability declaration with JSON Schema typed I/O
+3. **Task Lifecycle** — Submit → accept/reject → progress → complete/cancel with at-least-once delivery
+4. **Transport Binding** — WebSocket (loopback/LAN) and Unix domain sockets (local)
+5. **Discovery** — Local registry via Unix socket, LAN via mDNS, HTTP as optional hint
+6. **Security Model** — OS-authenticated local sessions, capability authorization, resource limits
+7. **Error Taxonomy** — Structured, machine-readable error codes with retry semantics
+8. **Reference Implementation** — TypeScript @polymesh/broker + @polymesh/client (~300 LOC)
+
+PolyMesh is **not a product**. It is a specification that any agent can implement in ~300 lines of code.
 
 ---
 
 ## Table of Contents
 
-1. [Motivation](#1-motivation)
-2. [Design Goals](#2-design-goals)
-3. [Non-Goals](#3-non-goals)
-4. [Protocol Overview](#4-protocol-overview)
-5. [Agent Card](#5-agent-card)
-6. [Message Envelope](#6-message-envelope)
-7. [Discovery](#7-discovery)
-8. [Connection Lifecycle](#8-connection-lifecycle)
-9. [Task Delegation](#9-task-delegation)
-10. [Delivery Semantics](#10-delivery-semantics)
-11. [Transport Binding: WebSocket](#11-transport-binding-websocket)
-12. [Security Model](#12-security-model)
-13. [Implementation Guide](#13-implementation-guide)
-14. [Reference Implementation](#14-reference-implementation)
-15. [FAQ](#15-faq)
+1. [Design Goals & Non-Goals](#1-design-goals--non-goals)
+2. [Core Protocol: Message Envelope](#2-core-protocol-message-envelope)
+3. [Message Types & Behavior](#3-message-types--behavior)
+4. [Task Lifecycle & State Machine](#4-task-lifecycle--state-machine)
+5. [Delivery Semantics & Idempotency](#5-delivery-semantics--idempotency)
+6. [Agent Card Schema](#6-agent-card-schema)
+7. [Capability Vocabulary](#7-capability-vocabulary)
+8. [Discovery & Transport Binding](#8-discovery--transport-binding)
+9. [Security Model & Authentication](#9-security-model--authentication)
+10. [Error Taxonomy](#10-error-taxonomy)
+11. [Reference Implementation Architecture](#11-reference-implementation-architecture)
+12. [Edge Cases & Required Behaviors](#12-edge-cases--required-behaviors)
+13. [Appendix: JSON Schema](#13-appendix-json-schema)
+14. [Appendix: Standard Capability Definitions](#14-appendix-standard-capability-definitions)
 
 ---
 
-## 1. Motivation
+## 1. Design Goals & Non-Goals
 
-In mid-2026, the AI agent ecosystem is fragmented. A developer may simultaneously run:
+### Goals
 
-- A **Hermes Agent** instance for personal automation (calendar, email, file ops)
-- A **Codex** or **Claude Code** CLI for coding tasks
-- An **OpenCode** instance for parallel builds
-- A **custom agent** built for a specific domain (research, monitoring, etc.)
+| Priority | Goal | Rationale |
+|----------|------|-----------|
+| P0 | **Local-first** | Agents on same machine/LAN discover and talk without internet, DNS, or cloud |
+| P0 | **Zero-config discovery** | Start an agent → it announces itself → becomes reachable. No config files |
+| P0 | **Framework-agnostic** | Any agent in any language can implement. No SDK lock-in |
+| P0 | **Self-describing** | Every agent publishes an Agent Card declaring identity, capabilities, and endpoints |
+| P0 | **Simple wire format** | JSON-based. A developer can craft a valid message by hand |
+| P1 | **Standard capability vocabulary** | Shared capability names so agents understand each other |
+| P1 | **At-least-once delivery** | Messages acknowledged. Offline targets receive deferred notification |
+| P1 | **Deterministic task lifecycle** | Submit → accept/reject → progress → complete/cancel with strict state transitions |
+| P2 | **Opt-in remote** | Protocol works on localhost first. Internet routing is possible but only for advanced profiles |
 
-These agents operate in isolation. There is no standard way for them to:
-- Discover each other on the same machine or network
-- Ask "what can you do?"
-- Send a task with structured input and get a structured result back
-- Coordinate on multi-step workflows without human intervention
+### Non-Goals
 
-Existing solutions are over-engineered for local use:
-- **Blockchain/DLT-based registries** add latency, cost, and complexity for a problem that exists entirely within one developer's local network
-- **A2A (Agent-to-Agent) protocol** targets enterprise inter-org scenarios with full lifecycle management, suited for large-scale deployments
-- **MCP (Model Context Protocol)** is agent→tool, not agent→agent
-- **Custom glue code** creates brittle, non-reusable point solutions
-
-PolyMesh fills the gap between "nothing" and "a global ledger" — a simple, local-first protocol that any agent can implement in an afternoon.
-
----
-
-## 2. Design Goals
-
-| Goal | Priority | Rationale |
-|------|----------|-----------|
-| **Local-first** | P0 | Agents on the same machine or LAN should discover and talk to each other without internet, DNS, or cloud dependencies |
-| **Zero-config discovery** | P0 | An agent starts, announces itself, becomes reachable. No configuration files, no registries to join |
-| **Framework-agnostic** | P0 | Any agent written in any language can implement the protocol. No SDK lock-in |
-| **Self-describing** | P0 | Every agent publishes an Agent Card declaring its identity, capabilities, and how to reach it |
-| **Simple message envelope** | P0 | JSON-based, akin to JSON-RPC 2.0. A developer can craft a valid message by hand |
-| **Standard capability vocabulary** | P1 | A shared vocabulary of capability names so agents can say "I handle `calendar.read`" and be understood |
-| **At-least-once delivery** | P1 | Messages are acknowledged. If the target is offline, the sender is told |
-| **Opt-in remote** | P2 | The protocol works on localhost first. Public internet routing is defined but not mandatory |
-| **No crypto/blockchain** | P2 | Identity is self-asserted. No keys, no wallets, no gas fees |
+- **Global agent discovery** — No global registry. Agents find each other locally
+- **Cryptographic identity** — No PKI, no blockchain, no wallets. Identity is OS-authenticated on localhost, trust-on-first-use on LAN
+- **Payment / billing** — PolyMesh does not handle payments
+- **Workflow orchestration** — PolyMesh delivers messages. Workflow DAGs are a layer above
+- **Agent-to-tool** — MCP covers that. PolyMesh is agent-to-agent only
+- **Large file transfer** — Messages ≤1 MiB. Large files use side channels (HTTP download, presigned URLs) referenced within messages
+- **Exactly-once execution** — Not achievable across crashes without application-level coordination. The spec provides at-most-once admission and terminalization
 
 ---
 
-## 3. Non-Goals
+## 2. Core Protocol: Message Envelope
 
-- **Global agent discovery** — PolyMesh does not define a global registry. Agents find each other on localhost or the local network
-- **Cryptographic identity** — No PKI, no signing, no blockchain. Identity is trust-on-first-use within a trusted network
-- **Payment / billing** — PolyMesh does not handle payments. Use LexPay or x402 for that
-- **Workflow orchestration** — PolyMesh delivers messages. It does not define workflow DAGs. That's a layer above
-- **Agent-to-tool** — MCP already covers that. PolyMesh is agent-to-agent only
-- **Large file transfer** — Messages are ≤1MB. Large files use side channels (HTTP download, S3 presigned URLs) referenced in the message
+Every message is a JSON object with the following top-level fields. All fields except `in_reply_to` are REQUIRED unless noted.
 
----
-
-## 4. Protocol Overview
-
-Agents in a PolyMesh network communicate over WebSocket connections. The protocol has four phases:
-
-```
-PHASE 1: DISCOVERY
-  Agent A starts → announces via mDNS "_polymesh._tcp" → 
-    or polls HTTP discovery endpoint → 
-    or connects to a known broker URL
-
-PHASE 2: ADVERTISEMENT
-  Agent A sends its Agent Card to newly discovered peers →
-    "I am agent-a, I can do: calendar.read, calendar.write, email.send"
-    
-PHASE 3: MESSAGING
-  Agent B wants task X → looks up who can do X →
-    sends a Task message to Agent A →
-    Agent A processes and returns a Result message
-
-PHASE 4: INBOX (optional)
-  Agents that may be offline maintain a persistent inbox
-    (local file, VekInbox, or AgentMail) for deferred delivery
-```
-
----
-
-## 5. Agent Card
-
-Every agent publishes a JSON Agent Card describing itself. The card is the agent's identity and capability declaration.
-
-### Schema
+### 2.1 Base Envelope Schema
 
 ```json
 {
-  "protocol": "polymesh/0.1",
-  "agent_id": "string (unique identifier, e.g. hermes-bot)",
-  "display_name": "string (human-readable name)",
-  "version": "string (agent version)",
-  "capabilities": [
-    {
-      "name": "string (dotted capability name)",
-      "description": "string (what this capability does)",
-      "input_schema": { "type": "object", ... },
-      "output_schema": { "type": "object", ... }
-    }
-  ],
-  "endpoints": [
-    {
-      "transport": "ws",
-      "location": "ws://localhost:9854",
-      "priority": 0
-    }
-  ],
-  "metadata": {
-    "description": "string (free-text description of the agent)",
-    "tags": ["string"],
-    "icon": "string (emoji or URL)"
+  "protocol": "polymesh.0.1",
+  "type": "<message_type>",
+  "message_id": "0197a1b0-0000-7000-8000-000000000001",
+  "timestamp": "2026-07-17T12:00:00.000Z",
+  "source": {
+    "agent_id": "example-agent",
+    "instance_id": "base64url-128-bit-instance-id"
+  },
+  "target": {
+    "agent_id": "target-agent",
+    "instance_id": "base64url-128-bit-instance-id"
+  },
+  "delivery": {
+    "mode": "at_least_once",
+    "idempotency_key": "submit:task-uuid",
+    "deadline": "2026-07-17T12:10:00.000Z"
+  },
+  "in_reply_to": "<message_id this is a response to, OPTIONAL>",
+  "params": {}
+}
+```
+
+### 2.2 Field Constraints
+
+| Field | Constraint |
+|-------|-----------|
+| `protocol` | MUST be exactly `"polymesh.0.1"` |
+| `type` | One of the registered message types |
+| `message_id` | UUIDv7. Unique per sender. Time-ordered |
+| `timestamp` | RFC 3339 with milliseconds, UTC. Server monotonic clock is authoritative |
+| `source.agent_id` | Stable logical identity, reverse-DNS recommended (e.g., `com.example.my-agent`) |
+| `source.instance_id` | 128-bit cryptographically random, base64url-encoded. Changes on restart |
+| `target.agent_id` | Target agent identity. `"*"` reserved for future broadcast |
+| `target.instance_id` | OPTIONAL. When absent, routes to any instance of that agent_id |
+| `delivery.mode` | Only `"at_least_once"` in v0.1 |
+| `delivery.idempotency_key` | Opaque string. MUST be unique per (source, target, type) scope |
+| `delivery.deadline` | RFC 3339. The server's clock is authoritative. Client MUST NOT exceed this |
+
+### 2.3 Wire Framing
+
+On WebSocket transport, each message is a single JSON text frame. On Unix socket transport, messages are length-prefixed:
+
+```
+[4 bytes: big-endian uint32 payload length][UTF-8 JSON payload]
+```
+
+Maximum frame size: **1,048,576 bytes** (1 MiB).
+
+---
+
+## 3. Message Types & Behavior
+
+### 3.1 Message Type Catalog
+
+| Type | Direction | Semantics |
+|------|-----------|-----------|
+| `card` | Agent → peer | Capability snapshot. Sent on connect and on revision change |
+| `task.submit` | Owner → executor | Creates or replays a logical task |
+| `task.accepted` | Executor → owner | Durable admission. `event_seq=1` |
+| `task.rejected` | Executor → owner | Final pre-admission refusal. `event_seq=1` |
+| `task.progress` | Executor → owner | Optional non-terminal lifecycle event. `event_seq >= 2` |
+| `task.completed` | Executor → owner | Sole post-acceptance terminal event |
+| `task.cancel` | Owner → executor | Idempotent cancellation request |
+| `task.status` | Bidirectional | Query (owner→executor) and snapshot (executor→owner) |
+| `ping` | Bidirectional | Liveness check. Requires `pong` reply within 5 seconds |
+| `pong` | Bidirectional | Liveness response. MUST match ping sequence number |
+| `error` | Any → sender | Protocol, routing, delivery, or control failure |
+
+### 3.2 Card Exchange
+
+On connection establishment, agents exchange `card` messages:
+
+1. Initiator sends `card` after `hello`/`hello` handshake
+2. Responder validates card, sends its own `card`
+3. Both sides send `ready` to confirm
+4. Application messages are illegal until both `ready` frames exchanged
+
+A `card` message contains:
+```json
+{
+  "type": "card",
+  "params": {
+    "card": { /* AgentCard object */ },
+    "digest": "sha256-of-canonical-card"
   }
 }
 ```
 
-### Standard Capability Names
+### 3.3 task.submit
 
-PolyMesh defines a namespace convention for capability names:
-
-| Namespace | Example | Description |
-|-----------|---------|-------------|
-| `calendar.read` | `calendar.read` | Read calendar events |
-| `calendar.write` | `calendar.write` | Create/update calendar events |
-| `email.send` | `email.send` | Send email |
-| `email.read` | `email.read` | Read email inbox |
-| `file.read` | `file.read` | Read files from workspace |
-| `file.write` | `file.write` | Write files to workspace |
-| `shell.exec` | `shell.exec` | Execute shell commands |
-| `knowledge.query` | `knowledge.query` | Query knowledge base |
-| `web.search` | `web.search` | Search the web |
-| `code.review` | `code.review` | Review code changes |
-| `code.build` | `code.build` | Build a project |
-| `notify.send` | `notify.send` | Send a notification |
-| `agent.ping` | `agent.ping` | Liveness check (required) |
-| `agent.info` | `agent.info` | Return agent card (required) |
-
-Agents can define custom namespaced capabilities (`custom.*`). Unknown capabilities are ignored.
-
-### Agent Card Delivery
-
-Agent Cards are delivered:
-1. Automatically on WebSocket connection (server sends `card` message)
-2. On request via the `agent.info` capability
-3. Via HTTP discovery endpoint `GET /.well-known/polymesh` if HTTP transport is also enabled
-
----
-
-## 6. Message Envelope
-
-All messages follow a standard JSON envelope:
+Creates a task. The owner generates `task_id` (UUIDv7) and retains it until retention expiry.
 
 ```json
 {
-  "type": "string (message type)",
-  "id": "string (unique message ID, UUIDv7)",
-  "timestamp": "ISO 8601 timestamp",
-  "source": "string (agent_id of sender)",
-  "target": "string (agent_id of recipient, or 'broadcast')",
-  "thread": "string (conversation thread ID, optional)",
-  "reply_to": "string (message ID this is a reply to, optional)",
-  "payload": {}
+  "type": "task.submit",
+  "params": {
+    "task_id": "0197a1b0-0000-7000-8000-000000000001",
+    "method": "org.polymesh.calendar.read",
+    "params": { /* capability-specific input */ },
+    "deadline": "2026-07-17T12:10:00.000Z"
+  }
 }
 ```
 
-### Message Types
+Rules:
+- `method` MUST match an advertised capability
+- Executor MUST validate `params` against capability `input_schema` before accepting
+- Deadline is immutable across retries
+- Owner MUST NOT alter method, parameters, task_id, or idempotency_key on retry
 
-| Type | Direction | Payload | Description |
-|------|-----------|---------|-------------|
-| `card` | server→client | `AgentCard` | Server announces its capabilities |
-| `task` | client→server | `{capability, input, metadata}` | Request a task to be performed |
-| `progress` | server→client | `{status, progress_pct, message}` | Intermediate progress update |
-| `result` | server→client | `{capability, output, error?, metadata}` | Task completed (success or failure) |
-| `ping` | any→any | `{}` | Liveness check |
-| `pong` | any→any | `{}` | Liveness response |
-| `error` | any→any | `{code, message, data?}` | Protocol error |
+### 3.4 task.accepted
 
-### Task Message Example
+Durable admission. The executor persists the task state, idempotency key, and deadline before emitting this.
 
 ```json
 {
-  "type": "task",
-  "id": "019f6e19-36a4-7c51-a3ed-58ea61d050ee",
-  "timestamp": "2026-07-17T12:00:00Z",
-  "source": "hermes-moses",
-  "target": "mom-agent",
-  "thread": "calendar-coordination-001",
-  "payload": {
-    "capability": "calendar.read",
-    "input": {
-      "date": "2026-07-21",
-      "person": "moses"
+  "type": "task.accepted",
+  "in_reply_to": "<submit message_id>",
+  "params": {
+    "task_id": "0197a1b0-...",
+    "event_seq": 1,
+    "accepted_at": "2026-07-17T12:00:01.000Z"
+  }
+}
+```
+
+An accepted task MUST eventually produce exactly one `task.completed` terminal event.
+
+### 3.5 task.rejected
+
+Final refusal. Non-retryable. MUST NOT be followed by `task.accepted` or `task.completed`.
+
+```json
+{
+  "type": "task.rejected",
+  "in_reply_to": "<submit message_id>",
+  "params": {
+    "task_id": "0197a1b0-...",
+    "event_seq": 1,
+    "code": "UNSUPPORTED_CAPABILITY",
+    "message": "Agent does not implement org.polymesh.calendar.read"
+  }
+}
+```
+
+### 3.6 task.progress
+
+Optional, advisory. Signals intermediate state.
+
+```json
+{
+  "type": "task.progress",
+  "params": {
+    "task_id": "0197a1b0-...",
+    "event_seq": 2,
+    "progress": {
+      "current": 1,
+      "total": 5,
+      "status": "querying google calendar API",
+      "state": "running"
+    }
+  }
+}
+```
+
+MUST follow `task.accepted`, precede terminal record, and have `event_seq >= 2`.
+
+### 3.7 task.completed
+
+Terminal event. Exactly one permitted. Uses `outcome` field for the result type:
+
+```json
+{
+  "type": "task.completed",
+  "params": {
+    "task_id": "0197a1b0-...",
+    "event_seq": 3,
+    "terminal": {
+      "outcome": "succeeded",
+      "result": { "free_slots": [] },
+      "completed_at": "2026-07-17T12:00:05.000Z"
+    }
+  }
+}
+```
+
+Terminal outcomes:
+- `succeeded` — requires `result` field
+- `failed` — requires `error` with code and message
+- `cancelled` — requires `cancellation` with code
+
+### 3.8 task.cancel
+
+Idempotent cancellation request:
+
+```json
+{
+  "type": "task.cancel",
+  "params": {
+    "task_id": "0197a1b0-...",
+    "reason": "deadline approaching, initiating fallback"
+  }
+}
+```
+
+- Only the authenticated submitter may cancel by default
+- Executor MUST persist accepted cancellation intent before transport receipt
+- If cancellation arrives before matching submit, store cancellation tombstone
+- Terminal outcome `cancelled` confirms cancellation
+
+### 3.9 task.status
+
+Two shapes:
+- **Query:** `{"kind": "query", "task_id": "..."}`
+- **Snapshot:** `{"kind": "snapshot", ...}` plus `in_reply_to`
+
+Snapshot reflects one persisted task state at `observed_at`.
+
+### 3.10 ping/pong
+
+```json
+{"type": "ping", "params": {"n": 41}}
+{"type": "pong", "params": {"n": 41}}
+```
+
+Sent every 30 seconds during active sessions. Any valid inbound frame refreshes liveness.
+
+---
+
+## 4. Task Lifecycle & State Machine
+
+```
+                     SUBMITTED (owner-local only)
+                         |
+                         | task.submit received
+                         v
+                    NO_RECORD
+                    /        \
+                   /          \
+        permanent refusal     durable admission
+             |                      |
+             v                      v
+         REJECTED               ACCEPTED
+         event_seq=1            event_seq=1
+                                     |
+                          +----------+----------+
+                          |          |          |
+                          v          v          v
+                       QUEUED    RUNNING    WAITING
+                       event_seq >= 2 (task.progress)
+                          |          |          |
+                          +----------+----------+
+                                     |
+                          +----------+----------+
+                          |          |          |
+                          v          v          v
+                     SUCCEEDED   FAILED    CANCELLED
+                     outcome:    outcome:  outcome:
+                     "succeeded" "failed"  "cancelled"
+```
+
+### State Machine Rules
+
+1. `REJECTED`, `SUCCEEDED`, `FAILED`, `CANCELLED` are terminal states
+2. Exactly one event may occupy a `(task_id, event_seq)` pair
+3. Accepted/rejected events always use `event_seq: 1`
+4. Every progress event increments event sequence monotonically
+5. Terminal event sequence MUST exceed all progress sequence numbers
+6. Consumers MUST deduplicate lifecycle events by `(task_id, event_seq)`, not envelope `message_id`
+7. A terminal event may arrive before delayed accepted/progress events. Consumers MUST NOT regress from a terminal state
+
+---
+
+## 5. Delivery Semantics & Idempotency
+
+### 5.1 Delivery Mode
+
+v0.1 supports only `"at_least_once"`. Messages are retried until acknowledged or deadline expiry.
+
+### 5.2 Deduplication Key
+
+The deduplication key is constructed from:
+
+```text
+(authenticated_source_instance_id,
+ authenticated_target_instance_id,
+ protocol,
+ message_type,
+ delivery.idempotency_key)
+```
+
+### 5.3 Semantic Fingerprint
+
+For each idempotency key, the receiver stores a fingerprint:
+
+```text
+SHA-256(JCS({
+  protocol, type, source, target,
+  delivery: { mode, deadline },
+  params
+}))
+```
+
+Where JCS = JSON Canonicalization Scheme (RFC 8785).
+
+### 5.4 Deduplication Behavior
+
+| Condition | Required Response |
+|-----------|------------------|
+| Same key, same fingerprint | Replay canonical outcome (duplicate delivery) |
+| Same key, different fingerprint | `PMX.DELIVERY.IDEMPOTENCY_CONFLICT` |
+| Same task_id, same immutable task, different submit key | Replay existing task state |
+| Same task_id, different method/input/deadline | `PMX.TASK.ID_CONFLICT` |
+
+### 5.5 Retention Requirements
+
+| Record | Minimum Retention |
+|--------|-------------------|
+| Idempotency key | 24 hours |
+| Active task state | Through task deadline |
+| Terminal records + results | `max(deadline, completed_at) + idempotency_retention_ms` (≥24h) |
+| Cancellation tombstones | Same as idempotency retention |
+
+### 5.6 Durable Inbox/Outbox Pattern
+
+Implementations SHOULD use:
+
+1. Persist inbound deduplication state
+2. Persist task state transition and canonical event
+3. Persist outbound event in outbox
+4. Only then issue durable transport receipt
+5. Retry outbox events until receipt or retention expiry
+
+---
+
+## 6. Agent Card Schema
+
+### 6.1 Full Schema
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "card_version", "agent_id", "instance_id",
+    "issued_at", "expires_at", "revision",
+    "capabilities"
+  ],
+  "properties": {
+    "card_version": {
+      "const": "1.0",
+      "description": "Schema version of the card itself"
+    },
+    "agent_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z][a-zA-Z0-9._-]*$",
+      "description": "Stable logical identifier, reverse-DNS recommended (e.g. com.example.my-agent)"
+    },
+    "instance_id": {
+      "type": "string",
+      "description": "128-bit random, base64url-encoded. Changes on each process restart"
+    },
+    "display_name": {
+      "type": "string",
+      "description": "Human-readable name. Presentation only"
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this card version was issued"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this card expires. MUST be later than issued_at"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing per-instance. Higher value replaces older cards"
+    },
+    "endpoints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Endpoint" },
+      "description": "List of reachable endpoints"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Capability" },
+      "minItems": 1,
+      "description": "At minimum MUST include org.polymesh.agent.ping and org.polymesh.agent.info"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits",
+      "description": "Advisory resource limits"
     },
     "metadata": {
-      "priority": "normal",
-      "timeout_seconds": 30
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "icon": { "type": "string" }
+      },
+      "description": "Free-form metadata"
+    }
+  },
+  "$defs": {
+    "Endpoint": {
+      "type": "object",
+      "required": ["transport", "url", "scope"],
+      "properties": {
+        "transport": { "type": "string", "enum": ["websocket", "unix"] },
+        "url": { "type": "string", "format": "uri" },
+        "scope": { "type": "string", "enum": ["loopback", "lan", "remote"] },
+        "security": { "type": "string", "enum": ["none", "token", "mutual"], "default": "none" }
+      }
+    },
+    "Capability": {
+      "type": "object",
+      "required": ["id", "version"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)*\\.[a-zA-Z][a-zA-Z0-9._-]*$",
+          "description": "Reverse-DNS capability identifier (e.g. org.polymesh.calendar.read)"
+        },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "description": { "type": "string" },
+        "input_schema": { "$ref": "https://json-schema.org/draft/2020-12/schema" },
+        "result_schema": { "$ref": "https://json-schema.org/draft/2020-12/schema" },
+        "idempotency": {
+          "type": "string",
+          "enum": ["pure", "idempotent", "sensitive"],
+          "default": "idempotent"
+        },
+        "side_effects": {
+          "type": "string",
+          "enum": ["none", "read", "write", "network", "approval"],
+          "default": "none"
+        },
+        "approval": {
+          "type": "string",
+          "enum": ["never", "always", "threshold"],
+          "default": "never"
+        },
+        "cancellation": {
+          "type": "string",
+          "enum": ["none", "best_effort", "supported"],
+          "default": "none"
+        },
+        "timeout_ceiling_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 300
+        }
+      }
+    },
+    "Limits": {
+      "type": "object",
+      "properties": {
+        "max_task_timeout_ms": { "type": "integer", "default": 300000 },
+        "max_tasks_per_principal": { "type": "integer", "default": 4 },
+        "max_input_bytes": { "type": "integer", "default": 262144 },
+        "max_result_bytes": { "type": "integer", "default": 1048576 }
+      }
     }
   }
 }
 ```
 
-### Result Message Example
+### 6.2 Card Exchange Protocol
+
+1. On connection, after `hello/hello` handshake, initiator sends `card` message with full card
+2. Responder validates: revision > cached, signatures match agent_id, expires_at in future
+3. Responder sends its own `card`
+4. Both sides send `ready` confirming mutual card receipt
+5. Cards are re-sent when revision changes
+6. Cards expire at `expires_at`; peers request refresh if still connected
+7. A card with `revision <= cached` is ignored
+
+### 6.3 Card Comparison Rules
+
+| Condition | Interpretation |
+|-----------|---------------|
+| Same `agent_id`, same `instance_id` | Same agent instance. Card revision may update |
+| Same `agent_id`, different `instance_id` | New instance (restart). Clear task state, re-authenticate |
+| Different `agent_id` | Different agent. Route accordingly |
+| Same `agent_id`, `revision` not strictly increasing | Protocol violation |
+
+---
+
+## 7. Capability Vocabulary
+
+### 7.1 Namespace Convention
+
+All capabilities use reverse-DNS notation:
+
+```text
+<org>.<domain>.<name>[.<sub>]
+```
+
+Standard namespace: `org.polymesh.*`
+Vendor namespaces: `com.<vendor>.*`, `io.<vendor>.*`
+Private/experimental: `custom.*`
+
+### 7.2 Required Standard Capabilities
+
+Every PolyMesh agent MUST implement:
+
+| Capability ID | Description |
+|---------------|-------------|
+| `org.polymesh.agent.ping` | Required. Liveness check. Input: `{}`. Result: `{}` |
+| `org.polymesh.agent.info` | Required. Returns full Agent Card. Input: `{}`. Result: `AgentCard` |
+| `org.polymesh.capabilities.list` | Required. Returns list of capabilities for current connection. Input: `{}`. Result: `[{id, version}]` |
+
+### 7.3 Standard Capability Definitions
+
+| ID | Description | Input | Result | Idempotency | Side Effect |
+|----|-------------|-------|--------|-------------|-------------|
+| `org.polymesh.agent.ping` | Liveness check | `{}` | `{}` | pure | none |
+| `org.polymesh.agent.info` | Get Agent Card | `{}` | `AgentCard` | pure | none |
+| `org.polymesh.capabilities.list` | List capabilities | `{}` | `[{id, version}]` | pure | none |
+| `org.polymesh.calendar.read` | Read calendar events | `{range: {from, to}, page_size?}` | `{events, next_cursor}` | pure | read |
+| `org.polymesh.calendar.write` | Create/update events | `{event}` | `{event_id}` | idempotent | write |
+| `org.polymesh.email.send` | Send email | `{to, subject, body}` | `{message_id}` | sensitive | network |
+| `org.polymesh.email.read` | Read inbox | `{folder, limit}` | `{messages}` | pure | read |
+| `org.polymesh.file.read` | Read file | `{path}` | `{content, size}` | pure | read |
+| `org.polymesh.file.write` | Write file | `{path, content}` | `{size}` | idempotent | write |
+| `org.polymesh.shell.exec` | Execute command | `{command, args, cwd, timeout}` | `{stdout, stderr, exit_code}` | sensitive | write |
+| `org.polymesh.knowledge.query` | Query knowledge base | `{query, limit}` | `{results}` | pure | read |
+| `org.polymesh.web.search` | Search web | `{query, limit}` | `{results}` | pure | network |
+| `org.polymesh.code.review` | Review code | `{diff, context}` | `{comments}` | pure | read |
+| `org.polymesh.code.build` | Build project | `{target, config}` | `{output, success}` | idempotent | write |
+| `org.polymesh.notify.send` | Send notification | `{channel, message}` | `{delivered}` | idempotent | network |
+| `org.polymesh.file.search` | Search files | `{pattern, root}` | `{matches}` | pure | read |
+| `org.polymesh.process.list` | List processes | `{}` | `{processes}` | pure | read |
+| `org.polymesh.mcp.execute` | Forward MCP tool call | `{tool, args}` | `{result}` | idempotent | network |
+
+---
+
+## 8. Discovery & Transport Binding
+
+### 8.1 Session Handshake
+
+Every transport connection begins with a deterministic 4-frame handshake before any application traffic:
+
+```
+Initiator A                              Responder B
+-----------                              -----------
+transport connected
+HELLO ---------------------------------->>
+                                         validate version/shape
+<<---------------------------------- HELLO
+CARD ---------------------------------->>
+                                         validate A's card
+<<---------------------------------- CARD
+READY ---------------------------------->>
+                                         validate transcript
+<<---------------------------------- READY
+ACTIVE                                     ACTIVE
+```
+
+**hello frame (initiator):**
+```json
+{
+  "type": "hello",
+  "v": "0.1",
+  "role": "initiator",
+  "agent_id": "agent-a",
+  "instance_id": "base64url-128-bit-id",
+  "nonce": "base64url-32-byte-nonce"
+}
+```
+
+**hello frame (responder):**
+```json
+{
+  "type": "hello",
+  "v": "0.1",
+  "role": "responder",
+  "agent_id": "agent-b",
+  "instance_id": "base64url-128-bit-id",
+  "nonce": "base64url-32-byte-nonce",
+  "echo": "initiator-nonce",
+  "sid": "derived-session-id"
+}
+```
+
+The session ID is derived as:
+
+```text
+sid = base64url(SHA-256("polymesh.0.1\0" || initiator_nonce || responder_nonce))
+```
+
+**card frame:**
+```json
+{
+  "type": "card",
+  "sid": "derived-session-id",
+  "for_nonce": "peer-nonce",
+  "digest": "sha256-of-canonical-card",
+  "card": { /* Agent Card */ }
+}
+```
+
+**ready frame:**
+```json
+{
+  "type": "ready",
+  "sid": "derived-session-id",
+  "self_card": "own-card-digest",
+  "peer_card": "peer-card-digest"
+}
+```
+
+Application messages are illegal until both `ready` frames exchanged.
+
+### 8.2 Local Transport (Unix Domain Sockets)
+
+For same-machine discovery, agents use Unix domain sockets under `$XDG_RUNTIME_DIR`:
+
+```
+$XDG_RUNTIME_DIR/polymesh/
+├── registry.sock          # Discovery registry (not a broker)
+└── agents/
+    └── pm-<random-128-bit-id>.sock  # Agent's direct data socket
+```
+
+**Requirements:**
+- `R` and `R/agents`: mode `0700`, owned by current UID
+- Socket files: mode `0600`
+- If `XDG_RUNTIME_DIR` is missing, unsafe, or wrong-owner: discovery unavailable. NO fallback to `/tmp`
+- Peer credential verification (`SO_PEERCRED` on Linux, `getpeereid` on BSD) MUST confirm same UID
+
+**Registry RPCs** (same framing, distinct from agent-to-agent messages):
+
+| Operation | Payload | Description |
+|-----------|---------|-------------|
+| `register` | `{agent_id, instance_id, socket, card_digest?}` | Register with lease (120s default) |
+| `renew` | `{lease_id}` | Renew registration (30s interval) |
+| `unregister` | `{lease_id}` | Remove registration |
+| `lookup` | `{agent_id}` | Get live agent endpoint |
+| `list` | `{}` | List all registered agents |
+| `watch` | — | Stream add/update/remove events |
+
+### 8.3 WebSocket Transport (LAN)
+
+WebSocket handshake:
+
+```
+GET /polymesh HTTP/1.1
+Host: host:port
+Upgrade: websocket
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Protocol: polymesh.0.1
+```
+
+Server responds with `101 Switching Protocols` and subprotocol `polymesh.0.1`.
+
+After upgrade, the standard PolyMesh session handshake runs immediately.
+
+**Pre-upgrade responses:**
+
+| Condition | Response |
+|-----------|----------|
+| Malformed | 400 |
+| Wrong path | 404 |
+| Policy denial | 403 |
+| Bad subprotocol | 426 |
+| Rate limited | 429 |
+| Temp unavailable | 503 + `Retry-After` |
+
+### 8.4 mDNS/DNS-SD Discovery (LAN)
+
+Service type: `_polymesh._tcp.local.`
+
+TXT records are deliberately minimal:
+- `v=0.1` (required)
+- `id=<agent_id>` (required)
+- `tls=1` (optional, indicates WSS)
+
+**NO cards, capabilities, secrets, or paths in TXT records.**
+
+Publish TTL: 120 seconds. Send TTL-0 goodbye on clean shutdown.
+
+### 8.5 HTTP Discovery Endpoint (Optional)
+
+```
+GET /.well-known/polymesh
+Accept: application/polymesh+json
+```
+
+Response (a hint only — NOT an Agent Card):
+```json
+{
+  "v": "0.1",
+  "agent_id": "agent-a",
+  "instance_id": "instance-a",
+  "endpoints": [{"transport": "websocket", "url": "wss://host:7443/polymesh"}]
+}
+```
+
+Cache `max-age: 60`. Do NOT follow redirects. Do NOT treat as authoritative identity.
+
+### 8.6 Heartbeat & Reconnection
+
+| Parameter | Value |
+|-----------|-------|
+| Ping interval | 30 seconds |
+| Inbound timeout | 90 seconds (no valid traffic = HEARTBEAT_TIMEOUT) |
+| Initial retry delay | 1 second |
+| Max retry delay | 60 seconds |
+| Backoff factor | 2× (+±20% jitter) |
+| Backoff reset condition | 90 seconds of stable session |
+
+**Graceful close:**
+```text
+A: CLOSE {code, retryable} → B: CLOSE_ACK → WebSocket Close/UDS shutdown
+```
+
+### 8.7 Concurrent Connection Arbitration
+
+Only one active session per verified peer instance. Deterministic tiebreaking:
+
+1. Unix socket > WSS > WS
+2. Lexicographically lower `(agent_id, instance_id)`
+3. Lexicographically lower `sid`
+
+The losing connection closes with `DUPLICATE_CONNECTION` and does not reconnect.
+
+### 8.8 Reconnect During Task
+
+After reconnect and handshake:
+
+```text
+A: RESUME {task-7, received_through: 40}
+B: RESUME {task-7, received_through: 41}
+```
+
+A discards and retransmits as needed. If task state evicted, return `RESUME_UNAVAILABLE`.
+
+Changed `instance_id` = restart. Task outcome unknown; do NOT replay non-idempotent work.
+
+### 8.9 v0.1 Exclusions
+
+**MUST NOT:**
+- Scan ports
+- Probe alternate ports after failure
+- Use relay, broker, STUN, ICE, or NAT hole-punching
+- Interpret mDNS TXT, HTTP discovery, source IP, or TLS alone as identity
+- Expose secrets or Agent Cards in discovery records
+
+---
+
+## 9. Security Model & Authentication
+
+### 9.1 Trust Model
+
+| Transport | Authentication | Trust Basis |
+|-----------|---------------|-------------|
+| Unix socket | Peer credential (SO_PEERCRED) | Same OS UID |
+| WebSocket loopback | Runtime session token (256-bit, in `$XDG_RUNTIME_DIR`, `0600`) | OS file permissions |
+| WebSocket LAN (opt-in) | HMAC-based shared secret | Explicit peer enrollment |
+
+### 9.2 Authentication Flow
+
+Every connection authenticates BEFORE exchanging cards or accepting tasks:
+
+```
+SESSION AUTH: hello/hello with nonces
+SESSION ID:  derived from mutual nonces
+SCOPE:       bound to authenticated principal
+CARDS:       only after auth complete
+TASKS:       only after cards exchanged
+```
+
+### 9.3 Authorization Policy
+
+**Default: DENY ALL.** Unknown peers get only `org.polymesh.agent.ping`.
+
+Policies are evaluated per-operation:
 
 ```json
 {
-  "type": "result",
-  "id": "019f6e19-36a4-7c51-a3ed-58ea61d050f1",
-  "timestamp": "2026-07-17T12:00:02Z",
-  "source": "mom-agent",
-  "target": "hermes-moses",
-  "reply_to": "019f6e19-36a4-7c51-a3ed-58ea61d050ee",
-  "thread": "calendar-coordination-001",
-  "payload": {
-    "capability": "calendar.read",
-    "output": {
-      "free_slots": [
-        {"start": "2026-07-21T18:00:00Z", "end": "2026-07-21T22:00:00Z"}
+  "version": "polymesh.policy/v1",
+  "defaultAllow": ["org.polymesh.agent.ping", "org.polymesh.agent.info"],
+  "rules": [
+    {
+      "match": {
+        "subject": "peer:pm_build_runner",
+        "authStrength": "local-unix"
+      },
+      "allow": [
+        { "operation": "org.polymesh.agent.info" },
+        {
+          "operation": "capability.invoke",
+          "capabilityId": "org.polymesh.file.read",
+          "constraints": {
+            "roots": ["/workspace/project"],
+            "maxBytes": 262144,
+            "followSymlinks": false
+          }
+        }
+      ]
+    },
+    {
+      "match": {
+        "subject": "peer:pm_deploy_agent",
+        "authStrength": "pairwise-psk"
+      },
+      "allow": [
+        {
+          "operation": "capability.invoke",
+          "capabilityId": "org.polymesh.shell.exec",
+          "constraints": {
+            "programs": ["/usr/bin/git", "/usr/bin/npm"],
+            "maxRuntimeMs": 30000,
+            "network": "disabled"
+          },
+          "requireLocalConfirmation": true
+        }
       ]
     }
-  }
+  ]
 }
 ```
 
----
+### 9.4 Metadata Disclosure
 
-## 7. Discovery
+| Level | Contents |
+|-------|----------|
+| Public card (unauthenticated) | `protocol version`, opaque `agent_id`, `authRequired: true` |
+| Detailed card (authenticated) | Allowed capabilities, non-sensitive docs, risk labels, rate limits |
+| Never exposed remotely | Tokens, secrets, policies, host details, internal paths, denied capabilities |
 
-PolyMesh defines three discovery mechanisms, listed in order of preference:
+Public card: ≤8 KiB. Detailed card: ≤64 KiB, filtered to authenticated peer's authorization scope.
 
-### 7.1 mDNS/DNS-SD (Local Network)
+### 9.5 Resource Limits (Default)
 
-Agents advertise on `_polymesh._tcp.local` using multicast DNS. The mDNS TXT record contains:
+| Resource | Default |
+|----------|---------|
+| Open inbound connections | 32 |
+| Pending handshake connections | 8 |
+| Sessions per principal | 4 |
+| Authentication deadline | 5 seconds |
+| Frame size (max) | 1,048,576 bytes |
+| Control requests | 60/min/principal |
+| Task submissions | 20/min/principal |
+| Running tasks (global) | 4 |
+| Running tasks (per principal) | 2 |
+| Task input | 256 KiB |
+| Default task timeout | 60 seconds |
+| Max task timeout | 300 seconds |
+| Result size | 1 MiB |
+| Idle session timeout | 10 minutes |
+| Max session age | 60 minutes |
 
-| Key | Value | Required |
-|-----|-------|----------|
-| `agent_id` | Agent identifier | Yes |
-| `version` | Protocol version | Yes |
-| `port` | WebSocket port | Yes |
-| `display_name` | Human-readable name | No |
-| `capabilities` | Comma-separated capability names | No |
+### 9.6 Token Rotation
 
-**Discovery flow:**
-1. Agent comes online → starts WebSocket server on a port
-2. Agent registers `_polymesh._tcp` service via mDNS
-3. Other agents on the same network receive ADD notifications
-4. Peers connect to the WebSocket port and receive the Agent Card
+Runtime tokens (loopback):
 
-### 7.2 Brokerless Direct Connect (Default)
+1. Generate 256-bit token with CSPRNG
+2. Write `0600` file, `fsync`, atomic rename into place
+3. Increment `authEpoch`
+4. Normal rotation: previous token accepted for 30-second overlap
+5. Hard rotation: close all sessions immediately, reject old tokens
 
-On **localhost**, agents can discover each other by scanning `localhost:9800-9899` for open WebSocket ports or by listening on a known port convention (`polymesh` broker on `:9854`).
+### 9.7 Threat Model
 
-**Fallback:** If no peers found within 5 seconds, the agent starts a broker on `:9854` and waits.
-
-### 7.3 HTTP Discovery Endpoint (Optional)
-
-Agents that also serve HTTP MAY publish `GET /.well-known/polymesh` returning their Agent Card. This is intended for remote agents that are reachable via Cloudflare Tunnel or similar.
-
-```json
-GET /.well-known/polymesh
-Response: AgentCard
-```
-
-### 7.4 Broker Mode (Optional)
-
-A PolyMesh **broker** is an agent that acts as a message relay. Brokers:
-- Maintain a registry of connected agents and their cards
-- Route messages between agents that cannot connect directly (NAT, firewalls)
-- MAY store a persistent inbox for offline agents
-- Brokers announce themselves via the same discovery mechanisms
-
----
-
-## 8. Connection Lifecycle
-
-```
-1. Agent starts → binds to WebSocket port
-2. Advertises via mDNS
-3. Receives connections from peers
-4. On connect: server sends `card` message
-5. Client responds with its own `card` message
-6. Both sides update local registry
-7. Messages flow bidirectionally
-8. On disconnect: agent is removed from registry
-9. Automatic reconnection with exponential backoff (1s, 2s, 4s, 8s, max 60s)
-```
-
-### Heartbeat
-
-The connection MUST be kept alive with `ping`/`pong` every 30 seconds. If no message is received for 90 seconds, the connection is considered dead and closed.
+| Threat | Control | Residual Risk |
+|--------|---------|--------------|
+| Rogue process, different OS user | `0700` dirs, kernel UID check | Root/kernel out of scope |
+| Rogue process, same OS user | Default deny, audit, managed-process binding | Cannot distinguish from legitimate same-UID agent without stronger OS boundary |
+| Token theft | Runtime dir confinement, rotation, short sessions | Reader can replay until rotation |
+| LAN injection | LAN disabled by default, explicit opt-in | Raw secret only blocks blind attackers |
+| Replay | Session-bound nonces, sequence counters, deduplication | Captured traffic remains replayable within dedup window |
+| DoS | Connection/handshake/frame/rate/task/buffer limits | Same-user can exhaust host resources |
+| Metadata enumeration | Minimal public card, generic denials | Protocol presence visible to authenticated peers |
 
 ---
 
-## 9. Task Delegation
+## 10. Error Taxonomy
 
-### Simple Task
-
-```
-Sender                   Receiver
-  │                         │
-  │──── task ──────────────►│
-  │                         │ (processing)
-  │◄──── result ────────────│
-  │                         │
-```
-
-### Streaming Progress
-
-```
-Sender                   Receiver
-  │                         │
-  │──── task ──────────────►│
-  │◄──── progress (20%) ────│
-  │◄──── progress (60%) ────│
-  │◄──── progress (90%) ────│
-  │◄──── result ────────────│
-  │                         │
-```
-
-### Human-in-the-Loop
-
-If a task requires human approval, the receiver responds with type `input-required`:
+### 10.1 Structured Error Format
 
 ```json
 {
-  "type": "input-required",
-  "id": "...",
-  "source": "receiver-agent",
-  "target": "sender-agent",
-  "reply_to": "<original task id>",
-  "payload": {
-    "prompt": "Is it OK to send email to john@example.com?",
-    "options": ["yes", "no", "modify"]
-  }
-}
-```
-
-The sender (or a human proxy like VekInbox) responds with another `task` message in the same thread:
-
-```json
-{
-  "type": "task",
-  "id": "...",
-  "source": "sender-agent",
-  "target": "receiver-agent",
-  "reply_to": "<input-required message id>",
-  "thread": "<original thread id>",
-  "payload": {
-    "capability": "calendar.write",
-    "input": {
-      "human_response": "yes",
-      "original_input": { ... }
+  "type": "error",
+  "params": {
+    "category": "task",
+    "code": "TASK_NOT_FOUND",
+    "message": "No task with ID 0197a1b0-1...",
+    "retryable": false,
+    "retry_after_ms": null,
+    "details": {
+      "task_id": "0197a1b0-1..."
     }
   }
 }
 ```
 
-### Error Handling
+### 10.2 Error Categories
 
-Errors follow standard HTTP-inspired codes:
+| Category | Example Codes | Retryable? |
+|----------|--------------|------------|
+| `parse` | `MALFORMED_FRAME`, `MALFORMED_JSON`, `DUPLICATE_MEMBER` | Never |
+| `protocol` | `UNSUPPORTED_PROTOCOL_VERSION`, `UNSUPPORTED_METHOD` | Never |
+| `identity` | `AUTHENTICATION_FAILED`, `SOURCE_IDENTITY_MISMATCH`, `AUTHORIZATION_DENIED` | Never |
+| `routing` | `UNKNOWN_TARGET`, `TARGET_UNAVAILABLE` | Target unavailable only |
+| `delivery` | `PMX.DELIVERY.MESSAGE_ID_CONFLICT`, `PMX.DELIVERY.IDEMPOTENCY_CONFLICT` | Storage unavailable only |
+| `resource` | `RATE_LIMITED`, `OVERLOADED`, `QUOTA_EXCEEDED` | Rate/overload yes |
+| `task` | `PMX.TASK.NOT_FOUND`, `PMX.TASK.CONFLICT`, `PMX.TASK.DEADLINE_EXCEEDED` | Never |
+| `execution` | `EXECUTION_FAILED`, `DEPENDENCY_FAILED`, `RESULT_TOO_LARGE` | After acceptance: never |
+| `internal` | `INTERNAL_ERROR` | Transient cases yes |
 
-| Code | Meaning |
-|------|---------|
-| `400` | Bad request — malformed input |
-| `401` | Unauthorized — sender cannot request this capability |
-| `404` | Capability not found — receiver doesn't have this capability |
-| `408` | Timeout — task exceeded the requested timeout |
-| `500` | Internal error — something broke on the receiver |
-| `503` | Busy — receiver is overloaded, try again later |
+### 10.3 Error Placement Rules
 
----
+| Situation | Response |
+|-----------|----------|
+| Malformed envelope | Drop or transport diagnostic. No reflected error unless identity/route safe |
+| Valid envelope can't be routed | Top-level `error` |
+| Temporary admission failure | Retryable top-level `error` |
+| Valid submit permanently refused | `task.rejected` |
+| Accepted task fails | `task.completed(outcome="failed")` |
+| Accepted task expires/cancels | `task.completed(outcome="cancelled")` |
 
-## 10. Delivery Semantics
-
-| Message Type | Delivery | Description |
-|-------------|----------|-------------|
-| `task` | At-least-once | Receiver MUST acknowledge by sending `result` or `error` within the timeout |
-| `result` | At-most-once | Best-effort delivery back to sender. If sender disconnects, result is lost |
-| `progress` | At-most-once | Fire-and-forget intermediate updates |
-| `ping` | At-most-once | Fire-and-forget liveness |
-| `card` | At-least-once | Re-sent on every connection |
-
-**Timeout:** If a sender doesn't receive `result` or `error` within `input.metadata.timeout_seconds` (default 60), it SHOULD consider the task failed.
-
-**Idempotency:** Task `id` values (UUIDv7) MUST be unique per sender. Receivers SHOULD deduplicate by `(source, id)`.
+`message` is human-readable. Clients MUST branch on `code` and `retryable`, never message text.
 
 ---
 
-## 11. Transport Binding: WebSocket
+## 11. Reference Implementation Architecture
 
-This section defines how PolyMesh maps onto WebSocket connections.
-
-### Endpoint
-
-The default WebSocket endpoint is `ws://localhost:9854`. The broker listens on this port.
-
-### Subprotocol
-
-The WebSocket subprotocol is `polymesh.0.1`.
-
-### Connection Initiation
+### 11.1 Package Structure
 
 ```
-CLIENT → SERVER: WebSocket handshake with subprotocol "polymesh.0.1"
-SERVER → CLIENT: {"type": "card", "id": "...", "source": "server", "payload": <AgentCard>}
-CLIENT → SERVER: {"type": "card", "id": "...", "source": "client", "payload": <AgentCard>}
+@polymesh/
+├── packages/
+│   ├── broker/
+│   │   ├── src/
+│   │   │   ├── protocol.ts    # 35 LOC — Types, guards, schemas
+│   │   │   ├── registry.ts    # 120 LOC — Agent registry, TTL, routing
+│   │   │   └── broker.ts      # 120 LOC — WebSocket server, handshake, auth, dispatch
+│   │   └── package.json
+│   └── client/
+│       ├── src/
+│       │   ├── client.ts      # 75 LOC — Connect, discover, call, respond
+│       │   ├── cli.ts         # 45 LOC — polymesh CLI commands
+│       │   └── mdns.ts        # 20 LOC — mDNS adapter
+│       └── package.json
+├── tsconfig.json
+├── vitest.config.ts
+└── package.json
 ```
 
-### Message Framing
+~295 LOC total production code.
 
-Each message is a single JSON object, serialized to a string, and sent as a WebSocket text frame. Multiple messages may be sent in either direction concurrently (the protocol is fully asynchronous).
+### 11.2 Key Dependencies
 
-### Close
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `ws` | ^8.21.1 | WebSocket server + client |
+| `bonjour-service` | ^1.4.3 | mDNS publish + discover |
+| `vitest` | ^3 | Test runner |
+| `typescript` | ^5 | Type system |
 
-Either side MAY close the WebSocket at any time. The close reason SHOULD be one of:
-- `shutdown` — agent is shutting down
-- `reconnect` — agent is reconnecting (will reconnect soon)
-- `protocol-error` — malformed message received
-- `timeout` — heartbeat missed
+### 11.3 CLI Interface
+
+```text
+polymesh start       [--port 7337] [--host 127.0.0.1] [--token TOKEN] [--mdns]
+polymesh connect     <ws-url> [--card FILE] [--token TOKEN]
+polymesh peers       [--url URL] [--card FILE] [--mdns]
+polymesh capabilities [--card FILE]
+polymesh call        <agent> <capability> <json-input> [--url URL] [--timeout MS]
+```
+
+Environment defaults: `POLYMESH_URL`, `POLYMESH_TOKEN`, `POLYMESH_CARD`.
+
+### 11.4 Test Plan
+
+1. **Registry unit tests** — register, duplicate-ID rejection, TTL expiry, touch renewal, stale-socket-safe removal
+2. **In-memory integration** — two paired `WireTransport`s, Alice + Bob, discovery + echo task exchange
+3. **WebSocket integration** — `new Broker({port: 0})`, WS `localhost:OS-assigned-port`, two-agent task exchange
+4. **Error cases** — bad token, unknown target, unknown capability, handler error, spoofed `from`, timeout, forged result, target disconnect
+5. **CLI tests** — export `main(argv, deps)` and test without subprocess spawning
+
+### 11.5 Broker Core (Pseudocode)
+
+The broker is a message router, not a state machine. It:
+
+1. Accepts WebSocket connections
+2. Runs full handshake (hello/hello → card exchange → ready)
+3. Maintains in-memory `Map<agent_id, {card, transport, sessionId}>` with TTL
+4. Routes `task.submit` messages by `target.agent_id`
+5. Returns `result`/`error` to the original caller using routing table
+6. Deletes registry entries on disconnect
+7. Fails pending routes on peer disconnect
 
 ---
 
-## 12. Security Model
+## 12. Edge Cases & Required Behaviors
 
-### Trust Model
-
-PolyMesh operates on a **local trust** model:
-
-- **On localhost:** All agents on the machine are trusted by default. This is appropriate for personal developer machines
-- **On LAN:** Agents MAY authenticate via a shared secret set in environment or config
-- **Over internet:** PolyMesh does not define auth. Use a tunnel (Cloudflare Tunnel, Tailscale) or WireGuard for remote connections
-
-### Threats Considered
-
-| Threat | Mitigation |
-|--------|-----------|
-| Rogue agent on localhost | None (local trust model — same as any local process) |
-| Rogue agent on LAN | Shared secret authentication (optional) |
-| Message injection | WebSocket is encrypted if using WSS. Only applicable over internet |
-| Denial of service | Agents MAY rate-limit connections per source IP |
-| Capability abuse | Each agent decides which capabilities it exposes. No agent can force another to execute a capability |
-
-### Secrets / Crypto
-
-None. PolyMesh explicitly does not define cryptographic identity. If you need authenticated identity, use a layer below (Tailscale, Cloudflare Access) or above (JWT in message metadata).
+| Edge Case | Required Behavior |
+|-----------|------------------|
+| Simultaneous connections between same peers | Deterministic duplicate arbitration (see §8.7). Loser closes with DUPLICATE_CONNECTION |
+| Restart during active task | New `instance_id` means stale task state. DO NOT replay non-idempotent work |
+| Submit retried after acceptance | Replay accepted + terminal events |
+| Submit retried after rejection | Replay canonical rejection |
+| Terminal arrives before accepted | Preserve terminal state. Do NOT regress on late events |
+| Cancel races success/failure | Durable compare-and-set decides winner |
+| Cancel before submit | Store cancellation tombstone. Matching submit accepts then cancels without work |
+| Deadline races cancellation | Deadline wins once reached |
+| Expired card from live connection | Policy is authoritative. Caller refreshes card |
+| Result purged after retention | Return `PMX.TASK.RESULT_EXPIRED`. Never invent state |
+| Router can't reach target | Emit `TARGET_UNAVAILABLE`. MUST NOT impersonate target |
+| mDNS spoofing | All discovery is hints. Card validation is authoritative |
+| IPv4/IPv6 dual-stack | Happy Eyeballs: IPv6 first, IPv4 after 250ms |
+| Port conflict | Report `PORT_IN_USE`. Do NOT probe neighbor ports |
+| Stale local socket | `ECONNREFUSED`: mark stale, rescan, backoff. NEVER unlink another process's socket |
+| Interface disappears | Retire candidates on that interface. Existing sessions rely on heartbeat |
+| Self-connection | Reject with `SELF_CONNECTION` |
+| Same agent_id, different key | `IDENTITY_COLLISION` |
+| Clock skew (client) | Server clock is authoritative. No implicit grace period |
+| Clock skew (server backward) | MUST NOT extend tasks beyond monotonic expiry |
+| Rate limit exceeded | Return `RATE_LIMITED`. Honor `retry_after_ms` |
 
 ---
 
-## 13. Implementation Guide
+## 13. Appendix: JSON Schema
 
-### Minimal Agent (Node.js, ~100 lines)
+### Base Envelope Schema
 
-```javascript
-import { WebSocketServer } from 'ws';
-import { createSocket } from 'dgram';
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://polymesh.dev/schemas/envelope.json",
+  "type": "object",
+  "required": ["protocol", "type", "message_id", "timestamp", "source", "target", "delivery", "params"],
+  "properties": {
+    "protocol": { "const": "polymesh.0.1" },
+    "type": {
+      "type": "string",
+      "enum": ["card", "task.submit", "task.accepted", "task.rejected", "task.progress",
+               "task.completed", "task.cancel", "task.status", "ping", "pong", "error"]
+    },
+    "message_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "object",
+      "required": ["agent_id", "instance_id"],
+      "properties": {
+        "agent_id": { "type": "string" },
+        "instance_id": { "type": "string" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["agent_id"],
+      "properties": {
+        "agent_id": { "type": "string" },
+        "instance_id": { "type": "string" }
+      }
+    },
+    "delivery": {
+      "type": "object",
+      "required": ["mode", "idempotency_key"],
+      "properties": {
+        "mode": { "const": "at_least_once" },
+        "idempotency_key": { "type": "string" },
+        "deadline": { "type": "string", "format": "date-time" }
+      }
+    },
+    "in_reply_to": { "type": "string" },
+    "params": { "type": "object" }
+  }
+}
+```
 
-const AGENT_CARD = {
-  protocol: 'polymesh/0.1',
-  agent_id: 'my-agent',
-  display_name: 'My Custom Agent',
-  version: '1.0.0',
-  capabilities: [
-    {
-      name: 'agent.ping',
-      description: 'Liveness check',
-      input_schema: { type: 'object' },
-      output_schema: { type: 'object' }
+*(Full per-message type schemas are defined in the Core Protocol §2 section above.)*
+
+---
+
+## 14. Appendix: Standard Capability Definitions
+
+*(See §7.3 for the full capability table. Each capability has input_schema and result_schema defined as JSON Schema 2020-12.)*
+
+### Example: `org.polymesh.calendar.read`
+
+```json
+{
+  "id": "org.polymesh.calendar.read",
+  "version": "2.0.0",
+  "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["range"],
+    "properties": {
+      "range": {
+        "type": "object",
+        "required": ["from", "to"],
+        "properties": {
+          "from": { "type": "string", "format": "date-time" },
+          "to": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": false
+      },
+      "page_size": { "type": "integer", "minimum": 1, "maximum": 1000 },
+      "cursor": { "type": "string" }
+    },
+    "additionalProperties": false
+  },
+  "result_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["events"],
+    "properties": {
+      "events": { "type": "array", "items": { "type": "object" } },
+      "next_cursor": { "type": ["string", "null"] }
     }
-  ],
-  endpoints: [{ transport: 'ws', location: 'ws://localhost:9854', priority: 0 }],
-  metadata: { description: 'A simple PolyMesh agent', tags: ['example'] }
-};
-
-// Start WebSocket broker
-const wss = new WebSocketServer({ port: 9854 });
-
-wss.on('connection', (ws) => {
-  // Send our card
-  ws.send(JSON.stringify({ type: 'card', payload: AGENT_CARD }));
-  
-  ws.on('message', (data) => {
-    const msg = JSON.parse(data.toString());
-    handleMessage(ws, msg);
-  });
-});
-
-function handleMessage(ws, msg) {
-  if (msg.type === 'card') {
-    registry.set(msg.source, msg.payload);
-    console.log(`Discovered agent: ${msg.source}`);
-  } else if (msg.type === 'task') {
-    executeTask(msg).then(result => {
-      ws.send(JSON.stringify({
-        type: 'result',
-        reply_to: msg.id,
-        source: AGENT_CARD.agent_id,
-        target: msg.source,
-        payload: result
-      }));
-    });
-  }
+  },
+  "idempotency": "pure",
+  "side_effects": "read",
+  "approval": "never",
+  "cancellation": "supported",
+  "timeout_ceiling_seconds": 30
 }
-
-async function findAgent(capability) {
-  for (const [id, card] of registry) {
-    if (card.capabilities.some(c => c.name === capability)) return id;
-  }
-  return null;
-}
-```
-
-### Python
-
-```python
-import asyncio, json, socket
-import websockets
-
-AGENT_CARD = {
-    "protocol": "polymesh/0.1",
-    "agent_id": "py-agent",
-    "display_name": "Python Agent",
-    "capabilities": [
-        {"name": "agent.ping", "description": "Liveness check"}
-    ],
-    "endpoints": [{"transport": "ws", "location": "ws://localhost:9855"}]
-}
-
-async def handler(websocket):
-    await websocket.send(json.dumps({"type": "card", "payload": AGENT_CARD}))
-    async for raw in websocket:
-        msg = json.loads(raw)
-        if msg["type"] == "task":
-            result = await execute(msg)
-            await websocket.send(json.dumps({
-                "type": "result",
-                "reply_to": msg["id"],
-                "payload": result
-            }))
-
-async def main():
-    async with websockets.serve(handler, "localhost", 9855):
-        await asyncio.Future()
-
-asyncio.run(main())
-```
-
-### mDNS Registration (Node.js)
-
-```javascript
-import { Bonjour } from 'bonjour-service';
-
-const bonjour = new Bonjour();
-
-// Advertise on _polymesh._tcp
-bonjour.publish({
-  name: `polymesh-${AGENT_CARD.agent_id}`,
-  type: 'polymesh',
-  port: 9854,
-  txt: {
-    agent_id: AGENT_CARD.agent_id,
-    version: '0.1.0',
-    capabilities: AGENT_CARD.capabilities.map(c => c.name).join(',')
-  }
-});
-
-// Discover peers
-bonjour.find({ type: 'polymesh' }, (service) => {
-  console.log(`Found agent: ${service.txt.agent_id} at ${service.host}:${service.port}`);
-  connectTo(service.host, service.port);
-});
 ```
 
 ---
 
-## 14. Reference Implementation
+## Revision History
 
-A reference implementation will be provided in this repository under `ref/`:
-
-| Language | Status | Location |
-|----------|--------|----------|
-| TypeScript | Planned | `ref/typescript/` |
-| Python | Planned | `ref/python/` |
-| Rust | Planned | `ref/rust/` |
-
-Each reference implementation includes:
-- WebSocket broker (server)
-- Agent client (connect, send, receive)
-- mDNS discovery (optional)
-- CLI for testing
-
----
-
-## 15. FAQ
-
-**Q: How is this different from A2A (Agent-to-Agent protocol)?**
-A: A2A is designed for enterprise multi-org scenarios — full lifecycle management, human-in-loop formalization, card resolution via HTTPS. PolyMesh targets the 90% use case: "I have 3 agents on my laptop, I want them to talk to each other." PolyMesh is simpler (no lifecycle states), local-first (no DNS needed), and usable in ~100 lines of code.
-
-**Q: How is this different from MCP?**
-A: MCP is agent→tool. PolyMesh is agent→agent. They complement each other: Agent A uses MCP to access tools, PolyMesh to talk to Agent B.
-
-**Q: Do I need a broker?**
-A: On localhost, no. Agents can connect directly. A broker helps when agents are behind NAT or need message queuing.
-
-**Q: What if two agents claim the same agent_id?**
-A: Last-wins on connection. Duplicate IDs are a configuration error.
-
-**Q: Can I use this over the internet?**
-A: Yes, with a tunnel (Tailscale, Cloudflare Tunnel, WireGuard). PolyMesh does not define internet-level discovery — that's the tunnel's job.
-
-**Q: Does PolyMesh use blockchain?**
-A: No. Zero blockchain, zero crypto, zero gas fees. It's WebSockets and JSON.
-
----
-
-## Appendix A: Message Type State Machine
-
-```
-                 ┌──────────┐
-                 │  card    │
-                 └────┬─────┘
-                      │
-              ┌───────▼────────┐
-              │  Established   │
-              │  (session)     │
-              └───────┬────────┘
-                      │
-          ┌───────────┼───────────┐
-          │           │           │
-          ▼           ▼           ▼
-      ┌───────┐  ┌───────┐  ┌───────┐
-      │ ping  │  │ task  │  │ card  │
-      └───┬───┘  └───┬───┘  └───┬───┘
-          │           │           │
-          ▼           ▼           │
-      ┌───────┐  ┌───────┐      │
-      │ pong  │  │progress│      │
-      └───────┘  └───┬───┘      │
-                     │           │
-                     ▼           │
-                ┌────────┐       │
-                │ result │       │
-                │ error  │       │
-                └────────┘       │
-                          ┌──────▼──────┐
-                          │  Reconnect  │
-                          │  or Close   │
-                          └─────────────┘
-```
-
-## Appendix B: Wire Format (BNF)
-
-```
-message      = "{" type "," id "," timestamp "," source "," target ["," thread] ["," reply_to] "," payload "}"
-type         = "type: \"" msg_type "\""
-msg_type     = "card" | "task" | "progress" | "result" | "ping" | "pong" | "error" | "input-required"
-id           = "id: \"" uuid_v7 "\""
-uuid_v7      = 8HEX "-" 4HEX "-7" 3HEX "-" 4HEX "-" 12HEX
-timestamp    = "timestamp: \"" iso8601 "\""
-source       = "source: \"" agent_id "\""
-target       = "target: \"" (agent_id | "broadcast") "\""
-thread       = "thread: \"" string "\""
-reply_to     = "reply_to: \"" uuid_v7 "\""
-payload      = "payload: " json_value
-agent_id     = ALPHA (ALPHA | DIGIT | "-" | "_" | ".")*
-```
-
-## Appendix C: Reserved Port Numbers
-
-| Port | Use |
-|------|-----|
-| 9854 | Default PolyMesh broker |
-| 9850-9859 | Recommended range for agent endpoints |
-| 5353 | mDNS (standard) |
+| Version | Date | Changes |
+|---------|------|---------|
+| 0.1.0-draft.1 | 2026-07-17 | Initial specification |
+| 0.1.0-draft.2 | 2026-07-17 | Added Ultra-reasoned core protocol schemas, transport binding, security model, reference impl, agent card vocabulary |
 
 ---
 
