@@ -1,6 +1,17 @@
-import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
-
 import { afterEach, describe, expect, it } from "vitest";
+
+// zstd is unavailable on Node < 22.  The describe block skips itself when the
+// runtime codec is absent so the suite is not restricted to a specific version.
+const zstdAvailable: boolean = (() => {
+  try {
+    const zlib = require("node:zlib") as {
+      zstdCompressSync?: (input: Uint8Array) => Uint8Array;
+    };
+    return typeof zlib.zstdCompressSync === "function";
+  } catch {
+    return false;
+  }
+})();
 
 import {
   Broker,
@@ -119,6 +130,16 @@ async function negotiateZstd(
   return selected;
 }
 
+// zstd runtime — resolved lazily so the file can be loaded on Node < 22 where
+// zstdCompressSync is absent.  The describe block skips itself unconditionally
+// when the codec is unavailable.
+function zstdCompressSync(input: Uint8Array): Uint8Array {
+  return require("node:zlib").zstdCompressSync(input);
+}
+function zstdDecompressSync(input: Uint8Array): Uint8Array {
+  return require("node:zlib").zstdDecompressSync(input);
+}
+
 function zstdFrame(recordType: string, record: unknown): JsonRecord {
   const uncompressed = Buffer.from(JSON.stringify(record), "utf8");
   const payload = zstdCompressSync(uncompressed);
@@ -164,7 +185,7 @@ function applicationRecords(frames: readonly unknown[]): JsonRecord[] {
 }
 
 describe("Broker v0.2 zstd transport integration", () => {
-  it("selects zstd post-READY, accepts a compressed submit, and delivers a compressed envelope", async () => {
+  (zstdAvailable ? it : it.skip)("selects zstd post-READY, accepts a compressed submit, and delivers a compressed envelope", async () => {
     const token = generateRuntimeToken();
     const store = new InMemoryDurableStore();
     const broker = new Broker({
