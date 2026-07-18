@@ -3,7 +3,15 @@
 import { readFile as nodeReadFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
-import { Broker, createAgentCard, isAgentCard, type AgentCard } from "@polymesh/broker";
+import {
+  MAX_CARD_BYTES,
+  Broker,
+  createAgentCard,
+  decodeRuntimeToken,
+  isAgentCard,
+  parseStrictJson,
+  type AgentCard,
+} from "@polymesh/broker";
 import { PolyMeshClient, type ClientOptions } from "./client.js";
 import { advertiseMdns, discoverMdns, type MdnsHandle, type MdnsPeer } from "./mdns.js";
 
@@ -32,11 +40,11 @@ interface ParsedArgs {
 }
 
 const usage = `Usage:
-  polymesh start [--port 7337] [--host 127.0.0.1] [--token TOKEN] [--mdns]
-  polymesh connect <ws-url> [--card FILE] [--token TOKEN]
+  polymesh start [--port 7337] [--host 127.0.0.1] --token-file FILE [--insecure-loopback-dev] [--mdns]
+  polymesh connect <wss-url> [--card FILE] [--token-file FILE] [--insecure-loopback-dev]
   polymesh peers [--url URL] [--card FILE] [--mdns]
   polymesh capabilities [--card FILE]
-  polymesh call <agent> <capability> <json-input> [--url URL] [--timeout MS]
+  polymesh call <agent> <capability> <json-input> [--url URL] [--timeout MS] [--token-file FILE] [--insecure-loopback-dev]
 `;
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -79,9 +87,22 @@ function defaultCard(): AgentCard {
 async function loadCard(path: string | undefined, deps: CliDeps): Promise<AgentCard> {
   if (!path) return defaultCard();
   const content = await (deps.readFile ?? nodeReadFile)(path, "utf8");
-  const parsed = JSON.parse(content) as unknown;
-  if (!isAgentCard(parsed)) throw new Error(`Invalid PolyMesh Agent Card: ${path}`);
-  return parsed;
+  const parsed = parseStrictJson(content, { maxBytes: MAX_CARD_BYTES });
+  if (!parsed.ok || !isAgentCard(parsed.value)) throw new Error(`Invalid PolyMesh Agent Card: ${path}`);
+  return parsed.value;
+}
+
+async function loadRuntimeToken(path: string | undefined, deps: CliDeps): Promise<string | undefined> {
+  if (!path) return undefined;
+  const token = await (deps.readFile ?? nodeReadFile)(path, "utf8");
+  if (!decodeRuntimeToken(token)) throw new Error("Runtime token file does not contain a valid PolyMesh token");
+  return token;
+}
+
+function rejectInlineToken(parsed: ParsedArgs, env: Record<string, string | undefined>): void {
+  if (hasFlag(parsed, "token") || env.POLYMESH_TOKEN !== undefined) {
+    throw new Error("Inline runtime tokens are not supported; use --token-file or POLYMESH_TOKEN_FILE");
+  }
 }
 
 function write(io: CliIo, value: unknown): void {
@@ -101,19 +122,32 @@ export async function main(argv: string[] = process.argv.slice(2), deps: CliDeps
     return 0;
   }
   const cardPath = flag(parsed, "card") ?? env.POLYMESH_CARD;
-  const token = flag(parsed, "token") ?? env.POLYMESH_TOKEN;
+  const tokenFile = flag(parsed, "token-file") ?? env.POLYMESH_TOKEN_FILE;
   const createBroker = deps.createBroker ?? ((options) => new Broker(options));
   const createClient = deps.createClient ?? ((options) => new PolyMeshClient(options));
 
   try {
+    rejectInlineToken(parsed, env);
     switch (parsed.command) {
       case "start": {
         const port = positiveInt(flag(parsed, "port"), 7337, "port");
         const host = flag(parsed, "host") ?? "127.0.0.1";
-        const broker = createBroker({ port, host, token });
+        const token = await loadRuntimeToken(tokenFile, deps);
+        const broker = createBroker({
+          port,
+          host,
+          token,
+          // Plain ws:// is an explicitly named development posture.  The
+          // broker independently verifies that the host is numeric loopback
+          // and that a valid runtime token is present.
+          allowInsecureLoopbackDevelopment: hasFlag(parsed, "insecure-loopback-dev"),
+        });
         await broker.start();
         let advertisement: MdnsHandle | undefined;
         if (hasFlag(parsed, "mdns")) {
+          if (!broker.url?.startsWith("wss://")) {
+            throw new Error("mDNS advertising requires a WSS endpoint");
+          }
           advertisement = (deps.advertiseMdns ?? advertiseMdns)({
             agentId: broker.card.agent_id,
             port: broker.port ?? port,
@@ -134,7 +168,13 @@ export async function main(argv: string[] = process.argv.slice(2), deps: CliDeps
         const url = parsed.positionals[0] ?? flag(parsed, "url") ?? env.POLYMESH_URL;
         if (!url) throw new Error("connect requires a WebSocket URL");
         const card = await loadCard(cardPath, deps);
-        const client = createClient({ card, url, token });
+        const token = await loadRuntimeToken(tokenFile, deps);
+        const client = createClient({
+          card,
+          url,
+          token,
+          allowInsecureLoopbackDevelopment: hasFlag(parsed, "insecure-loopback-dev"),
+        });
         await client.connect();
         write(io, { connected: true, peer: client.brokerIdentity, card: client.brokerCard });
         client.close();
@@ -163,13 +203,21 @@ export async function main(argv: string[] = process.argv.slice(2), deps: CliDeps
         const url = flag(parsed, "url") ?? env.POLYMESH_URL;
         if (!agent || !capability || jsonInput === undefined) throw new Error("call requires <agent> <capability> <json-input>");
         if (!url) throw new Error("call requires --url or POLYMESH_URL");
-        const input = JSON.parse(jsonInput) as unknown;
-        if (typeof input !== "object" || input === null || Array.isArray(input)) throw new Error("json-input must be a JSON object");
+        const parsedInput = parseStrictJson(jsonInput, { maxBytes: 256 * 1_024 });
+        if (!parsedInput.ok || typeof parsedInput.value !== "object" || parsedInput.value === null || Array.isArray(parsedInput.value)) {
+          throw new Error("json-input must be a bounded JSON object without duplicate keys");
+        }
         const card = await loadCard(cardPath, deps);
-        const client = createClient({ card, url, token });
+        const token = await loadRuntimeToken(tokenFile, deps);
+        const client = createClient({
+          card,
+          url,
+          token,
+          allowInsecureLoopbackDevelopment: hasFlag(parsed, "insecure-loopback-dev"),
+        });
         const timeoutMs = positiveInt(flag(parsed, "timeout"), 60_000, "timeout");
         try {
-          const result = await client.call(agent, capability, input as Record<string, never>, { timeoutMs });
+          const result = await client.call(agent, capability, parsedInput.value as Record<string, never>, { timeoutMs });
           write(io, result);
         } finally {
           client.close();
