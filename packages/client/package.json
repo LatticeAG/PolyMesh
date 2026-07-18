@@ -1,0 +1,39 @@
+{
+  "name": "@polymesh/client",
+  "version": "0.1.0",
+  "description": "PolyMesh client and CLI",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./mdns": {
+      "types": "./dist/mdns.d.ts",
+      "default": "./dist/mdns.js"
+    }
+  },
+  "bin": {
+    "polymesh": "./dist/cli.js"
+  },
+  "dependencies": {
+    "@polymesh/broker": "file:../broker",
+    "bonjour-service": "^1.4.3",
+    "ws": "^8.21.1"
+  }
+}

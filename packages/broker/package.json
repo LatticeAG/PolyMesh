@@ -1,0 +1,34 @@
+{
+  "name": "@polymesh/broker",
+  "version": "0.1.0",
+  "description": "PolyMesh WebSocket broker and registry",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "default": "./dist/protocol.js"
+    },
+    "./registry": {
+      "types": "./dist/registry.d.ts",
+      "default": "./dist/registry.js"
+    },
+    "./broker": {
+      "types": "./dist/broker.d.ts",
+      "default": "./dist/broker.js"
+    }
+  },
+  "dependencies": {
+    "ws": "^8.21.1"
+  }
+}
