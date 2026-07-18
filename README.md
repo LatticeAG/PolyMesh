@@ -2,16 +2,17 @@
 
 # PolyMesh
 
+**The phone network for AI agents.** An open-sourced protocol — not a product — for agents to discover each other, exchange capabilities, and delegate tasks.
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Language: TypeScript](https://img.shields.io/badge/language-TypeScript-3178C6.svg)](https://www.typescriptlang.org/)
-[![GitHub stars](https://img.shields.io/github/stars/mosesman831/polymesh?style=social)](https://github.com/mosesman831/polymesh/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/mosesman831/polymesh)](https://github.com/mosesman831/polymesh/issues)
-[![GitHub clones](https://img.shields.io/badge/clones-live-20c997)](https://github.com/mosesman831/polymesh/graphs/traffic)
-[![GitHub traffic](https://img.shields.io/github/commit-activity/m/mosesman831/polymesh)](https://github.com/mosesman831/polymesh/graphs/traffic)
+[![GitHub stars](https://img.shields.io/github/stars/LatticeAG/PolyMesh?style=social)](https://github.com/LatticeAG/PolyMesh/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/LatticeAG/PolyMesh)](https://github.com/LatticeAG/PolyMesh/issues)
+[![CI](https://github.com/LatticeAG/PolyMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/LatticeAG/PolyMesh/actions/workflows/ci.yml)
 
-**The phone network for AI agents.**
+<img align="center" alt="PolyMesh" src="https://img.shields.io/badge/status-experimental-orange">
 
-An open, local-first protocol for agent-to-agent communication.
+**The phone network for AI agents.** An open-sourced protocol — not a product.
 
 [What is PolyMesh](#what-is-polymesh) · [Quick Start](#quick-start) · [Why PolyMesh](#why-polymesh) · [Architecture](#architecture) · [Features](#features) · [Examples](#examples) · [Security](SECURITY.md) · [Status](#status) · [License](#license)
 
@@ -21,7 +22,7 @@ An open, local-first protocol for agent-to-agent communication.
 
 ## What is PolyMesh?
 
-PolyMesh is an **open protocol** — not a product — for AI agents to discover each other, exchange capability declarations, delegate tasks, and coordinate locally.
+PolyMesh is an **open protocol** to discover each other, exchange capability declarations, delegate tasks, and coordinate locally.
 
 > **Security:** Read [SECURITY.md](SECURITY.md) before exposing a listener or giving an agent access to data or side-effecting capabilities. The reference implementation is experimental; network deployment requires an explicitly configured secure profile.
 
@@ -164,7 +165,39 @@ That’s it. The broker routes the message, the target agent accepts or rejects 
 
 ---
 
-## Examples / Demo
+## Why PolyMesh over A2A and alternatives
+
+| | PolyMesh | Google A2A | MCP (Anthropic) |
+|---|---|---|---|
+| **Architecture** | Peer-to-peer mesh | Client-server over HTTP | Client-server over HTTP |
+| **Transport** | WebSocket / Unix socket | HTTPS (REST + SSE) | HTTP + SSE |
+| **Internet needed?** | No — works fully offline | Yes — agents need public HTTPS | Yes (stdlib) or local (custom) |
+| **Discovery** | mDNS + local registry | Agent Card URL registry | None (manual endpoint config) |
+| **Push vs Poll** | Persistent connection, push | Webhook / polling | SSE push (server→client) |
+| **Auth** | Unix creds / loopback token / enrolled WSS | OAuth 2.0 + JWKS | None in spec |
+| **Latency** | Sub-millisecond (UDS), real-time WS | HTTP request-response (10-100ms+) | HTTP + SSE (similar) |
+| **Framework** | Framework-agnostic — any agent implements the spec | Google-centric | Anthropic-centric |
+| **Deploy** | `npm install && polymesh start` | Requires DNS, TLS, OAuth infra | Requires HTTP server |
+| **Offline** | Full local operation | Impossible | Partial (local transport exists) |
+| **License** | MIT | Apache 2.0 | MIT |
+
+### When to choose PolyMesh
+
+- **You want agents to talk on your laptop** without deploying infrastructure
+- **You need sub-millisecond latency** for tight agent coordination loops
+- **Your agents run in an air-gapped or local environment**
+- **You want framework-agnostic** — Hermes, Codex, Claude Code, or your custom agent
+- **You want real-time push** — no polling, no webhook configuration
+
+### When A2A makes more sense
+
+- **Cross-organization agent communication** over the public internet
+- **You're already in the Google Cloud ecosystem** and want native integration
+- **You need a published, multi-vendor standard** with Google's backing
+
+PolyMesh is not a competitor to A2A for the enterprise internet-scale use case. It's an alternative for the **local-first, low-latency, no-infrastructure** use case that A2A explicitly doesn't address — the same way WebSockets didn't replace HTTP, they serve different parts of the stack.
+
+
 
 For a local demo, use the token-file and explicit `--insecure-loopback-dev` commands in [Quick Start](#quick-start). Do not use a tokenless listener or put a runtime token in a URL. LAN and production demos require the enrolled WSS profile; see [SECURITY.md](SECURITY.md).
 
@@ -216,7 +249,7 @@ PolyMesh is under active development. **Current version:** 0.2.0 — **Test suit
 ## Links
 
 - **Security guidance and disclosure:** [`SECURITY.md`](./SECURITY.md)
-- **Repository:** https://github.com/mosesman831/polymesh
+- **Repository:** https://github.com/LatticeAG/PolyMesh
 | **Ecosystem:** https://latticeag.vercel.app
 - **Related protocols:**
   - PolyBrain
