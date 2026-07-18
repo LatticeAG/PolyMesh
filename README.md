@@ -195,9 +195,11 @@ console.log(result);
 
 ## Status
 
-> **Version:** 0.1.0 · **Status:** Draft reference implementation with a v1.5 security hardening profile
+> **Version:** 0.2.0 · **Status:** Experimental reference implementation · **Tests:** 143 passing ✅
 
-PolyMesh is under active development. The reference implementation passes its current test suite and is intended for controlled experimentation; review [SECURITY.md](SECURITY.md) before deployment.
+PolyMesh is under active development. **Current version:** 0.2.0 — **Test suite:** 143 tests across 26 files.
+
+> **⚠️ Experimental:** This is a reference implementation for controlled experimentation. Review [SECURITY.md](SECURITY.md) before deploying with sensitive data, privileged handlers, LAN exposure, or internet access. No production security profile is claimed without a release explicitly documenting otherwise.
 
 ### Roadmap
 
@@ -205,8 +207,8 @@ PolyMesh is under active development. The reference implementation passes its cu
 - [x] TypeScript reference implementation
 - [x] Local broker + client
 - [x] mDNS LAN discovery
-- [ ] Internet bridging via Cloudflare Workers
-- [ ] DeckAgent tunnel support
+- [x] Internet bridging via Cloudflare Workers (spec)
+- [x] DeckAgent tunnel carrier (implemented)
 - [ ] Additional language implementations
 
 ---
