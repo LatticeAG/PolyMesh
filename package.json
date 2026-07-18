@@ -1,6 +1,6 @@
 {
   "name": "polymesh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "PolyMesh Protocol reference implementation",
   "type": "module",
@@ -14,6 +14,7 @@
     "build": "npm run build --workspace=@polymesh/broker && npm run build --workspace=@polymesh/client"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.2",
     "@types/ws": "^8.5.14",
     "typescript": "^5.8.3",

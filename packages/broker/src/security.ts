@@ -53,12 +53,15 @@ export interface RuntimeTokenFileOptions {
 }
 
 export type UpgradeValidationResult =
-  | { ok: true; token?: string }
+  | { ok: true; token?: string; subprotocol?: string }
   | { ok: false; status: 400 | 403 | 426; statusText: string; headers?: Record<string, string> };
 
 export interface StrictUpgradeOptions {
   path: string;
-  subprotocol: string;
+  /** Legacy one-profile form; it retains strict exact-header matching. */
+  subprotocol?: string;
+  /** Explicit opt-in profile set, used for separate v0.1/v0.2 sessions. */
+  subprotocols?: readonly string[];
   allowedOrigins?: readonly string[];
 }
 
@@ -74,7 +77,7 @@ interface TlsExporterSocket {
  * identity handshake treats `undefined` as authentication failure rather
  * than replacing it with a session ID or nonce-derived surrogate.
  */
-export function tlsChannelBinding(transport: unknown): string | undefined {
+export function tlsChannelBinding(transport: unknown, exporterLabel = POLYMESH_TLS_EXPORTER_LABEL): string | undefined {
   const socket: TlsExporterSocket | undefined =
     typeof transport === "object" && transport !== null && "_socket" in transport
       ? (transport as { _socket?: TlsExporterSocket })._socket
@@ -83,7 +86,8 @@ export function tlsChannelBinding(transport: unknown): string | undefined {
     return undefined;
   }
   try {
-    const material = socket.exportKeyingMaterial(32, POLYMESH_TLS_EXPORTER_LABEL, Buffer.alloc(0));
+    if (typeof exporterLabel !== "string" || exporterLabel.length === 0 || exporterLabel.length > 255) return undefined;
+    const material = socket.exportKeyingMaterial(32, exporterLabel, Buffer.alloc(0));
     return Buffer.isBuffer(material) && material.byteLength === 32 ? material.toString("base64url") : undefined;
   } catch {
     return undefined;
@@ -251,12 +255,29 @@ export function validateWebSocketUpgrade(request: IncomingMessage, options: Stri
   if (!hasSingleUpgradeConnectionToken(onlyHeader(headers, "connection"))) return badRequest();
   if (!isValidWebSocketKey(onlyHeader(headers, "sec-websocket-key"))) return badRequest();
   if (onlyHeader(headers, "sec-websocket-version") !== "13") return badRequest();
-  if (onlyHeader(headers, "sec-websocket-protocol") !== options.subprotocol) {
+  const offeredHeader = onlyHeader(headers, "sec-websocket-protocol");
+  const configured = options.subprotocols === undefined
+    ? (options.subprotocol === undefined ? [] : [options.subprotocol])
+    : [...options.subprotocols];
+  if (configured.length === 0 || configured.some((protocol) => typeof protocol !== "string" || protocol.length === 0 || /[\s,]/.test(protocol))) {
+    throw new TypeError("At least one valid WebSocket subprotocol is required");
+  }
+  let selected: string | undefined;
+  if (options.subprotocols === undefined) {
+    // Preserve the legacy endpoint's strict one-profile behaviour.
+    selected = offeredHeader === options.subprotocol ? options.subprotocol : undefined;
+  } else if (offeredHeader !== undefined) {
+    const offered = offeredHeader.split(",").map((entry) => entry.trim());
+    if (offered.length > 0 && offered.every((entry) => entry.length > 0) && new Set(offered).size === offered.length) {
+      selected = configured.find((protocol) => offered.includes(protocol));
+    }
+  }
+  if (selected === undefined) {
     return {
       ok: false,
       status: 426,
       statusText: "Upgrade Required",
-      headers: { "Sec-WebSocket-Protocol": options.subprotocol },
+      headers: { "Sec-WebSocket-Protocol": configured.join(", ") },
     };
   }
   if (headers.has("transfer-encoding") || (headers.has("content-length") && onlyHeader(headers, "content-length") !== "0")) {
@@ -273,7 +294,7 @@ export function validateWebSocketUpgrade(request: IncomingMessage, options: Stri
     return { ok: false, status: 403, statusText: "Forbidden" };
   }
 
-  return { ok: true, token: onlyHeader(headers, "x-polymesh-token") };
+  return { ok: true, token: onlyHeader(headers, "x-polymesh-token"), subprotocol: selected };
 }
 
 /**
