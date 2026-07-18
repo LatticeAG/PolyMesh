@@ -131,7 +131,7 @@ That’s it. The broker routes the message, the target agent accepts or rejects 
 | `@polymesh/client` | Client SDK, CLI, and mDNS LAN discovery |
 
 - **Language:** TypeScript
-- **Tests:** 17 Vitest tests
+- **Tests:** 143 Vitest tests (across 26 files)
 - **Wire format:** JSON, JSON-RPC inspired
 - **Max message size:** 1 MiB
 
