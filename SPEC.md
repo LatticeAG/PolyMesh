@@ -616,7 +616,8 @@ Every PolyMesh agent MUST implement:
 | `org.polymesh.code.review` | Review code | `{diff, context}` | `{comments}` | pure | read |
 | `org.polymesh.code.build` | Build project | `{target, config}` | `{output, success}` | idempotent | write |
 | `org.polymesh.notify.send` | Send notification | `{channel, message}` | `{delivered}` | idempotent | network |
-| `org.polymesh.file.search` | Search files | `{pattern, root}` | `{matches}` | pure | read |
+| `org.polymesh.file.search` | Search files | `{pattern, root?, max_results?, max_bytes?, include_hidden?}` | `{files, truncated}` | pure | read |
+| `org.polymesh.shell.exec` | Execute command | `{command, args?, cwd?, timeout_ms?, stdin_utf8?, env?, kill_grace_ms?}` | `{exit_code, signal, stdout, stderr, timed_out}` | sensitive | write |
 | `org.polymesh.process.list` | List processes | `{}` | `{processes}` | pure | read |
 | `org.polymesh.mcp.execute` | Forward MCP tool call | `{tool, args}` | `{result}` | idempotent | network |
 
@@ -788,19 +789,133 @@ Cache `max-age: 60`. Do NOT follow redirects. Do NOT treat as authoritative iden
 
 ### 8.6 Heartbeat & Reconnection
 
+Heartbeat timers use a local monotonic clock. Wall-clock time MUST NOT be used to measure ping intervals, pong deadlines, inactivity, stable-session duration, or reconnect delays.
+
 | Parameter | Value |
-|-----------|-------|
+|:---|---:|
 | Ping interval | 30 seconds |
-| Inbound timeout | 90 seconds (no valid traffic = HEARTBEAT_TIMEOUT) |
+| Pong deadline | 5 seconds after transport accepts the ping write |
+| Inbound timeout | 90 seconds with no valid inbound PolyMesh record |
 | Initial retry delay | 1 second |
-| Max retry delay | 60 seconds |
-| Backoff factor | 2× (+±20% jitter) |
-| Backoff reset condition | 90 seconds of stable session |
+| Maximum retry delay | 60 seconds |
+| Backoff factor | 2× with ±20% jitter |
+| Backoff reset condition | 90 seconds of uninterrupted `ACTIVE` session time |
+
+Heartbeat processing starts only after both `ready` records are exchanged. A **valid inbound record** is fully framed, decoded, authenticated, and valid for the current session state. Every valid inbound record refreshes the 90-second inbound timer.
+
+A `pong` satisfies a pending heartbeat only if `params.n` exactly matches the outstanding ping sequence number. `n` MUST be a non-negative JSON safe integer and MUST increase monotonically for the lifetime of the session.
+
+```text
+const PING_INTERVAL_MS    = 30_000
+const PONG_TIMEOUT_MS     = 5_000
+const INBOUND_TIMEOUT_MS  = 90_000
+const STABLE_SESSION_MS   = 90_000
+
+function activate(session):
+    now = monotonic_now_ms()
+    session.state = ACTIVE
+    session.generation += 1
+    session.active_since = now
+    session.last_valid_inbound = now
+    session.next_ping_at = now + PING_INTERVAL_MS
+    session.next_ping_n = 0
+    session.pending_ping = null
+    session.outstanding_ping = null
+    session.backoff_reset = false
+    arm_heartbeat(session)
+
+function on_valid_inbound(session, record):
+    if session.state != ACTIVE:
+        return
+    now = monotonic_now_ms()
+    session.last_valid_inbound = now
+    if record.type == "ping":
+        n = record.params.n
+        if not enqueueControl(session, {type: "pong", params: {n: n}}):
+            fail_session(session, "HEARTBEAT_TIMEOUT", retryable=true)
+            return
+    if record.type == "pong":
+        n = record.params.n
+        if session.outstanding_ping != null and
+           session.outstanding_ping.n == n:
+            session.outstanding_ping = null
+        else if session.pending_ping != null and
+                session.pending_ping.n == n:
+            session.pending_ping.pong_received = true
+    arm_heartbeat(session)
+
+function heartbeat_tick(session, captured_generation):
+    if session.state != ACTIVE or session.generation != captured_generation:
+        return
+    now = monotonic_now_ms()
+    if session.pending_ping != null and now >= session.pending_ping.write_deadline:
+        fail_session(session, "HEARTBEAT_TIMEOUT", retryable=true); return
+    if session.outstanding_ping != null and now >= session.outstanding_ping.pong_deadline:
+        fail_session(session, "HEARTBEAT_TIMEOUT", retryable=true); return
+    if now - session.last_valid_inbound >= INBOUND_TIMEOUT_MS:
+        fail_session(session, "HEARTBEAT_TIMEOUT", retryable=true); return
+    if not session.backoff_reset and now - session.active_since >= STABLE_SESSION_MS:
+        reconnect_attempt = 0
+        session.backoff_reset = true
+    if session.pending_ping == null and session.outstanding_ping == null and now >= session.next_ping_at:
+        begin_ping(session, now)
+    arm_heartbeat(session)
+
+function begin_ping(session, now):
+    n = session.next_ping_n
+    session.next_ping_n += 1
+    session.pending_ping = {n: n, write_deadline: now + PONG_TIMEOUT_MS, pong_received: false}
+    accepted = enqueueControl(session, {type: "ping", params: {n: n}},
+        onWritten = function():
+            if session.state != ACTIVE or session.pending_ping == null or session.pending_ping.n != n:
+                return
+            written_at = monotonic_now_ms()
+            if session.pending_ping.pong_received:
+                session.pending_ping = null
+            else:
+                session.outstanding_ping = {n: n, pong_deadline: written_at + PONG_TIMEOUT_MS}
+                session.pending_ping = null
+            session.next_ping_at = written_at + PING_INTERVAL_MS
+            arm_heartbeat(session))
+    if not accepted:
+        fail_session(session, "HEARTBEAT_TIMEOUT", retryable=true)
+
+function arm_heartbeat(session):
+    cancel_timer(session.heartbeat_timer)
+    now = monotonic_now_ms()
+    due = session.last_valid_inbound + INBOUND_TIMEOUT_MS
+    if session.pending_ping != null:
+        due = min(due, session.pending_ping.write_deadline)
+    if session.outstanding_ping != null:
+        due = min(due, session.outstanding_ping.pong_deadline)
+    if session.pending_ping == null and session.outstanding_ping == null:
+        due = min(due, session.next_ping_at)
+    if not session.backoff_reset:
+        due = min(due, session.active_since + STABLE_SESSION_MS)
+    session.heartbeat_timer = set_timer(max(1, due - now),
+        function(): heartbeat_tick(session, session.generation))
+
+function on_transport_closed(reason):
+    cancel_timer(session.heartbeat_timer)
+    if not reason.retryable or reason.code == "DUPLICATE_CONNECTION":
+        return
+    base_delay = min(1_000 * (2 ^ reconnect_attempt), 60_000)
+    delay = min(60_000, base_delay * random_uniform(0.8, 1.2))
+    reconnect_attempt += 1
+    set_timer(delay, function():
+        reconnect_transport()
+        // Complete hello/card/ready before sending RESUME.
+    )
+```
+
+`fail_session` MUST be idempotent. It cancels heartbeat timers, performs best-effort graceful close when writable, tears down the transport, and schedules reconnect only for retryable failures.
 
 **Graceful close:**
 ```text
 A: CLOSE {code, retryable} → B: CLOSE_ACK → WebSocket Close/UDS shutdown
 ```
+
+A peer MUST NOT wait indefinitely for `CLOSE_ACK`; after one second it MUST complete transport shutdown and apply the reconnect rule.
 
 ### 8.7 Concurrent Connection Arbitration
 
@@ -830,9 +945,11 @@ Changed `instance_id` = restart. Task outcome unknown; do NOT replay non-idempot
 **MUST NOT:**
 - Scan ports
 - Probe alternate ports after failure
-- Use relay, broker, STUN, ICE, or NAT hole-punching
+- Use relay, STUN, ICE, or NAT hole-punching
 - Interpret mDNS TXT, HTTP discovery, source IP, or TLS alone as identity
 - Expose secrets or Agent Cards in discovery records
+
+A local **router** (message-forwarding process) is permitted but must not impersonate agents, modify message payloads, or bypass authentication. The router is a convenience for same-machine agent-to-agent connectivity, not a NAT-traversal relay.
 
 ---
 
@@ -1024,7 +1141,6 @@ Runtime tokens (loopback):
 │   │   │   ├── protocol.ts    # 35 LOC — Types, guards, schemas
 │   │   │   ├── registry.ts    # 120 LOC — Agent registry, TTL, routing
 │   │   │   └── broker.ts      # 120 LOC — WebSocket server, handshake, auth, dispatch
-│   │   └── package.json
 │   └── client/
 │       ├── src/
 │       │   ├── client.ts      # 75 LOC — Connect, discover, call, respond
@@ -1036,7 +1152,7 @@ Runtime tokens (loopback):
 └── package.json
 ```
 
-~295 LOC total production code.
+~415 LOC total production code across all files.
 
 ### 11.2 Key Dependencies
 
@@ -1106,6 +1222,11 @@ The broker is a message router, not a state machine. It:
 | Clock skew (client) | Server clock is authoritative. No implicit grace period |
 | Clock skew (server backward) | MUST NOT extend tasks beyond monotonic expiry |
 | Rate limit exceeded | Return `RATE_LIMITED`. Honor `retry_after_ms` |
+| Network partition / split-brain session | Heartbeat failure means transport reachability unknown. MUST NOT be interpreted as task cancellation or authorization revocation. On reconnect, apply duplicate-session arbitration, exchange `RESUME`, reconcile lifecycle state by `(task_id, event_seq)` and `received_through`. Executor-side task-row locking and fencing tokens MUST ensure only one worker can commit a transition. |
+| Zombie registry registration | Registry lease binds `lease_id`, `agent_id`, `instance_id`, endpoint, and peer credential. Expired registrations not returned by `lookup`/`list`. Renewals match lease ID, not `agent_id`. `ECONNREFUSED` marks only matching lease stale; never unlink another process's socket. |
+| Slow consumer backpressure | Apply bounded queue rules (see §2.3). Lifecycle records in outbox MUST NOT be dropped. Pause reads, reserve control capacity, reject new submissions with retryable `OVERLOADED` before durable admission when processing cannot be bounded. |
+| Concurrent instance migration | Replacement uses new `instance_id`, may coexist with old instance under same `agent_id`. In-flight tasks pinned to accepting executor. New instance MUST NOT accept/cancel/complete old-instance tasks unless explicit fenced handoff above PolyMesh. |
+| Version negotiation between 0.1.x agents | All `0.1.x` use `hello.v: "0.1"` and `protocol: "polymesh.0.1"`. Patch releases remain wire-compatible. Peer with unsupported wire profile rejected with `UNSUPPORTED_PROTOCOL_VERSION`. MUST NOT silently downgrade. |
 
 ---
 
