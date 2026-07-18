@@ -217,7 +217,7 @@ PolyMesh is under active development. **Current version:** 0.2.0 — **Test suit
 
 - **Security guidance and disclosure:** [`SECURITY.md`](./SECURITY.md)
 - **Repository:** https://github.com/mosesman831/polymesh
-- **Ecosystem:** https://latticeag.com
+| **Ecosystem:** https://latticeag.vercel.app
 - **Related protocols:**
   - PolyBrain
   - PolyGnosis
@@ -228,4 +228,4 @@ PolyMesh is under active development. **Current version:** 0.2.0 — **Test suit
 
 PolyMesh is released under the [MIT License](LICENSE).
 
-A [LatticeAG](https://latticeag.com) protocol.
+A [LatticeAG](https://latticeag.vercel.app) protocol.
