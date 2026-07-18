@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node", "vitest/globals"],
+    "baseUrl": ".",
+    "paths": {
+      "@polymesh/broker": ["packages/broker/src/index.ts"],
+      "@polymesh/broker/*": ["packages/broker/src/*"],
+      "@polymesh/client": ["packages/client/src/index.ts"],
+      "@polymesh/client/*": ["packages/client/src/*"]
+    }
+  },
+  "include": ["packages/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]
+}
