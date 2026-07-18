@@ -13,7 +13,7 @@
 
 An open, local-first protocol for agent-to-agent communication.
 
-[What is PolyMesh](#what-is-polymesh) · [Quick Start](#quick-start) · [Why PolyMesh](#why-polymesh) · [Architecture](#architecture) · [Features](#features) · [Examples](#examples) · [Status](#status) · [License](#license)
+[What is PolyMesh](#what-is-polymesh) · [Quick Start](#quick-start) · [Why PolyMesh](#why-polymesh) · [Architecture](#architecture) · [Features](#features) · [Examples](#examples) · [Security](SECURITY.md) · [Status](#status) · [License](#license)
 
 </div>
 
@@ -22,6 +22,8 @@ An open, local-first protocol for agent-to-agent communication.
 ## What is PolyMesh?
 
 PolyMesh is an **open protocol** — not a product — for AI agents to discover each other, exchange capability declarations, delegate tasks, and coordinate locally.
+
+> **Security:** Read [SECURITY.md](SECURITY.md) before exposing a listener or giving an agent access to data or side-effecting capabilities. The reference implementation is experimental; network deployment requires an explicitly configured secure profile.
 
 Think of it as the **phone network for AI agents**: any agent can pick up the protocol, announce what it can do, and call on another agent without needing cloud infrastructure, a global registry, or a blockchain.
 
@@ -50,28 +52,36 @@ npm install
 npm run build
 ```
 
-### Start a broker
+### Start a local development broker
 
 ```bash
-npx @polymesh/broker
+# Create an owner-only 32-byte runtime token for this local session.
+umask 077
+node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))" \
+  > "${XDG_RUNTIME_DIR:?}/polymesh-token"
+
+# Plain ws:// is deliberately limited to an explicitly named loopback-dev profile.
+npx @polymesh/client start --token-file "${XDG_RUNTIME_DIR}/polymesh-token" --insecure-loopback-dev
 ```
 
-The broker listens on `ws://127.0.0.1:8080` by default and maintains a local registry of connected agents.
+The local development broker listens on `ws://127.0.0.1:7337` by default and maintains a local registry of connected agents. For LAN or production deployment, use the enrolled WSS profile described in [SECURITY.md](SECURITY.md).
 
 ### Connect from a client
 
 ```bash
-npx @polymesh/client --connect ws://127.0.0.1:8080 --agent-id my-agent
+npx @polymesh/client connect ws://127.0.0.1:7337 \
+  --token-file "${XDG_RUNTIME_DIR}/polymesh-token" \
+  --insecure-loopback-dev
 ```
 
 ### Call another agent
 
 ```bash
 npx @polymesh/client \
-  --connect ws://127.0.0.1:8080 \
-  --target calendar-agent \
-  --method org.polymesh.calendar.read \
-  --params '{"date": "2026-07-18"}'
+  call calendar-agent org.polymesh.calendar.read '{"date": "2026-07-18"}' \
+  --url ws://127.0.0.1:7337 \
+  --token-file "${XDG_RUNTIME_DIR}/polymesh-token" \
+  --insecure-loopback-dev
 ```
 
 That’s it. The broker routes the message, the target agent accepts or rejects the task, and you receive progress and completion events.
@@ -156,42 +166,20 @@ That’s it. The broker routes the message, the target agent accepts or rejects 
 
 ## Examples / Demo
 
-### Two agents on the same broker
-
-Terminal 1 — start a broker:
-
-```bash
-npx @polymesh/broker --port 8080
-```
-
-Terminal 2 — register an executor agent:
-
-```bash
-npx @polymesh/client \
-  --connect ws://127.0.0.1:8080 \
-  --agent-id executor-agent \
-  --capability '{"method":"echo","input_schema":{"type":"object"}}'
-```
-
-Terminal 3 — send it a task:
-
-```bash
-npx @polymesh/client \
-  --connect ws://127.0.0.1:8080 \
-  --agent-id caller-agent \
-  --target executor-agent \
-  --method echo \
-  --params '{"message": "hello world"}'
-```
+For a local demo, use the token-file and explicit `--insecure-loopback-dev` commands in [Quick Start](#quick-start). Do not use a tokenless listener or put a runtime token in a URL. LAN and production demos require the enrolled WSS profile; see [SECURITY.md](SECURITY.md).
 
 ### Programmatic client
 
 ```typescript
 import { PolyMeshClient } from '@polymesh/client';
+import { createAgentCard } from '@polymesh/broker';
 
 const client = new PolyMeshClient({
-  brokerUrl: 'ws://127.0.0.1:8080',
-  agentId: 'my-agent',
+  card: createAgentCard({ agent_id: 'my-agent' }),
+  url: 'ws://127.0.0.1:7337',
+  // Read from an owner-only token file or keychain; never embed it in a URL.
+  token: process.env.POLYMESH_LOCAL_TOKEN,
+  allowInsecureLoopbackDevelopment: true,
 });
 
 await client.connect();
@@ -207,9 +195,9 @@ console.log(result);
 
 ## Status
 
-> **Version:** 0.1.0 · **Status:** Draft specification + reference implementation
+> **Version:** 0.1.0 · **Status:** Draft reference implementation with a v1.5 security hardening profile
 
-PolyMesh is under active development. The wire format, message types, and Agent Card schema are defined in `SPEC.md`. The reference implementation passes the current test suite and is ready for experimentation.
+PolyMesh is under active development. The reference implementation passes its current test suite and is intended for controlled experimentation; review [SECURITY.md](SECURITY.md) before deployment.
 
 ### Roadmap
 
@@ -225,7 +213,7 @@ PolyMesh is under active development. The wire format, message types, and Agent 
 
 ## Links
 
-- **Protocol specification:** [`SPEC.md`](./SPEC.md)
+- **Security guidance and disclosure:** [`SECURITY.md`](./SECURITY.md)
 - **Repository:** https://github.com/mosesman831/polymesh
 - **Ecosystem:** https://latticeag.com
 - **Related protocols:**

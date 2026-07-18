@@ -1,6 +1,6 @@
 {
   "name": "@polymesh/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "PolyMesh client and CLI",
   "type": "module",
   "types": "./dist/index.d.ts",

@@ -2,5 +2,7 @@
 export * from "./client.js";
 export * from "./cli.js";
 export * from "./mdns.js";
+export * from "./policy.js";
+export * from "./replay-ledger.js";
 
 export { PolyMeshClient as default } from "./client.js";

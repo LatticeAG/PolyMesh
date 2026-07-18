@@ -1,6 +1,6 @@
 {
   "name": "@polymesh/broker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "PolyMesh WebSocket broker and registry",
   "type": "module",
   "types": "./dist/index.d.ts",
@@ -26,9 +26,30 @@
     "./broker": {
       "types": "./dist/broker.d.ts",
       "default": "./dist/broker.js"
+    },
+    "./durable-store": {
+      "types": "./dist/durable-store.d.ts",
+      "default": "./dist/durable-store.js"
+    },
+    "./routing": {
+      "types": "./dist/routing.d.ts",
+      "default": "./dist/routing.js"
+    },
+    "./rate-limit": {
+      "types": "./dist/rate-limit.d.ts",
+      "default": "./dist/rate-limit.js"
+    },
+    "./compression": {
+      "types": "./dist/compression.d.ts",
+      "default": "./dist/compression.js"
+    },
+    "./v2": {
+      "types": "./dist/v2.d.ts",
+      "default": "./dist/v2.js"
     }
   },
   "dependencies": {
+    "better-sqlite3": "^11.10.0",
     "ws": "^8.21.1"
   }
 }
