@@ -1,5 +1,28 @@
+# PolyMesh — GitIgnore
+
+# Governance — only exists in authorized local clones
+AGENTS.md
+
+# Specifications — proprietary protocol design, not for public distribution
+SPEC*.md
+spec*.md
+
+# Codex design reviews — contains security analysis and internal critiques
+CODEIX-REVIEW*.md
+codeix-review*.md
+review-*.md
+REVIEW-*.md
+
+# Build artifacts and temporary files
+build-prompt*.md
+BUILD-PROMPT*.md
+*.log
+*.tmp
+
+# Node
 node_modules/
 dist/
-coverage/
-*.tsbuildinfo
-.DS_Store
+
+# Environment
+.env
+.env.local
