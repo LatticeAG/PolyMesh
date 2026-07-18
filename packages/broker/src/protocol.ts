@@ -2093,25 +2093,65 @@ export interface WireMessageEvent {
 }
 
 /**
+ * Public WebSocket-shaped transport surface used by brokers and clients.
+ *
+ * `WireTransport` used to be only the concrete in-memory implementation
+ * below.  Keeping its public contract structural lets a real carrier (for
+ * example the DeckAgent tunnel adapter) participate in the same APIs without
+ * inheriting the in-memory peer and listener bookkeeping.
+ */
+export interface WireTransport {
+  readonly CONNECTING: number;
+  readonly OPEN: number;
+  readonly CLOSING: number;
+  readonly CLOSED: number;
+  readyState: number;
+  onmessage?: (event: WireMessageEvent) => void;
+  onclose?: (event: { code: number; reason: string }) => void;
+  onerror?: (event: { error: Error }) => void;
+  readonly isOpen: boolean;
+  /** @internal Connects the in-memory implementation to its peer. */
+  connect(peer: WireTransport): void;
+  on(event: "message", listener: WireMessageListener): this;
+  on(event: "close", listener: WireCloseListener): this;
+  on(event: "error", listener: WireErrorListener): this;
+  on(event: "open", listener: WireOpenListener): this;
+  once(event: "message", listener: WireMessageListener): this;
+  once(event: "close", listener: WireCloseListener): this;
+  once(event: "error", listener: WireErrorListener): this;
+  once(event: "open", listener: WireOpenListener): this;
+  off(event: "message", listener: WireMessageListener): this;
+  off(event: "close", listener: WireCloseListener): this;
+  off(event: "error", listener: WireErrorListener): this;
+  off(event: "open", listener: WireOpenListener): this;
+  addEventListener(event: "message", listener: (event: WireMessageEvent) => void): void;
+  addEventListener(event: "close", listener: (event: { code: number; reason: string }) => void): void;
+  addEventListener(event: "error", listener: (event: { error: Error }) => void): void;
+  send(data: WireData, callback?: (error?: Error) => void): void;
+  close(code?: number, reason?: string): void;
+  terminate(): void;
+}
+
+/**
  * A small in-memory, WebSocket-shaped transport used by integration tests and
  * by embedders that want to exercise routing without opening a port.
  */
-export class WireTransport {
+class InMemoryWireTransport implements WireTransport {
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
   static readonly CLOSING = 2;
   static readonly CLOSED = 3;
 
-  readonly CONNECTING = WireTransport.CONNECTING;
-  readonly OPEN = WireTransport.OPEN;
-  readonly CLOSING = WireTransport.CLOSING;
-  readonly CLOSED = WireTransport.CLOSED;
-  readyState = WireTransport.OPEN;
+  readonly CONNECTING = InMemoryWireTransport.CONNECTING;
+  readonly OPEN = InMemoryWireTransport.OPEN;
+  readonly CLOSING = InMemoryWireTransport.CLOSING;
+  readonly CLOSED = InMemoryWireTransport.CLOSED;
+  readyState = InMemoryWireTransport.OPEN;
   onmessage?: (event: WireMessageEvent) => void;
   onclose?: (event: { code: number; reason: string }) => void;
   onerror?: (event: { error: Error }) => void;
 
-  private peer?: WireTransport;
+  private peer?: InMemoryWireTransport;
   private readonly messageListeners = new Set<WireMessageListener>();
   private readonly closeListeners = new Set<WireCloseListener>();
   private readonly errorListeners = new Set<WireErrorListener>();
@@ -2119,11 +2159,17 @@ export class WireTransport {
 
   /** @internal */
   connect(peer: WireTransport): void {
+    // This hook belongs to the in-memory test double. A production transport
+    // can satisfy the public WireTransport interface without exposing the
+    // in-memory receiver that makes a pair possible.
+    if (!(peer instanceof InMemoryWireTransport)) {
+      throw new TypeError("In-memory wires can only connect to another in-memory wire");
+    }
     this.peer = peer;
   }
 
   get isOpen(): boolean {
-    return this.readyState === WireTransport.OPEN;
+    return this.readyState === InMemoryWireTransport.OPEN;
   }
 
   on(event: "message", listener: WireMessageListener): this;
@@ -2236,14 +2282,17 @@ export class WireTransport {
   }
 
   private finishClose(code: number, reason: string, closePeer: boolean): void {
-    if (this.readyState === WireTransport.CLOSED) return;
-    this.readyState = WireTransport.CLOSED;
+    if (this.readyState === InMemoryWireTransport.CLOSED) return;
+    this.readyState = InMemoryWireTransport.CLOSED;
     const reasonBuffer = Buffer.from(reason);
     for (const listener of this.closeListeners) listener(code, reasonBuffer);
     this.onclose?.({ code, reason });
     if (closePeer && this.peer) this.peer.finishClose(code, reason, false);
   }
 }
+
+/** Concrete in-memory implementation of the structural WireTransport API. */
+export const WireTransport = InMemoryWireTransport;
 
 export type WirePair = [WireTransport, WireTransport] & {
   a: WireTransport;
@@ -2257,7 +2306,7 @@ export function createWirePair(): WirePair {
   const b = new WireTransport();
   a.connect(b);
   b.connect(a);
-  const pair = [a, b] as WirePair;
+  const pair = [a, b] as unknown as WirePair;
   pair.a = a;
   pair.b = b;
   pair.left = a;
