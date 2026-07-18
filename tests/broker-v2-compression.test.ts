@@ -267,7 +267,7 @@ describe("Broker v0.2 zstd transport integration", () => {
     await expect(store.getOutbox(delivered.delivery_id)).resolves.toMatchObject({ state: "SENT_AWAITING_RECEIPT" });
   });
 
-  it("rejects a compressed delivery receipt without settling its outbox record", async () => {
+  (zstdAvailable ? it : it.skip)("rejects a compressed delivery receipt without settling its outbox record", async () => {
     const token = generateRuntimeToken();
     const store = new InMemoryDurableStore();
     const broker = new Broker({
