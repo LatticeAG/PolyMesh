@@ -39,7 +39,7 @@ describe("polymesh CLI", () => {
     const broker = {
       card: brokerCard,
       port: 7444,
-      url: "ws://127.0.0.1:7444/polymesh",
+      url: "wss://127.0.0.1:7444/polymesh",
       start: vi.fn(async () => broker),
       close: vi.fn(async () => undefined),
     };

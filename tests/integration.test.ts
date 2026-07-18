@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { Broker, createAgentCard, createEnvelope, createWirePair, randomInstanceId, uuidv7 } from "@polymesh/broker";
+import { Broker, capabilityContractTuple, createAgentCard, createEnvelope, createWirePair, generateRuntimeToken, randomInstanceId, uuidv7 } from "@polymesh/broker";
 import { PolyMeshClient } from "@polymesh/client";
 
 const clients: PolyMeshClient[] = [];
 const brokers: Broker[] = [];
+const MEMORY_TOKEN = generateRuntimeToken();
+
+function allow() {
+  return { effect: "allow" as const, ruleId: "test", policyGeneration: 1, leaseId: "test-lease" };
+}
 
 afterEach(async () => {
   for (const client of clients.splice(0)) client.close();
@@ -19,8 +24,14 @@ function card(agentId: string, capability?: string | string[]) {
   });
 }
 
+function contractFor(cardValue: ReturnType<typeof createAgentCard>, capability: string) {
+  const entry = cardValue.capabilities.find((candidate) => candidate.id === capability);
+  if (!entry) throw new Error(`Missing test capability ${capability}`);
+  return entry;
+}
+
 async function createMemoryClients() {
-  const broker = new Broker({ token: "memory-token" });
+  const broker = new Broker({ token: MEMORY_TOKEN });
   brokers.push(broker);
   const alice = new PolyMeshClient({ card: card("alice") });
   const bob = new PolyMeshClient({
@@ -31,13 +42,13 @@ async function createMemoryClients() {
         return { echoed: input };
       },
     },
-    authorize: () => true,
+    authorize: () => allow(),
   });
   clients.push(alice, bob);
   const [aliceWire, brokerAliceWire] = createWirePair();
   const [bobWire, brokerBobWire] = createWirePair();
-  broker.attach(brokerAliceWire, { token: "memory-token" });
-  broker.attach(brokerBobWire, { token: "memory-token" });
+  broker.attach(brokerAliceWire, { token: MEMORY_TOKEN });
+  broker.attach(brokerBobWire, { token: MEMORY_TOKEN });
   await Promise.all([alice.connectTransport(aliceWire), bob.connectTransport(bobWire)]);
   return { broker, alice, bob, aliceWire, bobWire };
 }
@@ -140,6 +151,7 @@ describe("in-memory broker/client integration", () => {
       return {};
     });
     const errors: unknown[] = [];
+    const echoContract = capabilityContractTuple(contractFor(bob.card, "org.example.echo"));
     aliceWire.on("message", (raw) => {
       const frame = JSON.parse(raw) as { type?: string; params?: { code?: string } };
       if (frame.type === "error") errors.push(frame);
@@ -156,6 +168,8 @@ describe("in-memory broker/client integration", () => {
       params: {
         task_id: "0197a1b0-0000-7000-8000-000000000002",
         method: "org.example.echo",
+        capability_version: echoContract.capability_version,
+        capability_contract_digest: echoContract.capability_contract_digest,
         params: {},
         deadline: new Date(Date.now() + 1_000).toISOString(),
       },
@@ -170,19 +184,19 @@ describe("in-memory broker/client integration", () => {
   it("fails a pending caller when the accepting target disconnects", async () => {
     let release!: () => void;
     const never = new Promise<void>((resolve) => { release = resolve; });
-    const broker = new Broker({ token: "memory-token" });
+    const broker = new Broker({ token: MEMORY_TOKEN });
     brokers.push(broker);
     const alice = new PolyMeshClient({ card: card("alice") });
     const bob = new PolyMeshClient({
       card: card("bob", "org.example.wait"),
       handlers: { "org.example.wait": async () => { await never; return {}; } },
-      authorize: () => true,
+      authorize: () => allow(),
     });
     clients.push(alice, bob);
     const [aliceWire, brokerAliceWire] = createWirePair();
     const [bobWire, brokerBobWire] = createWirePair();
-    broker.attach(brokerAliceWire, { token: "memory-token" });
-    broker.attach(brokerBobWire, { token: "memory-token" });
+    broker.attach(brokerAliceWire, { token: MEMORY_TOKEN });
+    broker.attach(brokerBobWire, { token: MEMORY_TOKEN });
     await Promise.all([alice.connectTransport(aliceWire), bob.connectTransport(bobWire)]);
 
     const call = alice.call("bob", "org.example.wait", {});
@@ -201,6 +215,7 @@ describe("in-memory broker/client integration", () => {
       return {};
     });
     const taskId = uuidv7();
+    const waitContract = capabilityContractTuple(contractFor(bob.card, "org.example.wait"));
     const brokerErrors: Array<{ params?: { code?: string } }> = [];
     bobWire.on("message", (raw) => {
       const frame = JSON.parse(raw) as { type?: string; params?: { code?: string } };
@@ -217,6 +232,7 @@ describe("in-memory broker/client integration", () => {
       params: {
         task_id: taskId,
         event_seq: 2,
+        ...waitContract,
         terminal: { outcome: "succeeded", result: {}, completed_at: new Date().toISOString() },
       },
     })));
@@ -229,7 +245,7 @@ describe("in-memory broker/client integration", () => {
   });
 
   it("enforces default-deny policy and validates capability input/result boundaries", async () => {
-    const broker = new Broker({ token: "memory-token" });
+    const broker = new Broker({ token: MEMORY_TOKEN });
     brokers.push(broker);
     const alice = new PolyMeshClient({ card: card("alice") });
     const bob = new PolyMeshClient({
@@ -261,17 +277,21 @@ describe("in-memory broker/client integration", () => {
         "org.example.denied": () => ({ shouldNotRun: true }),
         "org.example.large": () => "x".repeat(1_048_577),
       },
-      authorize: (request) => request.capability !== "org.example.denied",
+      authorize: (request) => request.capability !== "org.example.denied"
+        ? allow()
+        : { effect: "deny", code: "TEST_DENY" },
     });
     clients.push(alice, bob);
     const [aliceWire, brokerAliceWire] = createWirePair();
     const [bobWire, brokerBobWire] = createWirePair();
-    broker.attach(brokerAliceWire, { token: "memory-token" });
-    broker.attach(brokerBobWire, { token: "memory-token" });
+    broker.attach(brokerAliceWire, { token: MEMORY_TOKEN });
+    broker.attach(brokerBobWire, { token: MEMORY_TOKEN });
     await Promise.all([alice.connectTransport(aliceWire), bob.connectTransport(bobWire)]);
 
-    await expect(alice.call("bob", "org.example.typed", {})).rejects.toMatchObject({ code: "INVALID_INPUT" });
-    await expect(alice.call("bob", "org.example.typed", { value: "ok" })).resolves.toEqual({ length: 2 });
+    const typedContract = contractFor(bob.card, "org.example.typed");
+
+    await expect(alice.call("bob", "org.example.typed", {}, { capabilityContract: typedContract })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(alice.call("bob", "org.example.typed", { value: "ok" }, { capabilityContract: typedContract })).resolves.toEqual({ length: 2 });
     await expect(alice.call("bob", "org.example.denied", {})).rejects.toMatchObject({ code: "AUTHORIZATION_DENIED" });
     await expect(alice.call("bob", "org.example.large", {})).rejects.toMatchObject({ code: "RESULT_TOO_LARGE" });
 
@@ -282,7 +302,7 @@ describe("in-memory broker/client integration", () => {
     });
     clients.push(charlie);
     const [charlieWire, brokerCharlieWire] = createWirePair();
-    broker.attach(brokerCharlieWire, { token: "memory-token" });
+    broker.attach(brokerCharlieWire, { token: MEMORY_TOKEN });
     await charlie.connectTransport(charlieWire);
     await expect(alice.call("charlie", "org.example.custom", {})).rejects.toMatchObject({ code: "AUTHORIZATION_DENIED" });
   });
