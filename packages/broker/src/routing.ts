@@ -32,6 +32,115 @@ export const DRAINING = HealthState.DRAINING;
 export const OFFLINE = HealthState.OFFLINE;
 
 /**
+ * Events that may advance a registered instance's durable health state.
+ *
+ * This is deliberately a pure transition vocabulary: the relay/store owns
+ * the fenced compare-and-set and timestamp write, while callers can use this
+ * helper to reject an impossible state change before they allocate a route or
+ * publish an in-memory health signal.
+ */
+export const HealthTransitionEvent = Object.freeze({
+  SOFT_DEADLINE_MISSED: "soft_deadline_missed",
+  HARD_DEADLINE_MISSED: "hard_deadline_missed",
+  FRESH_AUTHENTICATED_PROOF: "fresh_authenticated_proof",
+  FATAL_TRANSPORT_FAILURE: "fatal_transport_failure",
+  ADMIN_DRAIN: "admin_drain",
+  RECOVERY_DRAIN: "recovery_drain",
+  SESSION_OR_LEASE_ENDED: "session_or_lease_ended",
+  DRAIN_DEADLINE_ELAPSED: "drain_deadline_elapsed",
+  AUTHENTICATED_REGISTRATION: "authenticated_registration",
+} as const);
+
+export type HealthTransitionEvent = (typeof HealthTransitionEvent)[keyof typeof HealthTransitionEvent];
+
+/** Inputs needed for one pure, fence-aware health-state decision. */
+export interface HealthTransitionInput {
+  state: HealthState;
+  event: HealthTransitionEvent;
+  /** Current durable registration fence, required for offline recovery. */
+  registrationFence?: number;
+  /** Candidate fence supplied by an authenticated replacement registration. */
+  nextRegistrationFence?: number;
+}
+
+export type HealthTransitionResult =
+  | { ok: true; state: HealthState; changed: boolean }
+  | {
+    ok: false;
+    state: HealthState;
+    code: "INVALID_HEALTH_TRANSITION" | "REGISTRATION_FENCE_REQUIRED";
+  };
+
+/**
+ * Apply the normative v0.2 health graph without mutating durable state.
+ *
+ * In particular, only a fresh authenticated proof can restore SUSPECT, and
+ * OFFLINE can return to HEALTHY only after a registration fence increases.
+ * A caller must still make this result durable with the relevant
+ * registration/session fence in the same transaction as its health update.
+ */
+export function transitionHealthState(input: HealthTransitionInput): HealthTransitionResult {
+  const { state, event } = input;
+  if (!isHealthState(state) || !isHealthTransitionEvent(event)) {
+    return { ok: false, state: isHealthState(state) ? state : OFFLINE, code: "INVALID_HEALTH_TRANSITION" };
+  }
+
+  if (event === HealthTransitionEvent.AUTHENTICATED_REGISTRATION) {
+    if (state !== OFFLINE) return { ok: false, state, code: "INVALID_HEALTH_TRANSITION" };
+    if (!isPositiveRegistrationFence(input.registrationFence) ||
+      !isPositiveRegistrationFence(input.nextRegistrationFence) ||
+      input.nextRegistrationFence <= input.registrationFence) {
+      return { ok: false, state, code: "REGISTRATION_FENCE_REQUIRED" };
+    }
+    return { ok: true, state: HEALTHY, changed: true };
+  }
+
+  if (event === HealthTransitionEvent.SESSION_OR_LEASE_ENDED) {
+    return state === OFFLINE
+      ? { ok: false, state, code: "INVALID_HEALTH_TRANSITION" }
+      : { ok: true, state: OFFLINE, changed: true };
+  }
+
+  if (event === HealthTransitionEvent.DRAIN_DEADLINE_ELAPSED) {
+    return state === DRAINING
+      ? { ok: true, state: OFFLINE, changed: true }
+      : { ok: false, state, code: "INVALID_HEALTH_TRANSITION" };
+  }
+
+  if (event === HealthTransitionEvent.ADMIN_DRAIN || event === HealthTransitionEvent.RECOVERY_DRAIN) {
+    return state === HEALTHY || state === SUSPECT || state === UNHEALTHY
+      ? { ok: true, state: DRAINING, changed: true }
+      : { ok: false, state, code: "INVALID_HEALTH_TRANSITION" };
+  }
+
+  if (event === HealthTransitionEvent.SOFT_DEADLINE_MISSED) {
+    return state === HEALTHY
+      ? { ok: true, state: SUSPECT, changed: true }
+      : { ok: false, state, code: "INVALID_HEALTH_TRANSITION" };
+  }
+
+  if (event === HealthTransitionEvent.HARD_DEADLINE_MISSED) {
+    return state === SUSPECT
+      ? { ok: true, state: UNHEALTHY, changed: true }
+      : { ok: false, state, code: "INVALID_HEALTH_TRANSITION" };
+  }
+
+  if (event === HealthTransitionEvent.FRESH_AUTHENTICATED_PROOF) {
+    return state === SUSPECT
+      ? { ok: true, state: HEALTHY, changed: true }
+      : { ok: false, state, code: "INVALID_HEALTH_TRANSITION" };
+  }
+
+  if (event === HealthTransitionEvent.FATAL_TRANSPORT_FAILURE) {
+    return state === HEALTHY || state === SUSPECT
+      ? { ok: true, state: UNHEALTHY, changed: true }
+      : { ok: false, state, code: "INVALID_HEALTH_TRANSITION" };
+  }
+
+  return { ok: false, state, code: "INVALID_HEALTH_TRANSITION" };
+}
+
+/**
  * A durable instance registration projected into the routing layer. These
  * fields are intentionally metadata only: a process-local socket belongs in
  * a broker connection index, never in a durable route or registry row.
@@ -190,6 +299,16 @@ function isFence(value: unknown): value is number {
 
 function isHealthState(value: unknown): value is HealthState {
   return value === HEALTHY || value === SUSPECT || value === UNHEALTHY || value === DRAINING || value === OFFLINE;
+}
+
+const HEALTH_TRANSITION_EVENT_SET = new Set<string>(Object.values(HealthTransitionEvent));
+
+function isHealthTransitionEvent(value: unknown): value is HealthTransitionEvent {
+  return typeof value === "string" && HEALTH_TRANSITION_EVENT_SET.has(value);
+}
+
+function isPositiveRegistrationFence(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
 }
 
 function sessionFenceOf(instance: Pick<RoutingInstance, "registrationFence" | "sessionFence">): number | undefined {

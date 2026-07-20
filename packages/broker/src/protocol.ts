@@ -18,6 +18,44 @@ import { TextDecoder } from "node:util";
 export const PROTOCOL_VERSION = "polymesh.0.1" as const;
 export const HANDSHAKE_VERSION = "0.1" as const;
 export const CARD_VERSION = "1.0" as const;
+/**
+ * PolyMesh 0.2 is a separate selected wire profile.  These constants live
+ * alongside the legacy values so callers can make the profile choice before
+ * they begin a handshake; v0.2 fields must never be interpreted as optional
+ * extensions of a v0.1 session.
+ */
+export const V2_PROTOCOL_VERSION = "polymesh.0.2" as const;
+export const V2_HANDSHAKE_VERSION = "0.2" as const;
+export const V2_CARD_VERSION = "2.0" as const;
+export const V2_SUBPROTOCOL = V2_PROTOCOL_VERSION;
+/** A v0.2 SID is the unpadded base64url encoding of 32 SHA-256 bytes. */
+export const V2_SID_BYTES = 32;
+export const V2_SID_LENGTH = 43;
+export const V2_SID_PATTERN = "^[A-Za-z0-9_-]{43}$";
+export const V2_SID_DOMAIN = "PMX-SID/0.2\0" as const;
+export const V2_HANDSHAKE_TRANSCRIPT_DOMAIN = "PMX-HANDSHAKE/0.2\0" as const;
+export const V2_AUTH_PAIR_DOMAIN = "PMX-AUTH-PAIR/0.2\0" as const;
+export const V2_CARD_DIGEST_DOMAIN = "PMX-CARD-DIGEST/0.2\0" as const;
+export const V2_SEMANTIC_DIGEST_DOMAIN = "PMX-SEMANTIC/0.2\0" as const;
+/** Canonical uppercase Crockford-base32 mesh identifier grammar. */
+export const V2_MESH_ID_PATTERN = "^msh_[0-9A-HJKMNP-TV-Z]{26}$";
+export const V2_RECORD_DIGEST_PATTERN = V2_SID_PATTERN;
+/**
+ * These are declarations rather than a fallback mechanism.  A transport
+ * selects exactly one profile before any record is accepted.
+ */
+export const PROTOCOL_PROFILE_SELECTIONS = Object.freeze({
+  v0_1: Object.freeze({
+    protocol: PROTOCOL_VERSION,
+    handshake_version: HANDSHAKE_VERSION,
+    card_version: CARD_VERSION,
+  }),
+  v0_2: Object.freeze({
+    protocol: V2_PROTOCOL_VERSION,
+    handshake_version: V2_HANDSHAKE_VERSION,
+    card_version: V2_CARD_VERSION,
+  }),
+});
 export const MAX_FRAME_BYTES = 1_048_576;
 /**
  * The only cryptographic identity profile implemented by the reference
@@ -263,6 +301,1141 @@ export interface AgentCard {
   /** Ed25519 signature over the canonical card excluding this field. */
   signature?: string;
 }
+
+/** The profile choice is made before a session begins and remains immutable. */
+export type ProtocolProfileVersion = typeof PROTOCOL_VERSION | typeof V2_PROTOCOL_VERSION;
+export type ProtocolHandshakeVersion = typeof HANDSHAKE_VERSION | typeof V2_HANDSHAKE_VERSION;
+export type ProtocolCardVersion = typeof CARD_VERSION | typeof V2_CARD_VERSION;
+export type ProtocolProfileSelection =
+  | typeof PROTOCOL_PROFILE_SELECTIONS.v0_1
+  | typeof PROTOCOL_PROFILE_SELECTIONS.v0_2;
+
+/**
+ * v0.2 declarations intentionally do not extend the v0.1 record interfaces.
+ * The two profiles have different required fields and therefore must be
+ * selected, not structurally merged.
+ */
+export type V2MeshId = string;
+export type V2SessionId = string;
+export type V2Digest = string;
+export type V2Nonce = string;
+export type V2HandshakeRole = "initiator" | "responder";
+export type V2TransportProfile =
+  | "local-unix/1"
+  | "loopback-wss/1"
+  | "enrolled-wss/1"
+  | "remote-relay/1"
+  | "deckagent-carrier/1";
+export type V2Extension = "compression/zstd";
+export type V2AuthenticationMethod =
+  | "local-unix"
+  | "mtls-enrolled"
+  | "oauth-dpop"
+  | "oauth-mtls"
+  | "deckagent-bound";
+
+/** Limits a peer is willing to receive; they are not send authorization. */
+export interface V2ReceiveLimits {
+  max_wire_bytes: number;
+  max_json_bytes: number;
+  max_uncompressed_bytes: number;
+  max_expansion_ratio: number;
+}
+
+/** v0.2 addresses carry authenticated mesh scope at the wire boundary. */
+export interface V2AgentRef {
+  /** Required remotely; only a selected single-mesh local profile may omit it. */
+  mesh_id?: V2MeshId;
+  agent_id: string;
+  instance_id?: string;
+}
+
+export interface V2AgentIdentity extends V2AgentRef {
+  instance_id: string;
+}
+
+/** The immutable v0.2 delivery fields carried by an application envelope. */
+export interface V2Delivery {
+  delivery_id: string;
+  mode: "at_least_once";
+  idempotency_key: string;
+  deadline: string;
+}
+
+export const V2_APPLICATION_MESSAGE_TYPES = [
+  "task.submit",
+  "task.accepted",
+  "task.rejected",
+  "task.progress",
+  "task.completed",
+  "task.cancel",
+  "task.status",
+  "error",
+] as const;
+
+export type V2ApplicationMessageType = (typeof V2_APPLICATION_MESSAGE_TYPES)[number];
+
+/**
+ * The base v0.2 application-envelope shape.  Type-specific `params` remain
+ * deliberately separate from transport-control records.
+ */
+export interface V2ApplicationEnvelope<
+  T extends V2ApplicationMessageType = V2ApplicationMessageType,
+  P extends JsonObject = JsonObject,
+> {
+  protocol: typeof V2_PROTOCOL_VERSION;
+  type: T;
+  message_id: string;
+  timestamp: string;
+  source: V2AgentIdentity;
+  target: V2AgentRef;
+  delivery: V2Delivery;
+  in_reply_to?: string;
+  params: P;
+}
+
+/** Authentication metadata is correlation material, never a raw credential. */
+export interface V2Authentication {
+  method: V2AuthenticationMethod;
+  principal_id: string;
+  credential_id: string;
+  key_id?: V2Digest;
+  /** Canonical decimal unsigned-64 string. */
+  auth_epoch: string;
+  channel_binding: V2Digest;
+}
+
+/** The v0.2 initiator hello has no SID because the responder derives it. */
+export interface V2HelloInitiatorFrame {
+  type: "hello";
+  v: typeof V2_HANDSHAKE_VERSION;
+  profile: typeof V2_PROTOCOL_VERSION;
+  role: "initiator";
+  agent_id: string;
+  instance_id: string;
+  /** Omitted only by the separately selected local-only profile. */
+  mesh_id?: V2MeshId;
+  nonce: V2Nonce;
+  transport_profile: V2TransportProfile;
+  receive_limits: V2ReceiveLimits;
+  extensions: readonly V2Extension[];
+}
+
+/** The responder hello binds the initiator nonce and supplies the session SID. */
+export interface V2HelloResponderFrame {
+  type: "hello";
+  v: typeof V2_HANDSHAKE_VERSION;
+  profile: typeof V2_PROTOCOL_VERSION;
+  role: "responder";
+  agent_id: string;
+  instance_id: string;
+  /** Omitted only by the separately selected local-only profile. */
+  mesh_id?: V2MeshId;
+  nonce: V2Nonce;
+  echo: V2Nonce;
+  sid: V2SessionId;
+  transport_profile: V2TransportProfile;
+  receive_limits: V2ReceiveLimits;
+  extensions: readonly V2Extension[];
+}
+
+export type V2HelloFrame = V2HelloInitiatorFrame | V2HelloResponderFrame;
+
+/** The post-hello auth record binds one role to the exact hello transcript. */
+export interface V2AuthFrame {
+  type: "auth";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  role: V2HandshakeRole;
+  mesh_id: V2MeshId;
+  transcript_hash: V2Digest;
+  authentication: V2Authentication;
+  /** Opaque, profile-specific proof; it is never a bearer token. */
+  proof?: string;
+}
+
+/** A v0.2 capability advertises the complete contract that it commits to. */
+export interface V2Capability {
+  id: string;
+  version: string;
+  contract_digest: V2Digest;
+  description?: string;
+  input_schema: JsonObject;
+  result_schema: JsonObject;
+  idempotency: "pure" | "idempotent" | "sensitive";
+  side_effects: "none" | "read" | "write" | "network" | "approval" | "execution";
+  approval: "never" | "always" | "threshold";
+  cancellation: "none" | "best_effort" | "supported";
+  timeout_ceiling_seconds: number;
+}
+
+export interface V2Endpoint {
+  transport: "unix" | "wss" | "remote-relay";
+  url: string;
+  scope: "loopback" | "lan" | "remote";
+  security?: "local-unix" | "enrolled-wss" | "remote-relay";
+}
+
+export interface V2CardLimits {
+  max_task_timeout_ms?: number;
+  max_tasks_per_principal?: number;
+  max_input_bytes?: number;
+  max_result_bytes?: number;
+}
+
+/** A signed, mesh-scoped v0.2 Agent Card. */
+export interface V2AgentCard {
+  card_version: typeof V2_CARD_VERSION;
+  mesh_id: V2MeshId;
+  agent_id: string;
+  instance_id: string;
+  display_name?: string;
+  issued_at: string;
+  expires_at: string;
+  revision: number;
+  identity: CardIdentity;
+  endpoints?: readonly V2Endpoint[];
+  capabilities: readonly V2Capability[];
+  limits?: V2CardLimits;
+  metadata?: {
+    description?: string;
+    tags?: readonly string[];
+    icon?: string;
+  };
+  signature: string;
+}
+
+/** The Card transport record is separate from an application envelope. */
+export interface V2CardFrame {
+  type: "card";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  role: V2HandshakeRole;
+  mesh_id: V2MeshId;
+  card_digest: V2Digest;
+  card: V2AgentCard;
+}
+
+/** The final bilateral handshake barrier before application/control traffic. */
+export interface V2ReadyFrame {
+  type: "ready";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  role: V2HandshakeRole;
+  mesh_id: V2MeshId;
+  transcript_hash: V2Digest;
+  auth_digest: V2Digest;
+  self_card_digest: V2Digest;
+  peer_card_digest: V2Digest;
+  receive_limits: V2ReceiveLimits;
+  extensions: readonly V2Extension[];
+}
+
+export interface V2CardUpdateFrame {
+  type: "card.update";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  role: V2HandshakeRole;
+  mesh_id: V2MeshId;
+  previous_card_digest: V2Digest;
+  card_digest: V2Digest;
+  card: V2AgentCard;
+}
+
+/** A receipt is durable delivery correlation, never task-state authority. */
+export type V2DeliveryReceiptRecord = {
+  type: "delivery.receipt";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  mesh_id: V2MeshId;
+  delivery_id: string;
+  message_id: string;
+  record_digest: V2Digest;
+  semantic_digest: V2Digest;
+} & (
+  | { state: "stored" | "duplicate"; code?: never }
+  | { state: "rejected"; code: string }
+);
+
+export interface V2ResumeEntry {
+  partition_id: string;
+  fence: string;
+  received_through: string;
+}
+
+export interface V2DeliveryResumeFrame {
+  type: "delivery.resume";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  mesh_id: V2MeshId;
+  partitions: readonly V2ResumeEntry[];
+}
+
+export interface V2ResumeAckEntry {
+  partition_id: string;
+  fence: string;
+  state: "available" | "unavailable" | "stale_fence";
+  replay_from?: string;
+  available_through?: string;
+  code?: string;
+}
+
+export interface V2DeliveryResumeAckFrame {
+  type: "delivery.resume.ack";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  mesh_id: V2MeshId;
+  partitions: readonly V2ResumeAckEntry[];
+}
+
+export interface V2PingFrame {
+  type: "ping";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  mesh_id: V2MeshId;
+  n: string;
+}
+
+export interface V2PongFrame extends Omit<V2PingFrame, "type"> {
+  type: "pong";
+}
+
+/** Bounded control diagnostic with no task-state authority. */
+export interface V2SessionErrorFrame {
+  type: "session.error";
+  v: typeof V2_HANDSHAKE_VERSION;
+  sid: V2SessionId;
+  mesh_id: V2MeshId;
+  in_reply_to?: string;
+  code: string;
+  message: string;
+  retryable: boolean;
+  retry_after_ms?: number | null;
+  details?: JsonObject;
+}
+
+/** Base v0.2 handshake/control vocabulary prior to compression extensions. */
+export type V2HandshakeRecord =
+  | V2HelloFrame
+  | V2AuthFrame
+  | V2CardFrame
+  | V2ReadyFrame
+  | V2CardUpdateFrame;
+export type V2TransportControlRecord =
+  | V2DeliveryReceiptRecord
+  | V2DeliveryResumeFrame
+  | V2DeliveryResumeAckFrame
+  | V2PingFrame
+  | V2PongFrame
+  | V2SessionErrorFrame;
+
+/** Strict syntactic guards for values which establish the v0.2 wire scope. */
+export function isV2MeshId(value: unknown): value is V2MeshId {
+  return typeof value === "string" && new RegExp(V2_MESH_ID_PATTERN).test(value);
+}
+
+export function isV2SessionId(value: unknown): value is V2SessionId {
+  return typeof value === "string" && new RegExp(V2_SID_PATTERN).test(value) && isBase64Url(value, V2_SID_BYTES);
+}
+
+export function isV2ProtocolProfile(value: unknown): value is typeof PROTOCOL_PROFILE_SELECTIONS.v0_2 {
+  return isRecord(value) &&
+    value.protocol === V2_PROTOCOL_VERSION &&
+    value.handshake_version === V2_HANDSHAKE_VERSION &&
+    value.card_version === V2_CARD_VERSION;
+}
+
+/** Shared Draft 2020-12 vocabulary for the distinct v0.2 profile. */
+export const V2_COMMON_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "https://polymesh.dev/schemas/v2/common.json",
+  title: "PolyMesh v2 common wire values",
+  $defs: {
+    UuidV7: {
+      type: "string",
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    },
+    Digest: { type: "string", pattern: V2_SID_PATTERN },
+    Nonce: { type: "string", pattern: V2_SID_PATTERN },
+    Signature: { type: "string", pattern: "^[A-Za-z0-9_-]{86}$" },
+    MeshId: { type: "string", pattern: V2_MESH_ID_PATTERN },
+    AgentId: {
+      type: "string",
+      minLength: 1,
+      maxLength: 128,
+      pattern: "^[a-z][a-z0-9._-]*[a-z0-9]$|^[a-z]$",
+    },
+    InstanceId: { type: "string", pattern: "^[A-Za-z0-9_-]{22}$" },
+    UInt64: { type: "string", pattern: "^(0|[1-9][0-9]{0,19})$" },
+    DateTimeMs: {
+      type: "string",
+      format: "date-time",
+      pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$",
+    },
+    Semver: {
+      type: "string",
+      pattern: "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+    },
+    CapabilityId: {
+      type: "string",
+      minLength: 3,
+      maxLength: 192,
+      pattern: "^[a-z][a-z0-9]*(?:\\.[a-z][a-z0-9-]*)+$",
+    },
+    IdempotencyKey: {
+      type: "string",
+      minLength: 1,
+      maxLength: 256,
+      pattern: "^[A-Za-z0-9._~:-]+$",
+    },
+    OpaqueId: {
+      type: "string",
+      minLength: 1,
+      maxLength: 192,
+      pattern: "^[A-Za-z0-9._:-]+$",
+    },
+    ErrorCode: {
+      type: "string",
+      minLength: 3,
+      maxLength: 128,
+      pattern: "^[A-Z][A-Z0-9_.]+$",
+    },
+    JsonValue: {
+      anyOf: [
+        { type: "null" },
+        { type: "boolean" },
+        { type: "number" },
+        { type: "string", maxLength: MAX_FRAME_BYTES },
+        { type: "array", maxItems: MAX_JSON_ARRAY_ITEMS, items: { $ref: "#/$defs/JsonValue" } },
+        { type: "object", maxProperties: MAX_JSON_OBJECT_MEMBERS, additionalProperties: { $ref: "#/$defs/JsonValue" } },
+      ],
+    },
+    JsonObject: {
+      type: "object",
+      maxProperties: MAX_JSON_OBJECT_MEMBERS,
+      additionalProperties: { $ref: "#/$defs/JsonValue" },
+    },
+    SourceAddress: {
+      type: "object",
+      additionalProperties: false,
+      required: ["agent_id", "instance_id"],
+      properties: {
+        mesh_id: { $ref: "#/$defs/MeshId" },
+        agent_id: { $ref: "#/$defs/AgentId" },
+        instance_id: { $ref: "#/$defs/InstanceId" },
+      },
+    },
+    TargetAddress: {
+      type: "object",
+      additionalProperties: false,
+      required: ["agent_id"],
+      properties: {
+        mesh_id: { $ref: "#/$defs/MeshId" },
+        agent_id: { $ref: "#/$defs/AgentId" },
+        instance_id: { $ref: "#/$defs/InstanceId" },
+      },
+    },
+    Delivery: {
+      type: "object",
+      additionalProperties: false,
+      required: ["delivery_id", "mode", "idempotency_key", "deadline"],
+      properties: {
+        delivery_id: { $ref: "#/$defs/UuidV7" },
+        mode: { const: "at_least_once" },
+        idempotency_key: { $ref: "#/$defs/IdempotencyKey" },
+        deadline: { $ref: "#/$defs/DateTimeMs" },
+      },
+    },
+    CapabilityTuple: {
+      type: "object",
+      required: ["capability", "capability_version", "capability_contract_digest"],
+      properties: {
+        capability: { $ref: "#/$defs/CapabilityId" },
+        capability_version: { $ref: "#/$defs/Semver" },
+        capability_contract_digest: { $ref: "#/$defs/Digest" },
+      },
+    },
+    StructuredError: {
+      type: "object",
+      additionalProperties: false,
+      required: ["category", "code", "message", "retryable"],
+      properties: {
+        category: { type: "string", enum: ["parse", "protocol", "identity", "routing", "delivery", "resource", "task", "execution", "internal"] },
+        code: { $ref: "#/$defs/ErrorCode" },
+        message: { type: "string", minLength: 1, maxLength: 512 },
+        retryable: { type: "boolean" },
+        retry_after_ms: { type: ["integer", "null"], minimum: 0, maximum: 86_400_000 },
+        details: { $ref: "#/$defs/JsonObject" },
+      },
+    },
+    Cancellation: {
+      type: "object",
+      additionalProperties: false,
+      required: ["code"],
+      properties: {
+        code: { $ref: "#/$defs/ErrorCode" },
+        message: { type: "string", maxLength: 512 },
+      },
+    },
+  },
+} as const;
+
+/**
+ * Closed application-envelope schema for the selected `polymesh.0.2`
+ * profile.  It is intentionally separate from the legacy `ENVELOPE_SCHEMA`:
+ * delivery_id is nested under delivery and mesh scope is part of each address.
+ */
+export const V2_APPLICATION_ENVELOPE_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "https://polymesh.dev/schemas/v2/envelope.json",
+  title: "PolyMesh v2 application envelope",
+  type: "object",
+  additionalProperties: false,
+  required: ["protocol", "type", "message_id", "timestamp", "source", "target", "delivery", "params"],
+  properties: {
+    protocol: { const: V2_PROTOCOL_VERSION },
+    type: { type: "string", enum: V2_APPLICATION_MESSAGE_TYPES },
+    message_id: { $ref: "common.json#/$defs/UuidV7" },
+    timestamp: { $ref: "common.json#/$defs/DateTimeMs" },
+    source: { $ref: "common.json#/$defs/SourceAddress" },
+    target: { $ref: "common.json#/$defs/TargetAddress" },
+    delivery: { $ref: "common.json#/$defs/Delivery" },
+    in_reply_to: { $ref: "common.json#/$defs/UuidV7" },
+    params: { type: "object" },
+  },
+  allOf: [
+    { if: { properties: { type: { const: "task.submit" } } }, then: { properties: { params: { $ref: "#/$defs/TaskSubmit" } } } },
+    { if: { properties: { type: { const: "task.accepted" } } }, then: { required: ["in_reply_to"], properties: { params: { $ref: "#/$defs/TaskAccepted" } } } },
+    { if: { properties: { type: { const: "task.rejected" } } }, then: { required: ["in_reply_to"], properties: { params: { $ref: "#/$defs/TaskRejected" } } } },
+    { if: { properties: { type: { const: "task.progress" } } }, then: { properties: { params: { $ref: "#/$defs/TaskProgress" } } } },
+    { if: { properties: { type: { const: "task.completed" } } }, then: { properties: { params: { $ref: "#/$defs/TaskCompleted" } } } },
+    { if: { properties: { type: { const: "task.cancel" } } }, then: { properties: { params: { $ref: "#/$defs/TaskCancel" } } } },
+    { if: { properties: { type: { const: "task.status" } } }, then: { properties: { params: { $ref: "#/$defs/TaskStatus" } } } },
+    { if: { properties: { type: { const: "error" } } }, then: { required: ["in_reply_to"], properties: { params: { $ref: "#/$defs/ApplicationError" } } } },
+  ],
+  $defs: {
+    TaskSubmit: {
+      type: "object",
+      additionalProperties: false,
+      required: ["task_id", "capability", "capability_version", "capability_contract_digest", "input", "deadline"],
+      properties: {
+        task_id: { $ref: "common.json#/$defs/UuidV7" },
+        capability: { $ref: "common.json#/$defs/CapabilityId" },
+        capability_version: { $ref: "common.json#/$defs/Semver" },
+        capability_contract_digest: { $ref: "common.json#/$defs/Digest" },
+        input: { $ref: "common.json#/$defs/JsonValue" },
+        deadline: { $ref: "common.json#/$defs/DateTimeMs" },
+      },
+    },
+    TaskAccepted: {
+      allOf: [
+        { $ref: "common.json#/$defs/CapabilityTuple" },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["task_id", "event_seq", "accepted_at"],
+          properties: {
+            task_id: { $ref: "common.json#/$defs/UuidV7" },
+            event_seq: { const: 1 },
+            accepted_at: { $ref: "common.json#/$defs/DateTimeMs" },
+            capability: { $ref: "common.json#/$defs/CapabilityId" },
+            capability_version: { $ref: "common.json#/$defs/Semver" },
+            capability_contract_digest: { $ref: "common.json#/$defs/Digest" },
+          },
+        },
+      ],
+    },
+    TaskRejected: {
+      allOf: [
+        { $ref: "common.json#/$defs/CapabilityTuple" },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["task_id", "event_seq", "code", "message"],
+          properties: {
+            task_id: { $ref: "common.json#/$defs/UuidV7" },
+            event_seq: { const: 1 },
+            code: { $ref: "common.json#/$defs/ErrorCode" },
+            message: { type: "string", maxLength: 512 },
+            capability: { $ref: "common.json#/$defs/CapabilityId" },
+            capability_version: { $ref: "common.json#/$defs/Semver" },
+            capability_contract_digest: { $ref: "common.json#/$defs/Digest" },
+          },
+        },
+      ],
+    },
+    TaskProgress: {
+      allOf: [
+        { $ref: "common.json#/$defs/CapabilityTuple" },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["task_id", "event_seq", "progress"],
+          properties: {
+            task_id: { $ref: "common.json#/$defs/UuidV7" },
+            event_seq: { type: "integer", minimum: 2, maximum: Number.MAX_SAFE_INTEGER },
+            capability: { $ref: "common.json#/$defs/CapabilityId" },
+            capability_version: { $ref: "common.json#/$defs/Semver" },
+            capability_contract_digest: { $ref: "common.json#/$defs/Digest" },
+            progress: { $ref: "#/$defs/Progress" },
+          },
+        },
+      ],
+    },
+    TaskCompleted: {
+      allOf: [
+        { $ref: "common.json#/$defs/CapabilityTuple" },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["task_id", "event_seq", "terminal"],
+          properties: {
+            task_id: { $ref: "common.json#/$defs/UuidV7" },
+            event_seq: { type: "integer", minimum: 2, maximum: Number.MAX_SAFE_INTEGER },
+            capability: { $ref: "common.json#/$defs/CapabilityId" },
+            capability_version: { $ref: "common.json#/$defs/Semver" },
+            capability_contract_digest: { $ref: "common.json#/$defs/Digest" },
+            terminal: { $ref: "#/$defs/Terminal" },
+          },
+        },
+      ],
+    },
+    TaskCancel: {
+      type: "object",
+      additionalProperties: false,
+      required: ["task_id"],
+      properties: {
+        task_id: { $ref: "common.json#/$defs/UuidV7" },
+        reason: { type: "string", maxLength: 512 },
+      },
+    },
+    TaskStatus: {
+      oneOf: [{ $ref: "#/$defs/TaskStatusQuery" }, { $ref: "#/$defs/TaskStatusSnapshot" }],
+    },
+    ApplicationError: { $ref: "common.json#/$defs/StructuredError" },
+    Progress: {
+      type: "object",
+      additionalProperties: false,
+      required: ["state"],
+      properties: {
+        state: { type: "string", enum: ["queued", "running", "waiting"] },
+        current: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+        total: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+        status: { type: "string", maxLength: 1_024 },
+      },
+    },
+    Terminal: {
+      oneOf: [
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["outcome", "result", "completed_at"],
+          properties: {
+            outcome: { const: "succeeded" },
+            result: { $ref: "common.json#/$defs/JsonValue" },
+            completed_at: { $ref: "common.json#/$defs/DateTimeMs" },
+          },
+        },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["outcome", "error", "completed_at"],
+          properties: {
+            outcome: { const: "failed" },
+            error: { $ref: "common.json#/$defs/StructuredError" },
+            completed_at: { $ref: "common.json#/$defs/DateTimeMs" },
+          },
+        },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["outcome", "cancellation", "completed_at"],
+          properties: {
+            outcome: { const: "cancelled" },
+            cancellation: { $ref: "common.json#/$defs/Cancellation" },
+            completed_at: { $ref: "common.json#/$defs/DateTimeMs" },
+          },
+        },
+      ],
+    },
+    TaskStatusQuery: {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "task_id"],
+      properties: {
+        kind: { const: "query" },
+        task_id: { $ref: "common.json#/$defs/UuidV7" },
+      },
+    },
+    TaskStatusSnapshot: {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "task_id", "state", "event_seq", "observed_at"],
+      properties: {
+        kind: { const: "snapshot" },
+        task_id: { $ref: "common.json#/$defs/UuidV7" },
+        state: { type: "string", enum: ["accepted", "queued", "running", "waiting", "succeeded", "failed", "cancelled", "rejected", "recovery_required"] },
+        event_seq: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+        observed_at: { $ref: "common.json#/$defs/DateTimeMs" },
+        terminal: { $ref: "#/$defs/Terminal" },
+      },
+    },
+  },
+} as const;
+
+export const V2_ENVELOPE_SCHEMA = V2_APPLICATION_ENVELOPE_SCHEMA;
+export const v2ApplicationEnvelopeSchema = V2_APPLICATION_ENVELOPE_SCHEMA;
+export const v2EnvelopeSchema = V2_APPLICATION_ENVELOPE_SCHEMA;
+
+/** Remote/relay sessions require serialized mesh scope in both addresses. */
+export const V2_REMOTE_ADDRESSES_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "https://polymesh.dev/schemas/v2/remote-addresses.json",
+  $defs: {
+    RemoteSourceAddress: {
+      type: "object",
+      additionalProperties: false,
+      required: ["mesh_id", "agent_id", "instance_id"],
+      properties: {
+        mesh_id: { $ref: "common.json#/$defs/MeshId" },
+        agent_id: { $ref: "common.json#/$defs/AgentId" },
+        instance_id: { $ref: "common.json#/$defs/InstanceId" },
+      },
+    },
+    RemoteTargetAddress: {
+      type: "object",
+      additionalProperties: false,
+      required: ["mesh_id", "agent_id"],
+      properties: {
+        mesh_id: { $ref: "common.json#/$defs/MeshId" },
+        agent_id: { $ref: "common.json#/$defs/AgentId" },
+        instance_id: { $ref: "common.json#/$defs/InstanceId" },
+      },
+    },
+  },
+} as const;
+
+/** Draft 2020-12 schema for the signed v0.2 mesh-scoped Agent Card. */
+export const V2_AGENT_CARD_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "https://polymesh.dev/schemas/v2/card.json",
+  title: "PolyMesh v2 signed Agent Card",
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "card_version", "mesh_id", "agent_id", "instance_id", "issued_at", "expires_at",
+    "revision", "identity", "capabilities", "signature",
+  ],
+  properties: {
+    card_version: { const: V2_CARD_VERSION },
+    mesh_id: { $ref: "common.json#/$defs/MeshId" },
+    agent_id: { $ref: "common.json#/$defs/AgentId" },
+    instance_id: { $ref: "common.json#/$defs/InstanceId" },
+    display_name: { type: "string", minLength: 1, maxLength: 128 },
+    issued_at: { $ref: "common.json#/$defs/DateTimeMs" },
+    expires_at: { $ref: "common.json#/$defs/DateTimeMs" },
+    revision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+    identity: { $ref: "#/$defs/Identity" },
+    endpoints: { type: "array", maxItems: MAX_ENDPOINTS_PER_CARD, uniqueItems: true, items: { $ref: "#/$defs/Endpoint" } },
+    capabilities: { type: "array", minItems: 1, maxItems: MAX_CAPABILITIES_PER_CARD, items: { $ref: "#/$defs/Capability" } },
+    limits: { $ref: "#/$defs/AdvertisedLimits" },
+    metadata: { $ref: "#/$defs/CardMetadata" },
+    signature: { $ref: "common.json#/$defs/Signature" },
+  },
+  $defs: {
+    Identity: {
+      type: "object",
+      additionalProperties: false,
+      required: ["alg", "key_id", "public_key"],
+      properties: {
+        alg: { const: IDENTITY_ALGORITHM },
+        key_id: { $ref: "common.json#/$defs/Digest" },
+        public_key: { type: "string", pattern: V2_SID_PATTERN },
+      },
+    },
+    Endpoint: {
+      type: "object",
+      additionalProperties: false,
+      required: ["transport", "url", "scope"],
+      properties: {
+        transport: { type: "string", enum: ["unix", "wss", "remote-relay"] },
+        url: { type: "string", format: "uri", maxLength: 2_048 },
+        scope: { type: "string", enum: ["loopback", "lan", "remote"] },
+        security: { type: "string", enum: ["local-unix", "enrolled-wss", "remote-relay"] },
+      },
+    },
+    Capability: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "id", "version", "contract_digest", "input_schema", "result_schema", "idempotency",
+        "side_effects", "approval", "cancellation", "timeout_ceiling_seconds",
+      ],
+      properties: {
+        id: { $ref: "common.json#/$defs/CapabilityId" },
+        version: { $ref: "common.json#/$defs/Semver" },
+        contract_digest: { $ref: "common.json#/$defs/Digest" },
+        description: { type: "string", maxLength: 2_048 },
+        input_schema: { $ref: "common.json#/$defs/JsonObject" },
+        result_schema: { $ref: "common.json#/$defs/JsonObject" },
+        idempotency: { type: "string", enum: ["pure", "idempotent", "sensitive"] },
+        side_effects: { type: "string", enum: ["none", "read", "write", "network", "approval", "execution"] },
+        approval: { type: "string", enum: ["never", "always", "threshold"] },
+        cancellation: { type: "string", enum: ["none", "best_effort", "supported"] },
+        timeout_ceiling_seconds: { type: "integer", minimum: 1, maximum: 86_400 },
+      },
+    },
+    AdvertisedLimits: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        max_task_timeout_ms: { type: "integer", minimum: 1, maximum: 86_400_000 },
+        max_tasks_per_principal: { type: "integer", minimum: 1, maximum: 100_000 },
+        max_input_bytes: { type: "integer", minimum: 1, maximum: MAX_FRAME_BYTES },
+        max_result_bytes: { type: "integer", minimum: 1, maximum: MAX_FRAME_BYTES },
+      },
+    },
+    CardMetadata: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        description: { type: "string", maxLength: 2_048 },
+        tags: { type: "array", maxItems: 32, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 64 } },
+        icon: { type: "string", format: "uri", maxLength: 2_048 },
+      },
+    },
+  },
+} as const;
+
+export const v2CommonSchema = V2_COMMON_SCHEMA;
+export const v2RemoteAddressesSchema = V2_REMOTE_ADDRESSES_SCHEMA;
+export const v2AgentCardSchema = V2_AGENT_CARD_SCHEMA;
+
+/**
+ * Draft 2020-12 schema for v0.2 handshake and non-compression control
+ * records.  Session state still determines whether a structurally valid
+ * record is allowed at a particular point in the handshake.
+ */
+export const V2_HANDSHAKE_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "https://polymesh.dev/schemas/v2/control.json",
+  title: "PolyMesh v2 handshake and transport-control records",
+  oneOf: [
+    { $ref: "#/$defs/HelloInitiator" },
+    { $ref: "#/$defs/HelloResponder" },
+    { $ref: "#/$defs/Auth" },
+    { $ref: "#/$defs/Card" },
+    { $ref: "#/$defs/Ready" },
+    { $ref: "#/$defs/CardUpdate" },
+    { $ref: "#/$defs/DeliveryReceipt" },
+    { $ref: "#/$defs/DeliveryResume" },
+    { $ref: "#/$defs/DeliveryResumeAck" },
+    { $ref: "#/$defs/Ping" },
+    { $ref: "#/$defs/Pong" },
+    { $ref: "#/$defs/SessionError" },
+  ],
+  $defs: {
+    ReceiveLimits: {
+      type: "object",
+      additionalProperties: false,
+      required: ["max_wire_bytes", "max_json_bytes", "max_uncompressed_bytes", "max_expansion_ratio"],
+      properties: {
+        max_wire_bytes: { type: "integer", minimum: 4_096, maximum: MAX_FRAME_BYTES },
+        max_json_bytes: { type: "integer", minimum: 4_096, maximum: MAX_FRAME_BYTES },
+        max_uncompressed_bytes: { type: "integer", minimum: 4_096, maximum: MAX_FRAME_BYTES },
+        max_expansion_ratio: { type: "integer", minimum: 1, maximum: 64 },
+      },
+    },
+    Extensions: {
+      type: "array",
+      maxItems: 8,
+      uniqueItems: true,
+      items: { type: "string", enum: ["compression/zstd"] },
+    },
+    Authentication: {
+      type: "object",
+      additionalProperties: false,
+      required: ["method", "principal_id", "credential_id", "auth_epoch", "channel_binding"],
+      properties: {
+        method: { type: "string", enum: ["local-unix", "mtls-enrolled", "oauth-dpop", "oauth-mtls", "deckagent-bound"] },
+        principal_id: { $ref: "common.json#/$defs/OpaqueId" },
+        credential_id: { $ref: "common.json#/$defs/OpaqueId" },
+        key_id: { $ref: "common.json#/$defs/Digest" },
+        auth_epoch: { $ref: "common.json#/$defs/UInt64" },
+        channel_binding: { $ref: "common.json#/$defs/Digest" },
+      },
+    },
+    Session: {
+      type: "object",
+      properties: {
+        v: { const: V2_HANDSHAKE_VERSION },
+        sid: { $ref: "common.json#/$defs/Digest" },
+        mesh_id: { $ref: "common.json#/$defs/MeshId" },
+      },
+    },
+    Role: {
+      type: "object",
+      properties: { role: { type: "string", enum: ["initiator", "responder"] } },
+    },
+    HelloInitiator: {
+      allOf: [
+        {
+          type: "object",
+          required: [
+            "type", "v", "profile", "role", "agent_id", "instance_id", "nonce",
+            "transport_profile", "receive_limits", "extensions",
+          ],
+          properties: {
+            type: { const: "hello" },
+            v: { const: V2_HANDSHAKE_VERSION },
+            profile: { const: V2_PROTOCOL_VERSION },
+            role: { const: "initiator" },
+            agent_id: { $ref: "common.json#/$defs/AgentId" },
+            instance_id: { $ref: "common.json#/$defs/InstanceId" },
+            mesh_id: { $ref: "common.json#/$defs/MeshId" },
+            nonce: { $ref: "common.json#/$defs/Nonce" },
+            transport_profile: { type: "string", enum: ["local-unix/1", "loopback-wss/1", "enrolled-wss/1", "remote-relay/1", "deckagent-carrier/1"] },
+            receive_limits: { $ref: "#/$defs/ReceiveLimits" },
+            extensions: { $ref: "#/$defs/Extensions" },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    HelloResponder: {
+      allOf: [
+        {
+          type: "object",
+          required: [
+            "type", "v", "profile", "role", "agent_id", "instance_id", "nonce", "echo", "sid",
+            "transport_profile", "receive_limits", "extensions",
+          ],
+          properties: {
+            type: { const: "hello" },
+            v: { const: V2_HANDSHAKE_VERSION },
+            profile: { const: V2_PROTOCOL_VERSION },
+            role: { const: "responder" },
+            agent_id: { $ref: "common.json#/$defs/AgentId" },
+            instance_id: { $ref: "common.json#/$defs/InstanceId" },
+            mesh_id: { $ref: "common.json#/$defs/MeshId" },
+            nonce: { $ref: "common.json#/$defs/Nonce" },
+            echo: { $ref: "common.json#/$defs/Nonce" },
+            sid: { $ref: "common.json#/$defs/Digest" },
+            transport_profile: { type: "string", enum: ["local-unix/1", "loopback-wss/1", "enrolled-wss/1", "remote-relay/1", "deckagent-carrier/1"] },
+            receive_limits: { $ref: "#/$defs/ReceiveLimits" },
+            extensions: { $ref: "#/$defs/Extensions" },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    Auth: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        { $ref: "#/$defs/Role" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "role", "mesh_id", "transcript_hash", "authentication"],
+          properties: {
+            type: { const: "auth" },
+            transcript_hash: { $ref: "common.json#/$defs/Digest" },
+            authentication: { $ref: "#/$defs/Authentication" },
+            proof: { type: "string", minLength: 43, maxLength: 4_096, pattern: "^[A-Za-z0-9_-]+$" },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    Card: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        { $ref: "#/$defs/Role" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "role", "mesh_id", "card_digest", "card"],
+          properties: {
+            type: { const: "card" },
+            card_digest: { $ref: "common.json#/$defs/Digest" },
+            card: { $ref: "card.json" },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    Ready: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        { $ref: "#/$defs/Role" },
+        {
+          type: "object",
+          required: [
+            "type", "v", "sid", "role", "mesh_id", "transcript_hash", "auth_digest",
+            "self_card_digest", "peer_card_digest", "receive_limits", "extensions",
+          ],
+          properties: {
+            type: { const: "ready" },
+            transcript_hash: { $ref: "common.json#/$defs/Digest" },
+            auth_digest: { $ref: "common.json#/$defs/Digest" },
+            self_card_digest: { $ref: "common.json#/$defs/Digest" },
+            peer_card_digest: { $ref: "common.json#/$defs/Digest" },
+            receive_limits: { $ref: "#/$defs/ReceiveLimits" },
+            extensions: { $ref: "#/$defs/Extensions" },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    CardUpdate: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        { $ref: "#/$defs/Role" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "role", "mesh_id", "previous_card_digest", "card_digest", "card"],
+          properties: {
+            type: { const: "card.update" },
+            previous_card_digest: { $ref: "common.json#/$defs/Digest" },
+            card_digest: { $ref: "common.json#/$defs/Digest" },
+            card: { $ref: "card.json" },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    DeliveryReceipt: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "mesh_id", "delivery_id", "message_id", "record_digest", "semantic_digest", "state"],
+          properties: {
+            type: { const: "delivery.receipt" },
+            delivery_id: { $ref: "common.json#/$defs/UuidV7" },
+            message_id: { $ref: "common.json#/$defs/UuidV7" },
+            record_digest: { $ref: "common.json#/$defs/Digest" },
+            semantic_digest: { $ref: "common.json#/$defs/Digest" },
+            state: { type: "string", enum: ["stored", "duplicate", "rejected"] },
+            code: { $ref: "common.json#/$defs/ErrorCode" },
+          },
+          allOf: [
+            {
+              if: { properties: { state: { const: "rejected" } } },
+              then: { required: ["code"] },
+              else: { not: { required: ["code"] } },
+            },
+          ],
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    ResumeEntry: {
+      type: "object",
+      additionalProperties: false,
+      required: ["partition_id", "fence", "received_through"],
+      properties: {
+        partition_id: { $ref: "common.json#/$defs/OpaqueId" },
+        fence: { $ref: "common.json#/$defs/UInt64" },
+        received_through: { $ref: "common.json#/$defs/UInt64" },
+      },
+    },
+    DeliveryResume: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "mesh_id", "partitions"],
+          properties: {
+            type: { const: "delivery.resume" },
+            partitions: { type: "array", minItems: 1, maxItems: 128, items: { $ref: "#/$defs/ResumeEntry" } },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    ResumeAckEntry: {
+      type: "object",
+      additionalProperties: false,
+      required: ["partition_id", "fence", "state"],
+      properties: {
+        partition_id: { $ref: "common.json#/$defs/OpaqueId" },
+        fence: { $ref: "common.json#/$defs/UInt64" },
+        state: { type: "string", enum: ["available", "unavailable", "stale_fence"] },
+        replay_from: { $ref: "common.json#/$defs/UInt64" },
+        available_through: { $ref: "common.json#/$defs/UInt64" },
+        code: { $ref: "common.json#/$defs/ErrorCode" },
+      },
+    },
+    DeliveryResumeAck: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "mesh_id", "partitions"],
+          properties: {
+            type: { const: "delivery.resume.ack" },
+            partitions: { type: "array", minItems: 1, maxItems: 128, items: { $ref: "#/$defs/ResumeAckEntry" } },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    Ping: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "mesh_id", "n"],
+          properties: { type: { const: "ping" }, n: { $ref: "common.json#/$defs/UInt64" } },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    Pong: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "mesh_id", "n"],
+          properties: { type: { const: "pong" }, n: { $ref: "common.json#/$defs/UInt64" } },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+    SessionError: {
+      allOf: [
+        { $ref: "#/$defs/Session" },
+        {
+          type: "object",
+          required: ["type", "v", "sid", "mesh_id", "code", "message", "retryable"],
+          properties: {
+            type: { const: "session.error" },
+            in_reply_to: { $ref: "common.json#/$defs/UuidV7" },
+            code: { $ref: "common.json#/$defs/ErrorCode" },
+            message: { type: "string", minLength: 1, maxLength: 512 },
+            retryable: { type: "boolean" },
+            retry_after_ms: { type: ["integer", "null"], minimum: 0, maximum: 86_400_000 },
+            details: { $ref: "common.json#/$defs/JsonObject" },
+          },
+        },
+      ],
+      unevaluatedProperties: false,
+    },
+  },
+} as const;
+
+/** Standalone receipt schema for transports which dispatch control records by type. */
+export const V2_DELIVERY_RECEIPT_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "https://polymesh.dev/schemas/v2/delivery-receipt.json",
+  $ref: "control.json#/$defs/DeliveryReceipt",
+} as const;
+
+export const V2_CONTROL_SCHEMA = V2_HANDSHAKE_SCHEMA;
+export const V2_CONTROL_RECORD_SCHEMA = V2_HANDSHAKE_SCHEMA;
+export const V2_HANDSHAKE_RECORD_SCHEMA = V2_HANDSHAKE_SCHEMA;
+export const v2HandshakeSchema = V2_HANDSHAKE_SCHEMA;
+export const v2ControlSchema = V2_HANDSHAKE_SCHEMA;
+export const v2DeliveryReceiptSchema = V2_DELIVERY_RECEIPT_SCHEMA;
 
 /** JSON Schema form of the base application envelope (draft 2020-12). */
 export const ENVELOPE_SCHEMA = {
@@ -533,6 +1706,10 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[])
 
 function hasRequiredKeys(value: Record<string, unknown>, required: readonly string[]): boolean {
   return required.every((key) => Object.hasOwn(value, key));
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return hasRequiredKeys(value, keys) && hasOnlyKeys(value, keys);
 }
 
 function serializedJsonBytes(value: unknown): number | undefined {
@@ -934,6 +2111,48 @@ export function deriveSessionId(initiatorNonce: string | Uint8Array, responderNo
     .update(`${PROTOCOL_VERSION}\0`, "utf8")
     .update(nonceBytes(initiatorNonce))
     .update(nonceBytes(responderNonce))
+    .digest("base64url");
+}
+
+function v2ChannelBindingBytes(value: string | Uint8Array): Buffer {
+  if (typeof value === "string") {
+    if (!isBase64Url(value, V2_SID_BYTES)) {
+      throw new ProtocolError("MALFORMED_CHANNEL_BINDING", "v0.2 channel binding must be a 32-byte base64url value", "parse");
+    }
+    return Buffer.from(value, "base64url");
+  }
+  const bytes = Buffer.from(value);
+  if (bytes.byteLength !== V2_SID_BYTES) {
+    throw new ProtocolError("MALFORMED_CHANNEL_BINDING", "v0.2 channel binding must contain exactly 32 bytes", "parse");
+  }
+  return bytes;
+}
+
+function v2NonceBytes(value: string | Uint8Array): Buffer {
+  const bytes = nonceBytes(value);
+  if (bytes.byteLength !== V2_SID_BYTES) {
+    throw new ProtocolError("MALFORMED_NONCE", "v0.2 session nonces must contain exactly 32 bytes", "parse");
+  }
+  return bytes;
+}
+
+/**
+ * Derive the v0.2 session correlation value from both hello nonces and the
+ * authenticated channel binding.  Unlike the legacy v0.1 SID this is bound
+ * to the selected profile and cannot be replayed onto another TLS/carrier
+ * session.  It is correlation material, not a credential.
+ */
+export function deriveV2SessionId(
+  initiatorNonce: string | Uint8Array,
+  responderNonce: string | Uint8Array,
+  channelBindingHash: string | Uint8Array,
+): V2SessionId {
+  return createHash("sha256")
+    .update(V2_SID_DOMAIN, "utf8")
+    .update(v2NonceBytes(initiatorNonce))
+    .update(v2NonceBytes(responderNonce))
+    .update(V2_PROTOCOL_VERSION, "utf8")
+    .update(v2ChannelBindingBytes(channelBindingHash))
     .digest("base64url");
 }
 
@@ -1867,6 +3086,174 @@ export function validateEnvelope(value: unknown): ValidationResult<Envelope> {
 
 export function isEnvelope(value: unknown): value is Envelope {
   return validateEnvelope(value).ok;
+}
+
+export interface V2ApplicationEnvelopeValidationOptions {
+  /** Require serialized mesh scope and bind both addresses to this session mesh. */
+  meshId?: V2MeshId;
+  /** Reject the local-only paired mesh omission. */
+  requireMesh?: boolean;
+}
+
+/**
+ * Strict, closed validation for one `polymesh.0.2` application envelope.
+ * This is deliberately not a v0.1 adapter: v2 keeps delivery_id inside the
+ * delivery object, has no raw-card/receipt/ping application messages, and
+ * binds paired address mesh omissions only in the local-only profile.
+ */
+export function validateV2ApplicationEnvelope(
+  value: unknown,
+  options: V2ApplicationEnvelopeValidationOptions = {},
+): ValidationResult<V2ApplicationEnvelope> {
+  if (!isRecord(value)) return validationFailure("v0.2 envelope must be an object");
+  const fields = ["protocol", "type", "message_id", "timestamp", "source", "target", "delivery", "in_reply_to", "params"];
+  const required = ["protocol", "type", "message_id", "timestamp", "source", "target", "delivery", "params"];
+  if (!hasRequiredKeys(value, required) || !hasOnlyKeys(value, fields) || value.protocol !== V2_PROTOCOL_VERSION ||
+    typeof value.type !== "string" || !V2_APPLICATION_MESSAGE_TYPES.includes(value.type as V2ApplicationMessageType) ||
+    !isUuidV7(value.message_id) || !isTimestamp(value.timestamp) ||
+    !isV2SourceAddress(value.source) || !isV2TargetAddress(value.target) || !isV2Delivery(value.delivery) ||
+    (value.in_reply_to !== undefined && !isUuidV7(value.in_reply_to)) || !isRecord(value.params) || !isJsonValue(value.params)) {
+    return validationFailure("v0.2 envelope has an invalid, unknown, or missing field");
+  }
+  const source = value.source as Record<string, unknown>;
+  const target = value.target as Record<string, unknown>;
+  const sourceMesh = source.mesh_id;
+  const targetMesh = target.mesh_id;
+  if ((sourceMesh === undefined) !== (targetMesh === undefined) ||
+    (sourceMesh !== undefined && sourceMesh !== targetMesh) ||
+    (options.requireMesh === true && sourceMesh === undefined) ||
+    (options.meshId !== undefined && (sourceMesh !== options.meshId || targetMesh !== options.meshId))) {
+    return validationFailure("v0.2 envelope mesh scope does not match the session");
+  }
+  const parameterError = validateV2ApplicationParams(value.type as V2ApplicationMessageType, value.params as JsonObject);
+  if (parameterError !== undefined) return validationFailure(parameterError);
+  if (value.type === "task.submit" && (value.params as JsonObject).deadline !== (value.delivery as JsonObject).deadline) {
+    return validationFailure("v0.2 task.submit params.deadline must exactly match delivery.deadline");
+  }
+  return { ok: true, value: value as unknown as V2ApplicationEnvelope };
+}
+
+export function isV2ApplicationEnvelope(
+  value: unknown,
+  options?: V2ApplicationEnvelopeValidationOptions,
+): value is V2ApplicationEnvelope {
+  return validateV2ApplicationEnvelope(value, options).ok;
+}
+
+function isV2AgentId(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 128 &&
+    /^(?:[a-z]|[a-z][a-z0-9._-]*[a-z0-9])$/.test(value) && !value.includes("..") && !value.includes("*");
+}
+
+function isV2CapabilityId(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 3 && value.length <= 192 &&
+    /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9-]*)+$/.test(value);
+}
+
+function isV2Semver(value: unknown): value is string {
+  return typeof value === "string" && /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(value);
+}
+
+function isV2Digest(value: unknown): value is string {
+  return typeof value === "string" && isBase64Url(value, V2_SID_BYTES);
+}
+
+function isV2SourceAddress(value: unknown): boolean {
+  return isRecord(value) && hasOnlyKeys(value, ["mesh_id", "agent_id", "instance_id"]) &&
+    hasRequiredKeys(value, ["agent_id", "instance_id"]) && isV2AgentId(value.agent_id) && isInstanceId(value.instance_id) &&
+    (value.mesh_id === undefined || isV2MeshId(value.mesh_id));
+}
+
+function isV2TargetAddress(value: unknown): boolean {
+  return isRecord(value) && hasOnlyKeys(value, ["mesh_id", "agent_id", "instance_id"]) &&
+    hasRequiredKeys(value, ["agent_id"]) && isV2AgentId(value.agent_id) &&
+    (value.instance_id === undefined || isInstanceId(value.instance_id)) &&
+    (value.mesh_id === undefined || isV2MeshId(value.mesh_id));
+}
+
+function isV2Delivery(value: unknown): boolean {
+  return isRecord(value) && hasExactKeys(value, ["delivery_id", "mode", "idempotency_key", "deadline"]) &&
+    isUuidV7(value.delivery_id) && value.mode === "at_least_once" && typeof value.idempotency_key === "string" &&
+    value.idempotency_key.length >= 1 && value.idempotency_key.length <= MAX_IDEMPOTENCY_KEY_BYTES &&
+    /^[A-Za-z0-9._~:-]+$/.test(value.idempotency_key) && isTimestamp(value.deadline);
+}
+
+function isV2CapabilityTuple(value: JsonObject): boolean {
+  return isV2CapabilityId(value.capability) && isV2Semver(value.capability_version) && isV2Digest(value.capability_contract_digest);
+}
+
+function validateV2ApplicationParams(type: V2ApplicationMessageType, params: JsonObject): string | undefined {
+  const taskId = params.task_id;
+  if (type === "task.submit") {
+    return hasExactKeys(params, ["task_id", "capability", "capability_version", "capability_contract_digest", "input", "deadline"]) &&
+      isUuidV7(taskId) && isV2CapabilityTuple(params) && isJsonValue(params.input) && isTimestamp(params.deadline)
+      ? undefined : "Invalid v0.2 task.submit params";
+  }
+  if (type === "task.accepted") {
+    return hasExactKeys(params, ["task_id", "event_seq", "accepted_at", "capability", "capability_version", "capability_contract_digest"]) &&
+      isUuidV7(taskId) && params.event_seq === 1 && isTimestamp(params.accepted_at) && isV2CapabilityTuple(params)
+      ? undefined : "Invalid v0.2 task.accepted params";
+  }
+  if (type === "task.rejected") {
+    return hasExactKeys(params, ["task_id", "event_seq", "code", "message", "capability", "capability_version", "capability_contract_digest"]) &&
+      isUuidV7(taskId) && params.event_seq === 1 && isV2ErrorCode(params.code) && isBoundedString(params.message, 512) && isV2CapabilityTuple(params)
+      ? undefined : "Invalid v0.2 task.rejected params";
+  }
+  if (type === "task.progress") {
+    return hasExactKeys(params, ["task_id", "event_seq", "progress", "capability", "capability_version", "capability_contract_digest"]) &&
+      isUuidV7(taskId) && isFiniteInteger(params.event_seq, 2) && isV2CapabilityTuple(params) && isV2Progress(params.progress)
+      ? undefined : "Invalid v0.2 task.progress params";
+  }
+  if (type === "task.completed") {
+    return hasExactKeys(params, ["task_id", "event_seq", "terminal", "capability", "capability_version", "capability_contract_digest"]) &&
+      isUuidV7(taskId) && isFiniteInteger(params.event_seq, 2) && isV2CapabilityTuple(params) && isV2Terminal(params.terminal)
+      ? undefined : "Invalid v0.2 task.completed params";
+  }
+  if (type === "task.cancel") {
+    return hasOnlyKeys(params, ["task_id", "reason"]) && hasRequiredKeys(params, ["task_id"]) && isUuidV7(taskId) &&
+      (params.reason === undefined || isBoundedString(params.reason, 512)) ? undefined : "Invalid v0.2 task.cancel params";
+  }
+  if (type === "task.status") {
+    const query = hasExactKeys(params, ["kind", "task_id"]) && params.kind === "query" && isUuidV7(taskId);
+    const snapshot = hasOnlyKeys(params, ["kind", "task_id", "state", "event_seq", "observed_at", "terminal"]) &&
+      hasRequiredKeys(params, ["kind", "task_id", "state", "event_seq", "observed_at"]) && params.kind === "snapshot" && isUuidV7(taskId) &&
+      typeof params.state === "string" && ["accepted", "queued", "running", "waiting", "succeeded", "failed", "cancelled", "rejected", "recovery_required"].includes(params.state) &&
+      isFiniteInteger(params.event_seq, 1) && isTimestamp(params.observed_at) && (params.terminal === undefined || isV2Terminal(params.terminal));
+    return query || snapshot ? undefined : "Invalid v0.2 task.status params";
+  }
+  return hasExactKeys(params, ["category", "code", "message", "retryable", "retry_after_ms", "details"]) && isV2StructuredError(params)
+    ? undefined : "Invalid v0.2 error params";
+}
+
+function isV2ErrorCode(value: unknown): boolean {
+  return typeof value === "string" && value.length >= 3 && value.length <= 128 && /^[A-Z][A-Z0-9_.]+$/.test(value);
+}
+
+function isV2StructuredError(value: unknown): boolean {
+  return isRecord(value) && hasRequiredKeys(value, ["category", "code", "message", "retryable"]) &&
+    hasOnlyKeys(value, ["category", "code", "message", "retryable", "retry_after_ms", "details"]) &&
+    typeof value.category === "string" && ERROR_CATEGORY_SET.has(value.category) && isV2ErrorCode(value.code) &&
+    isBoundedString(value.message, 512) && typeof value.retryable === "boolean" &&
+    (value.retry_after_ms === undefined || value.retry_after_ms === null || isFiniteInteger(value.retry_after_ms, 0)) &&
+    (value.details === undefined || (isRecord(value.details) && isJsonValue(value.details)));
+}
+
+function isV2Progress(value: unknown): boolean {
+  return isRecord(value) && hasRequiredKeys(value, ["state"]) && hasOnlyKeys(value, ["state", "current", "total", "status"]) &&
+    (value.state === "queued" || value.state === "running" || value.state === "waiting") &&
+    (value.current === undefined || isFiniteInteger(value.current, 0)) &&
+    (value.total === undefined || isFiniteInteger(value.total, 1)) &&
+    (value.status === undefined || isBoundedString(value.status, 1_024));
+}
+
+function isV2Terminal(value: unknown): boolean {
+  if (!isRecord(value) || !hasRequiredKeys(value, ["outcome", "completed_at"]) || !isTimestamp(value.completed_at)) return false;
+  if (value.outcome === "succeeded") return hasExactKeys(value, ["outcome", "result", "completed_at"]) && isJsonValue(value.result);
+  if (value.outcome === "failed") return hasExactKeys(value, ["outcome", "error", "completed_at"]) && isV2StructuredError(value.error);
+  return value.outcome === "cancelled" && hasOnlyKeys(value, ["outcome", "cancellation", "completed_at"]) &&
+    hasRequiredKeys(value, ["outcome", "cancellation", "completed_at"]) && isRecord(value.cancellation) &&
+    hasRequiredKeys(value.cancellation, ["code"]) && hasOnlyKeys(value.cancellation, ["code", "message"]) &&
+    isV2ErrorCode(value.cancellation.code) && (value.cancellation.message === undefined || isBoundedString(value.cancellation.message, 512));
 }
 
 export function validateHandshakeFrame(value: unknown): ValidationResult<HandshakeFrame> {

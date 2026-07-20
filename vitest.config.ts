@@ -6,6 +6,7 @@ export default defineConfig({
     alias: {
       "@polymesh/broker": fileURLToPath(new URL("./packages/broker/src/index.ts", import.meta.url)),
       "@polymesh/client": fileURLToPath(new URL("./packages/client/src/index.ts", import.meta.url)),
+      "@polymesh/gateway": fileURLToPath(new URL("./packages/gateway/src/index.ts", import.meta.url)),
     },
   },
   test: {

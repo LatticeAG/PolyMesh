@@ -133,11 +133,11 @@ async function negotiateZstd(
 // zstd runtime — resolved lazily so the file can be loaded on Node < 22 where
 // zstdCompressSync is absent.  The describe block skips itself unconditionally
 // when the codec is unavailable.
-function zstdCompressSync(input: Uint8Array): Uint8Array {
-  return require("node:zlib").zstdCompressSync(input);
+function zstdCompressSync(input: Uint8Array): Buffer {
+  return Buffer.from(require("node:zlib").zstdCompressSync(input));
 }
-function zstdDecompressSync(input: Uint8Array): Uint8Array {
-  return require("node:zlib").zstdDecompressSync(input);
+function zstdDecompressSync(input: Uint8Array): Buffer {
+  return Buffer.from(require("node:zlib").zstdDecompressSync(input));
 }
 
 function zstdFrame(recordType: string, record: unknown): JsonRecord {
