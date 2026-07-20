@@ -1,0 +1,20 @@
+{
+  "name": "@polymesh/gateway",
+  "version": "0.2.0",
+  "description": "PolyMesh v2 REST and SSE gateway",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@polymesh/broker": "file:../broker"
+  }
+}
