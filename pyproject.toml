@@ -63,4 +63,5 @@ line-length = 120
 dev = [
     "httpx>=0.28.1",
     "pytest>=8.4.2",
+    "pytest-asyncio>=0.26.0",
 ]
