@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymesh"
+version = "0.1.0"
+description = "Async Python SDK for the PolyMesh polymesh.0.1 wire profile"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "LatticeAG"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+  "click>=8.1,<9",
+  "cryptography>=42,<46",
+  "platformdirs>=4,<5",
+  "pydantic>=2.7,<3",
+  "websockets>=13,<16",
+]
+
+[project.optional-dependencies]
+http = ["httpx>=0.27,<1"]
+mdns = ["zeroconf>=0.132,<1"]
+yaml = ["PyYAML>=6,<7"]
+secure-carrier = []
+test = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1"]
+
+[project.scripts]
+polymesh = "polymesh.cli:main"
+create-polymesh-app = "polymesh.cli:create_polymesh_app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+polymesh = ["py.typed", "schemas/*.json"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.4.2",
+]
