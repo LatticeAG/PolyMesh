@@ -15,7 +15,7 @@ import {
   normalizePeerClose,
   sanitizeCloseReason,
   writeRuntimeTokenAtomically,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 
 const brokers: Broker[] = [];
 

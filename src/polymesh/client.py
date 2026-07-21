@@ -1,8 +1,9 @@
-"""Async-first PolyMesh v0.1 client and task lifecycle implementation."""
+"""Async-first PolyMesh v0.1 and native-v2 client lifecycle implementation."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import copy
 import inspect
@@ -43,25 +44,46 @@ from .protocol import (
     canonical_json,
     card_digest,
     create_auth_proof,
+    create_v2_auth_proof,
     create_envelope,
     derive_session_id,
+    derive_v2_session_id,
     encode_record_text,
+    is_v2_mesh_id,
+    is_v2_native_uuid,
+    native_v2_envelope_as_legacy,
+    native_v2_envelope_from_legacy,
     parse_strict_json,
     random_nonce,
     sign_agent_card,
     validate_envelope,
     validate_restricted_schema,
     validate_handshake_frame,
+    validate_v2_envelope,
+    validate_v2_ack_frame,
+    validate_v2_error_frame,
+    validate_v2_hello_frame,
+    validate_v2_init_frame,
+    validate_v2_native_envelope,
     validate_restricted_schema_instance,
     verify_auth_proof,
+    verify_v2_auth_proof,
     verify_enrolled_card,
     verify_routed_provenance,
+    v2_auth_transcript,
+    v2_envelope_as_legacy,
+    v2_envelope_from_legacy,
+    uuidv7,
 )
 from .transport import (
     ConnectionState,
+    MAX_FRAME_BYTES,
     SecureWireTransport,
     WebSocketConnector,
     WireTransport,
+    zstd_available,
+    zstd_compress,
+    zstd_decompress,
 )
 from .types import (
     AgentCard,
@@ -80,6 +102,7 @@ from .types import (
     ReceiptParams,
     ReconnectPolicy,
     ReadyFrame,
+    PROTOCOL_VERSION,
     ResponderHello,
     SecureIdentityOptions,
     TaskSnapshot,
@@ -92,6 +115,8 @@ from .types import (
     format_timestamp,
     parse_timestamp,
     utc_now_millis,
+    V2_HANDSHAKE_VERSION,
+    V2_PROTOCOL_VERSION,
 )
 
 
@@ -208,6 +233,65 @@ class _InboundReplay:
     fingerprint: str
     accepted: Envelope | None = None
     terminal: Envelope | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _V2Compression:
+    """One post-READY v2 transport selection for this connection generation."""
+
+    algorithm: str
+    max_compressed_bytes: int | None = None
+    max_uncompressed_bytes: int | None = None
+    max_expansion_ratio: int | None = None
+
+
+_V2_COMPRESSIBLE_TYPES = frozenset(
+    {
+        "task.submit",
+        "task.accepted",
+        "task.rejected",
+        "task.progress",
+        "task.completed",
+        "task.cancel",
+        "task.status",
+        "error",
+    }
+)
+
+
+def _v2_compression_limits(value: Mapping[str, Any]) -> tuple[int, int, int] | None:
+    """Parse the closed camel-case wire limits used by the current broker."""
+
+    if set(value) != {"maxCompressedBytes", "maxUncompressedBytes", "maxExpansionRatio"}:
+        return None
+    compressed = value.get("maxCompressedBytes")
+    uncompressed = value.get("maxUncompressedBytes")
+    ratio = value.get("maxExpansionRatio")
+    if (
+        not isinstance(compressed, int)
+        or isinstance(compressed, bool)
+        or not isinstance(uncompressed, int)
+        or isinstance(uncompressed, bool)
+        or not isinstance(ratio, int)
+        or isinstance(ratio, bool)
+        or not 0 < compressed <= MAX_FRAME_BYTES
+        or not 0 < uncompressed <= MAX_FRAME_BYTES
+        or not 0 < ratio <= 64
+    ):
+        return None
+    return compressed, uncompressed, ratio
+
+
+def _v2_decode_base64url(value: Any) -> bytes:
+    if not isinstance(value, str) or not value or "=" in value:
+        raise ProtocolError("COMPRESSION_FRAME_INVALID", "compressed payload must be canonical base64url")
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except Exception as exc:
+        raise ProtocolError("COMPRESSION_FRAME_INVALID", "compressed payload is not base64url") from exc
+    if base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != value:
+        raise ProtocolError("COMPRESSION_FRAME_INVALID", "compressed payload is not canonical base64url")
+    return raw
 
 
 class TaskHandle:
@@ -333,7 +417,12 @@ class TaskContext:
 
 
 class PolyMeshClient:
-    """One loop-bound async v0.1 PolyMesh session manager."""
+    """One loop-bound async PolyMesh session manager.
+
+    ``profile="polymesh.0.1"`` remains the default.  Selecting
+    ``polymesh.0.2`` is an explicit, non-downgrading choice that uses the v2
+    WebSocket subprotocol, mesh-scoped envelope encoding, and optional zstd.
+    """
 
     def __init__(
         self,
@@ -348,6 +437,11 @@ class PolyMeshClient:
         handlers: Mapping[str, TaskHandler] | None = None,
         default_timeout: float = 60.0,
         handshake_timeout: float = 5.0,
+        profile: str = PROTOCOL_VERSION,
+        mesh_id: str | None = None,
+        compression: bool = True,
+        compression_limits: Mapping[str, int] | None = None,
+        v2_handshake: str = "auto",
         reconnect: ReconnectPolicy | None = None,
         limits: ClientLimits | None = None,
         authorization: AuthorizationHook | None = None,
@@ -360,6 +454,28 @@ class PolyMeshClient:
             unknown = ", ".join(sorted(legacy))
             raise TypeError(f"unexpected PolyMeshClient option(s): {unknown}")
         self.card = AgentCard.model_validate(card)
+        if profile not in {PROTOCOL_VERSION, V2_PROTOCOL_VERSION}:
+            raise ValueError("profile must be polymesh.0.1 or polymesh.0.2")
+        if mesh_id is not None and not is_v2_mesh_id(mesh_id):
+            raise ValueError("mesh_id is not a valid PolyMesh v2 mesh identity")
+        if profile == PROTOCOL_VERSION and mesh_id is not None:
+            raise ValueError("mesh_id is available only for profile='polymesh.0.2'")
+        if not isinstance(compression, bool):
+            raise TypeError("compression must be a boolean")
+        if v2_handshake not in {"auto", "native", "legacy"}:
+            raise ValueError("v2_handshake must be 'auto', 'native', or 'legacy'")
+        if profile == PROTOCOL_VERSION and v2_handshake != "auto":
+            raise ValueError("v2_handshake is available only for profile='polymesh.0.2'")
+        if mesh_id is not None and profile == V2_PROTOCOL_VERSION and v2_handshake != "legacy" and not is_v2_native_uuid(mesh_id):
+            raise ValueError("native polymesh.0.2 mesh_id must be a UUIDv7")
+        limits_source: Mapping[str, Any] = compression_limits or {
+            "maxCompressedBytes": MAX_FRAME_BYTES,
+            "maxUncompressedBytes": MAX_FRAME_BYTES,
+            "maxExpansionRatio": 32,
+        }
+        parsed_compression_limits = _v2_compression_limits(limits_source)
+        if parsed_compression_limits is None:
+            raise ValueError("compression_limits must contain bounded v2 zstd limits")
         if default_timeout <= 0 or handshake_timeout <= 0:
             raise ValueError("timeouts must be positive")
         if token is not None and token_store is not None:
@@ -369,6 +485,20 @@ class PolyMeshClient:
         if identity is not None and (token is not None or token_store is not None):
             raise ValueError("secure identity cannot be combined with a runtime token")
         self._broker_url = broker_url
+        self._profile = profile
+        self._mesh_id = mesh_id
+        self._compression_enabled = compression
+        self._v2_offer_limits = parsed_compression_limits
+        self._v2_handshake_preference = v2_handshake
+        self._v2_wire_mode = "native" if profile == V2_PROTOCOL_VERSION and v2_handshake != "legacy" else "legacy"
+        self._v2_compression: _V2Compression | None = None
+        self._v2_compression_offered = False
+        self._v2_initiator_hello: JsonObject | None = None
+        self._v2_responder_hello: JsonObject | None = None
+        self._v2_native_compression_selected = "none"
+        self._v2_native_compression_active = False
+        self._v2_native_proposed = False
+        self._v2_native_ready_sent = False
         self._token = token
         self._token_store = token_store
         self._allow_insecure_loopback_development = allow_insecure_loopback_development
@@ -454,6 +584,26 @@ class PolyMeshClient:
     @property
     def broker_url(self) -> str | None:
         return self._broker_url
+
+    @property
+    def profile(self) -> str:
+        """The profile selected before this connection's first hello."""
+
+        return self._profile
+
+    @property
+    def mesh_id(self) -> str | None:
+        """The authenticated v2 mesh scope, populated by a responder hello."""
+
+        return self._mesh_id
+
+    @property
+    def compression_algorithm(self) -> str:
+        """The active v2 codec, or ``"none"`` before/without negotiation."""
+
+        if self._profile == V2_PROTOCOL_VERSION and self._v2_wire_mode == "native":
+            return "zstd" if self._v2_native_compression_active and self._v2_native_compression_selected == "zstd" else "none"
+        return self._v2_compression.algorithm if self._v2_compression is not None else "none"
 
     @property
     def broker_card(self) -> AgentCard | None:
@@ -569,22 +719,57 @@ class PolyMeshClient:
         return await asyncio.shield(self._connect_future)
 
     async def _connect_from_factory(self) -> "PolyMeshClient":
-        factory = self._transport_factory
-        if factory is None:
-            if not self._broker_url:
-                raise TransportError("INVALID_ENDPOINT", "broker_url is required when no transport factory is supplied")
-            connector = WebSocketConnector(
-                self._broker_url,
-                token=self._token,
-                token_store=self._token_store,
-                allow_insecure_loopback_development=self._allow_insecure_loopback_development,
-                secure_identity=self._identity_options,
-            )
-            transport = await connector()
-        else:
+        async def open_transport() -> WireTransport:
+            factory = self._transport_factory
+            if factory is None:
+                if not self._broker_url:
+                    raise TransportError("INVALID_ENDPOINT", "broker_url is required when no transport factory is supplied")
+                connector = WebSocketConnector(
+                    self._broker_url,
+                    token=self._token,
+                    token_store=self._token_store,
+                    allow_insecure_loopback_development=self._allow_insecure_loopback_development,
+                    secure_identity=self._identity_options,
+                    profile=self._profile,
+                )
+                return await connector()
             candidate = factory()
-            transport = await candidate if inspect.isawaitable(candidate) else candidate
-        return await self.connect_transport(transport)
+            return await candidate if inspect.isawaitable(candidate) else candidate
+
+        # Native v2 is the release profile.  Earlier brokers already selected
+        # the same WebSocket subprotocol but begin with a v2 ``hello``.  An
+        # auto connection attempts the native init/ack exchange first and,
+        # only after that fresh carrier is fenced, retries the older v2
+        # handshake on a newly opened carrier.  This never downgrades to v0.1.
+        if self._profile == V2_PROTOCOL_VERSION and self._v2_handshake_preference == "auto":
+            self._v2_wire_mode = "native"
+            try:
+                return await self.connect_transport(await open_transport())
+            except (HandshakeError, TransportClosedError) as native_error:
+                if not self._is_native_v2_fallback_error(native_error):
+                    raise
+                self._v2_wire_mode = "legacy"
+                try:
+                    return await self.connect_transport(await open_transport())
+                except BaseException:
+                    # Preserve the native negotiation failure when the retry
+                    # could not obtain a new carrier at all; otherwise the
+                    # legacy error carries the broker's useful diagnosis.
+                    raise
+        self._v2_wire_mode = "legacy" if self._v2_handshake_preference == "legacy" else "native"
+        return await self.connect_transport(await open_transport())
+
+    @staticmethod
+    def _is_native_v2_fallback_error(error: BaseException) -> bool:
+        """Only retry old v2 when native profile negotiation was unavailable."""
+
+        if isinstance(error, TransportClosedError):
+            return True
+        return isinstance(error, HandshakeError) and error.code in {
+            "NATIVE_V2_UNSUPPORTED",
+            "HANDSHAKE_FAILED",
+            "MALFORMED_FRAME",
+        }
 
     async def connect_transport(self, transport: WireTransport) -> "PolyMeshClient":
         self._bind_loop()
@@ -606,6 +791,14 @@ class PolyMeshClient:
             self._broker_card = None
             self._broker_identity = None
             self._broker_principal = None
+            self._v2_compression = None
+            self._v2_compression_offered = False
+            self._v2_initiator_hello = None
+            self._v2_responder_hello = None
+            self._v2_native_compression_selected = "none"
+            self._v2_native_compression_active = False
+            self._v2_native_proposed = False
+            self._v2_native_ready_sent = False
             self._next_ping = 0
             self._outstanding_pong = None
             self._last_valid_inbound_at = None
@@ -626,10 +819,21 @@ class PolyMeshClient:
         self._last_valid_inbound_at = self._active_since
         self._receiver_task = asyncio.create_task(self._receiver(transport, generation), name="polymesh-client-receiver")
         self._heartbeat_task = asyncio.create_task(self._heartbeat(transport, generation), name="polymesh-client-heartbeat")
+        if self._profile == V2_PROTOCOL_VERSION:
+            if self._v2_wire_mode == "native":
+                await self._start_native_v2_compression(generation)
+            else:
+                await self._start_v2_compression(generation)
         self._emit("ready", self)
         return self
 
     async def _handshake(self, transport: WireTransport, generation: int) -> None:
+        if self._profile == V2_PROTOCOL_VERSION:
+            if self._v2_wire_mode == "native":
+                await self._handshake_native_v2(transport, generation)
+            else:
+                await self._handshake_legacy_v2(transport, generation)
+            return
         nonce = random_nonce()
         hello = InitiatorHello(
             type="hello",
@@ -728,6 +932,217 @@ class PolyMeshClient:
         if ready.self_card != peer_digest or ready.peer_card != own_digest:
             raise HandshakeError("HANDSHAKE_FAILED", "peer ready does not bind exchanged cards")
 
+    async def _handshake_native_v2(self, transport: WireTransport, generation: int) -> None:
+        """Negotiate the compact native v2 SDK profile with ``v2.init``/ack.
+
+        Native v2 deliberately has no hidden v0.1 card/ready exchange.  The
+        selected profile, broker mesh, and opaque UUIDv7 session identifier
+        are established by the ack before any native application envelope is
+        admitted.  The enrolled Ed25519 profile is not silently approximated
+        here: its card/auth transcript remains an explicit legacy-v2 path
+        until native card authentication is specified.
+        """
+
+        if self._identity_options is not None:
+            raise SecureProfileUnsupportedError(
+                "SECURE_PROFILE_UNSUPPORTED",
+                "native polymesh.0.2 init/ack does not define the enrolled card authentication exchange",
+            )
+        if self._mesh_id is not None and not is_v2_native_uuid(self._mesh_id):
+            raise HandshakeError("NATIVE_V2_UNSUPPORTED", "configured native v0.2 mesh_id must be UUIDv7")
+        compression = ["none"]
+        if self._compression_enabled and zstd_available():
+            compression = ["zstd", "none"]
+        init = validate_v2_init_frame(
+            {
+                "type": "v2.init",
+                "protocol": V2_PROTOCOL_VERSION,
+                "profile": V2_PROTOCOL_VERSION,
+                "supported_profiles": [V2_PROTOCOL_VERSION],
+                **({"mesh_id": self._mesh_id} if self._mesh_id is not None else {}),
+                "agent_id": self.card.agent_id,
+                "instance_id": self.card.instance_id,
+                "nonce": uuidv7(),
+                "compression": compression,
+            }
+        )
+        await self._send_record(init, transport=transport, generation=generation)
+        raw_response = parse_strict_json(await transport.recv())
+        if isinstance(raw_response, dict) and raw_response.get("type") == "v2.error":
+            failure = validate_v2_error_frame(raw_response)
+            code = str(failure["code"])
+            message = str(failure["message"])
+            if code == "PMX.SESSION.PROFILE":
+                raise HandshakeError("NATIVE_V2_UNSUPPORTED", message)
+            raise AuthenticationError(code, message, retryable=bool(failure.get("retryable", False)))
+        try:
+            ack = validate_v2_ack_frame(raw_response)
+        except Exception as exc:
+            # Earlier v2 brokers respond to an unknown init with a closed
+            # legacy error/connection.  The outer auto mode may reopen one
+            # carrier and try that explicit legacy wire grammar.
+            raise HandshakeError("NATIVE_V2_UNSUPPORTED", "peer did not acknowledge native v0.2 init") from exc
+        if self._mesh_id is not None and ack["mesh_id"] != self._mesh_id:
+            raise AuthenticationError("MESH_SCOPE_MISMATCH", "native v0.2 broker selected a different mesh")
+        selected_compression = str(ack["compression"])
+        if selected_compression == "zstd" and (not self._compression_enabled or not zstd_available()):
+            raise HandshakeError("COMPRESSION_UNAVAILABLE", "broker selected zstd which this native v0.2 client did not offer")
+        self._sid = str(ack["session_id"])
+        self._mesh_id = str(ack["mesh_id"])
+        self._v2_native_compression_selected = selected_compression
+        self._v2_native_compression_active = selected_compression == "none"
+        self._v2_native_proposed = False
+        self._v2_native_ready_sent = False
+        if "agent_id" in ack and "instance_id" in ack:
+            try:
+                self._broker_identity = AgentIdentity(agent_id=str(ack["agent_id"]), instance_id=str(ack["instance_id"]))
+            except Exception as exc:
+                raise HandshakeError("HANDSHAKE_FAILED", "native v0.2 broker identity is incompatible with this SDK") from exc
+        self._phase = ClientPhase.AWAIT_READY
+        if selected_compression == "zstd":
+            # Native v2 has a bilateral compression barrier. Complete it
+            # inside the handshake before publishing an active connection so
+            # callers can never send a raw application record after zstd was
+            # selected but before both peers have confirmed readiness.
+            self._v2_native_proposed = True
+            await self._send_native_v2_zstd_proposal(generation)
+            ready_frame = parse_strict_json(await transport.recv())
+            if not isinstance(ready_frame, dict):
+                raise HandshakeError("COMPRESSION_FAILED", "native v0.2 broker did not return zstd.ready")
+            try:
+                self._validate_native_v2_zstd_control(ready_frame, "zstd.ready")
+            except Exception as exc:
+                raise HandshakeError("COMPRESSION_FAILED", "native v0.2 zstd.ready is invalid") from exc
+            self._v2_native_ready_sent = True
+            await self._send_record(
+                {
+                    "type": "zstd.ready",
+                    "profile": V2_PROTOCOL_VERSION,
+                    "mesh_id": self._mesh_id,
+                    "session_id": self._sid,
+                    "compression": "zstd",
+                },
+                transport=transport,
+                generation=generation,
+            )
+            self._v2_native_compression_active = True
+
+    async def _handshake_legacy_v2(self, transport: WireTransport, generation: int) -> None:
+        """Run the selected legacy-broker-compatible v0.2 handshake.
+
+        v0.2 hello is deliberately distinct.  The card/auth/ready records are
+        still closed v0.1-shaped records, but their session ID and secure
+        transcript are profile-domain-separated.
+        """
+
+        nonce = random_nonce()
+        hello: JsonObject = {
+            "type": "hello",
+            "v": V2_HANDSHAKE_VERSION,
+            "role": "initiator",
+            "agent_id": self.card.agent_id,
+            "instance_id": self.card.instance_id,
+            "nonce": nonce,
+            **({"mesh_id": self._mesh_id} if self._mesh_id is not None else {}),
+            **({"security_profile": "enrolled-ed25519-tls-1.3"} if self._identity_options is not None else {}),
+        }
+        hello = validate_v2_hello_frame(hello)
+        await self._send_record(hello, transport=transport, generation=generation)
+        response = validate_v2_hello_frame(parse_strict_json(await transport.recv()))
+        if response.get("role") != "responder":
+            raise HandshakeError("HANDSHAKE_FAILED", "expected v0.2 responder hello")
+        expected_sid = derive_v2_session_id(nonce, str(response["nonce"]))
+        if response.get("echo") != nonce or response.get("sid") != expected_sid:
+            raise HandshakeError("HANDSHAKE_FAILED", "v0.2 responder hello does not bind initiator nonce")
+        responder_mesh = response.get("mesh_id")
+        if not isinstance(responder_mesh, str):
+            raise HandshakeError("MESH_SCOPE_MISMATCH", "v0.2 responder did not bind a mesh identity")
+        if self._mesh_id is not None and responder_mesh != self._mesh_id:
+            raise AuthenticationError("MESH_SCOPE_MISMATCH", "v0.2 responder selected a different mesh")
+        if response["agent_id"] == self.card.agent_id and response["instance_id"] == self.card.instance_id:
+            raise HandshakeError("SELF_CONNECTION", "client cannot connect to itself")
+        secure_binding: str | None = None
+        if self._identity_options is None:
+            if response.get("security_profile") is not None:
+                raise AuthenticationError("SECURITY_PROFILE_MISMATCH", "peer selected unexpected secure profile")
+        else:
+            if response.get("security_profile") != "enrolled-ed25519-tls-1.3":
+                raise AuthenticationError("SECURITY_PROFILE_MISMATCH", "peer did not select the enrolled secure profile")
+            if not isinstance(transport, SecureWireTransport):
+                raise SecureProfileUnsupportedError("SECURE_PROFILE_UNSUPPORTED", "secure enrolled handshake requires an exporter-capable adapter")
+            try:
+                exported = transport.export_tls_channel_binding()
+            except Exception as exc:
+                raise SecureProfileUnsupportedError("SECURE_PROFILE_UNSUPPORTED", "secure carrier did not export TLS binding") from exc
+            if not isinstance(exported, bytes) or len(exported) != 32:
+                raise SecureProfileUnsupportedError("SECURE_PROFILE_UNSUPPORTED", "secure carrier TLS binding must be 32 bytes")
+            secure_binding = base64url_encode(exported)
+
+        self._sid = expected_sid
+        self._mesh_id = responder_mesh
+        self._v2_initiator_hello = hello
+        self._v2_responder_hello = response
+        self._phase = ClientPhase.AWAIT_CARD
+        own_digest = card_digest(self.card)
+        await self._send_record(
+            CardFrame(type="card", sid=expected_sid, for_nonce=str(response["nonce"]), digest=own_digest, card=self.card),
+            transport=transport,
+            generation=generation,
+        )
+        card_response = validate_handshake_frame(parse_strict_json(await transport.recv()))
+        if not isinstance(card_response, CardFrame):
+            raise HandshakeError("HANDSHAKE_FAILED", "expected peer card")
+        if card_response.sid != expected_sid or card_response.for_nonce != nonce:
+            raise HandshakeError("HANDSHAKE_FAILED", "peer card does not bind v0.2 handshake")
+        if card_response.card.agent_id != response["agent_id"] or card_response.card.instance_id != response["instance_id"]:
+            raise AuthenticationError("SOURCE_IDENTITY_MISMATCH", "peer card identity differs from v0.2 hello")
+        if parse_timestamp(card_response.card.expires_at) <= datetime.now(UTC):
+            raise HandshakeError("CARD_EXPIRED", "peer card has expired")
+        peer_digest = card_digest(card_response.card)
+        if peer_digest != card_response.digest.lower():
+            raise HandshakeError("CARD_DIGEST_MISMATCH", "peer card digest does not match")
+        self._broker_card = card_response.card
+        self._broker_identity = AgentIdentity(agent_id=str(response["agent_id"]), instance_id=str(response["instance_id"]))
+        if self._identity_options is not None:
+            assert self._enrollments is not None and secure_binding is not None and self.card.identity is not None
+            principal = verify_enrolled_card(card_response.card, self._enrollments)
+            if principal is None or principal.agent_id != response["agent_id"] or card_response.card.identity is None or principal.key_id != card_response.card.identity.key_id:
+                raise AuthenticationError("AUTHENTICATION_FAILED", "peer card is not signed by an enrolled identity")
+            transcript = v2_auth_transcript(
+                initiator_hello=hello,
+                responder_hello=response,
+                initiator_card_digest=own_digest,
+                responder_card_digest=peer_digest,
+                tls_channel_binding=secure_binding,
+            )
+            self._phase = ClientPhase.AWAIT_AUTH
+            own_proof = create_v2_auth_proof(
+                self.card.identity,
+                self.card.agent_id,
+                expected_sid,
+                transcript,
+                self._identity_options.private_key,
+            )
+            await self._send_record(own_proof, transport=transport, generation=generation)
+            peer_proof = validate_handshake_frame(parse_strict_json(await transport.recv()))
+            if not isinstance(peer_proof, AuthFrame) or peer_proof.sid != expected_sid:
+                raise AuthenticationError("AUTHENTICATION_FAILED", "peer v0.2 authentication proof is invalid")
+            verified = verify_v2_auth_proof(peer_proof, transcript, self._enrollments)
+            if verified is None or verified.agent_id != principal.agent_id or verified.key_id != principal.key_id:
+                raise AuthenticationError("AUTHENTICATION_FAILED", "peer did not prove possession of its enrolled key")
+            self._broker_principal = verified
+        self._phase = ClientPhase.AWAIT_READY
+        await self._send_record(
+            ReadyFrame(type="ready", sid=expected_sid, self_card=own_digest, peer_card=peer_digest),
+            transport=transport,
+            generation=generation,
+        )
+        ready = validate_handshake_frame(parse_strict_json(await transport.recv()))
+        if not isinstance(ready, ReadyFrame) or ready.sid != expected_sid:
+            raise HandshakeError("HANDSHAKE_FAILED", "expected peer v0.2 ready")
+        if ready.self_card != peer_digest or ready.peer_card != own_digest:
+            raise HandshakeError("HANDSHAKE_FAILED", "peer ready does not bind exchanged cards")
+
     async def ready(self) -> "PolyMeshClient":
         if self.connected:
             return self
@@ -748,6 +1163,14 @@ class PolyMeshClient:
         self._broker_card = None
         self._broker_identity = None
         self._broker_principal = None
+        self._v2_compression = None
+        self._v2_compression_offered = False
+        self._v2_initiator_hello = None
+        self._v2_responder_hello = None
+        self._v2_native_compression_selected = "none"
+        self._v2_native_compression_active = False
+        self._v2_native_proposed = False
+        self._v2_native_ready_sent = False
         self._outstanding_pong = None
         self._fail_pending_recovery("client disconnected")
         self._fail_status_queries(TransportClosedError("TRANSPORT_CLOSED", "client disconnected"))
@@ -776,6 +1199,182 @@ class PolyMeshClient:
         else:
             asyncio.run_coroutine_threadsafe(self.disconnect(code, reason, wait=False), loop)
 
+    async def _start_v2_compression(self, generation: int) -> None:
+        """Offer zstd only after the authenticated READY boundary.
+
+        A missing optional codec is an ordinary ``none`` outcome, not a
+        profile downgrade: v2 stays selected and sends its application frames
+        uncompressed.  The control exchange is intentionally never wrapped.
+        """
+
+        if (
+            self._profile != V2_PROTOCOL_VERSION
+            or self._v2_wire_mode != "legacy"
+            or not self._compression_enabled
+            or self._v2_compression_offered
+            or not zstd_available()
+            or generation != self._generation
+            or not self.connected
+        ):
+            return
+        self._v2_compression_offered = True
+        compressed, uncompressed, ratio = self._v2_offer_limits
+        offer: JsonObject = {
+            "type": "compression.offer",
+            "v": V2_HANDSHAKE_VERSION,
+            "algorithms": ["none", "zstd"],
+            "limits": {
+                "maxCompressedBytes": compressed,
+                "maxUncompressedBytes": uncompressed,
+                "maxExpansionRatio": ratio,
+            },
+        }
+        await self._send_record(offer, generation=generation)
+
+    async def _start_native_v2_compression(self, generation: int) -> None:
+        """Begin native zstd activation after a native ack selected it.
+
+        The actual three-record state machine is implemented beside the
+        receive handlers below.  A native ack selecting ``none`` is already
+        an active, valid profile and deliberately emits no control traffic.
+        """
+
+        if self._profile != V2_PROTOCOL_VERSION or self._v2_wire_mode != "native" or generation != self._generation:
+            return
+        if self._v2_native_compression_selected == "zstd" and not self._v2_native_compression_active:
+            raise HandshakeError("COMPRESSION_FAILED", "native v0.2 zstd barrier did not complete during handshake")
+
+    def _v2_wire_for_send(self, record: Any) -> JsonObject:
+        """Encode one record for the already-selected v2 profile."""
+
+        if self._v2_wire_mode == "native":
+            return self._native_v2_wire_for_send(record)
+        if isinstance(record, Envelope):
+            if self._mesh_id is None:
+                raise HandshakeError("MESH_SCOPE_MISMATCH", "v0.2 application record has no authenticated mesh identity")
+            wire = v2_envelope_from_legacy(record, mesh_id=self._mesh_id)
+            return self._v2_maybe_compress_wire_envelope(wire)
+        if isinstance(record, Mapping):
+            wire = dict(record)
+            if wire.get("type") in {"v2.init", "v2.ack", "v2.error", "zstd.propose", "zstd.ready", "zstd.wrapper"}:
+                return wire
+            if wire.get("protocol") == PROTOCOL_VERSION:
+                if self._mesh_id is None:
+                    raise HandshakeError("MESH_SCOPE_MISMATCH", "v0.2 application record has no authenticated mesh identity")
+                wire = v2_envelope_from_legacy(validate_envelope(wire), mesh_id=self._mesh_id)
+                return self._v2_maybe_compress_wire_envelope(wire)
+            if wire.get("protocol") == V2_PROTOCOL_VERSION:
+                if self._mesh_id is None:
+                    raise HandshakeError("MESH_SCOPE_MISMATCH", "v0.2 application record has no authenticated mesh identity")
+                wire = validate_v2_envelope(wire, mesh_id=self._mesh_id)
+                return self._v2_maybe_compress_wire_envelope(wire)
+            return wire
+        if hasattr(record, "model_dump"):
+            dumped = record.model_dump(mode="json", exclude_none=True)
+            if not isinstance(dumped, dict):
+                raise TypeError("v0.2 record model did not serialize to an object")
+            return dumped
+        raise TypeError("record must be a PolyMesh handshake frame, envelope, or mapping")
+
+    def _native_v2_wire_for_send(self, record: Any) -> JsonObject:
+        """Encode one compact native-v2 control or application record."""
+
+        if isinstance(record, Envelope):
+            if self._mesh_id is None:
+                raise HandshakeError("MESH_SCOPE_MISMATCH", "native v0.2 application record has no acknowledged mesh identity")
+            return self._native_v2_maybe_wrap_envelope(native_v2_envelope_from_legacy(record, mesh_id=self._mesh_id))
+        if isinstance(record, Mapping):
+            wire = dict(record)
+            if wire.get("type") in {"v2.init", "v2.ack", "v2.error", "zstd.propose", "zstd.ready", "zstd.wrapper"}:
+                return wire
+            if wire.get("protocol") == PROTOCOL_VERSION:
+                if self._mesh_id is None:
+                    raise HandshakeError("MESH_SCOPE_MISMATCH", "native v0.2 application record has no acknowledged mesh identity")
+                return self._native_v2_maybe_wrap_envelope(
+                    native_v2_envelope_from_legacy(validate_envelope(wire), mesh_id=self._mesh_id)
+                )
+            if wire.get("protocol") == V2_PROTOCOL_VERSION and wire.get("profile") == V2_PROTOCOL_VERSION:
+                if self._mesh_id is None:
+                    raise HandshakeError("MESH_SCOPE_MISMATCH", "native v0.2 application record has no acknowledged mesh identity")
+                return self._native_v2_maybe_wrap_envelope(validate_v2_native_envelope(wire, mesh_id=self._mesh_id))
+            return wire
+        if hasattr(record, "model_dump"):
+            dumped = record.model_dump(mode="json", exclude_none=True)
+            if not isinstance(dumped, dict):
+                raise TypeError("native v0.2 record model did not serialize to an object")
+            return dumped
+        raise TypeError("record must be a PolyMesh handshake frame, envelope, or mapping")
+
+    def _native_v2_maybe_wrap_envelope(self, wire: JsonObject) -> JsonObject:
+        """Wrap one native envelope only after both zstd ready records exist."""
+
+        if self._v2_native_compression_selected != "zstd" or not self._v2_native_compression_active:
+            return wire
+        if self._sid is None or self._mesh_id is None:
+            raise HandshakeError("MESH_SCOPE_MISMATCH", "native v0.2 zstd session has no binding")
+        _, maximum_uncompressed, maximum_ratio = self._v2_offer_limits
+        maximum_compressed = self._v2_offer_limits[0]
+        encoded = canonical_json(wire).encode("utf-8")
+        if not encoded or len(encoded) > maximum_uncompressed:
+            raise TransportError("COMPRESSION_LIMIT_EXCEEDED", "native v0.2 envelope exceeds zstd output limit")
+        try:
+            compressed = zstd_compress(encoded)
+        except TransportError as exc:
+            raise TransportError("PMX.PROTOCOL.COMPRESSION", "native v0.2 zstd compression failed") from exc
+        if (
+            not compressed
+            or len(compressed) > maximum_compressed
+            or len(encoded) / max(1, len(compressed)) > maximum_ratio
+        ):
+            raise TransportError("COMPRESSION_LIMIT_EXCEEDED", "native v0.2 zstd wrapper exceeds negotiated limits")
+        return {
+            "type": "zstd.wrapper",
+            "profile": V2_PROTOCOL_VERSION,
+            "mesh_id": self._mesh_id,
+            "session_id": self._sid,
+            "compression": "zstd",
+            "uncompressed_bytes": len(encoded),
+            "compressed_bytes": len(compressed),
+            "payload": base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("="),
+        }
+
+    def _v2_maybe_compress_wire_envelope(self, wire: JsonObject) -> JsonObject:
+        selection = self._v2_compression
+        if (
+            selection is None
+            or selection.algorithm != "zstd"
+            or wire.get("type") not in _V2_COMPRESSIBLE_TYPES
+            or selection.max_compressed_bytes is None
+            or selection.max_uncompressed_bytes is None
+            or selection.max_expansion_ratio is None
+        ):
+            return wire
+        encoded = canonical_json(wire).encode("utf-8")
+        if not encoded or len(encoded) > selection.max_uncompressed_bytes:
+            return wire
+        try:
+            compressed = zstd_compress(encoded)
+        except TransportError:
+            # A codec disappearing after negotiation is not permission to
+            # mutate the profile; raw v2 application frames remain legal.
+            return wire
+        if (
+            not compressed
+            or len(compressed) >= len(encoded)
+            or len(compressed) > selection.max_compressed_bytes
+            or len(encoded) / max(1, len(compressed)) > selection.max_expansion_ratio
+        ):
+            return wire
+        return {
+            "type": "compression.frame",
+            "v": V2_HANDSHAKE_VERSION,
+            "algorithm": "zstd",
+            "record_type": wire["type"],
+            "compressed_bytes": len(compressed),
+            "uncompressed_bytes": len(encoded),
+            "payload": base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("="),
+        }
+
     async def _send_record(self, record: Any, *, transport: WireTransport | None = None, generation: int | None = None) -> None:
         self._bind_loop()
         chosen = transport or self._transport
@@ -787,7 +1386,13 @@ class PolyMeshClient:
         async with self._send_lock:
             if generation is not None and (generation != self._generation or chosen is not self._transport):
                 raise TransportClosedError("TRANSPORT_CLOSED", "stale connection generation", retryable=True)
-            await chosen.send(encode_record_text(record))
+            if self._profile == V2_PROTOCOL_VERSION:
+                encoded = canonical_json(self._v2_wire_for_send(record))
+                if len(encoded.encode("utf-8")) > MAX_FRAME_BYTES:
+                    raise TransportError("FRAME_TOO_LARGE", "outbound v0.2 record exceeds 1 MiB")
+                await chosen.send(encoded)
+            else:
+                await chosen.send(encode_record_text(record))
 
     async def _receiver(self, transport: WireTransport, generation: int) -> None:
         try:
@@ -795,12 +1400,15 @@ class PolyMeshClient:
                 raw = await transport.recv()
                 if generation != self._generation or transport is not self._transport:
                     return
-                try:
-                    envelope = validate_envelope(parse_strict_json(raw))
-                except Exception as exc:
-                    self._emit("protocol_error", exc)
-                    continue
-                valid_inbound = await self._dispatch_envelope(envelope, generation)
+                if self._profile == V2_PROTOCOL_VERSION:
+                    valid_inbound = await self._receive_v2_record(raw, generation)
+                else:
+                    try:
+                        envelope = validate_envelope(parse_strict_json(raw))
+                    except Exception as exc:
+                        self._emit("protocol_error", exc)
+                        continue
+                    valid_inbound = await self._dispatch_envelope(envelope, generation)
                 if valid_inbound and generation == self._generation and transport is self._transport:
                     # The envelope has crossed framing and structural
                     # validation; handlers apply stricter task authorization
@@ -811,6 +1419,303 @@ class PolyMeshClient:
         except BaseException as exc:
             if generation == self._generation and not self._disconnecting:
                 await self._fail_generation(exc, generation, reconnect=True)
+
+    async def _receive_v2_record(self, raw: str, generation: int) -> bool:
+        """Decode one v2 control/wrapper/envelope record after READY."""
+
+        if self._v2_wire_mode == "native":
+            return await self._receive_native_v2_record(raw, generation)
+        try:
+            frame = parse_strict_json(raw)
+            if not isinstance(frame, dict):
+                raise ProtocolError("MALFORMED_FRAME", "v0.2 record must be an object")
+            frame_type = frame.get("type")
+            if frame_type == "compression.offer":
+                return await self._receive_v2_compression_offer(frame, generation)
+            if frame_type == "compression.selected":
+                return self._receive_v2_compression_selected(frame)
+            if frame_type == "compression.frame":
+                return await self._receive_v2_compressed_frame(frame, generation)
+            if frame_type == "delivery.receipt":
+                return self._receive_v2_delivery_receipt(frame)
+            if self._mesh_id is None:
+                raise ProtocolError("MESH_SCOPE_MISMATCH", "v0.2 session has no authenticated mesh identity")
+            wire = validate_v2_envelope(frame, mesh_id=self._mesh_id)
+            delivery_id = wire.get("delivery_id")
+            envelope = v2_envelope_as_legacy(wire, mesh_id=self._mesh_id)
+            valid = await self._dispatch_envelope(envelope, generation)
+            if valid and isinstance(delivery_id, str):
+                await self._send_v2_delivery_receipt(delivery_id, envelope.message_id, generation)
+            return valid
+        except Exception as exc:
+            self._emit("protocol_error", exc)
+            return False
+
+    async def _receive_native_v2_record(self, raw: str, generation: int) -> bool:
+        """Decode one compact native-v2 control/wrapper/envelope record."""
+
+        try:
+            frame = parse_strict_json(raw)
+            if not isinstance(frame, dict):
+                raise ProtocolError("MALFORMED_FRAME", "native v0.2 record must be an object")
+            frame_type = frame.get("type")
+            if frame_type == "zstd.propose":
+                return await self._receive_native_v2_zstd_propose(frame, generation)
+            if frame_type == "zstd.ready":
+                return await self._receive_native_v2_zstd_ready(frame, generation)
+            if frame_type == "zstd.wrapper":
+                return await self._receive_native_v2_zstd_wrapper(frame, generation)
+            if frame_type == "v2.error":
+                failure = validate_v2_error_frame(frame)
+                self._emit(
+                    "protocol_error",
+                    ProtocolError(str(failure["code"]), str(failure["message"]), retryable=bool(failure.get("retryable", False))),
+                )
+                return False
+            if self._mesh_id is None:
+                raise ProtocolError("MESH_SCOPE_MISMATCH", "native v0.2 session has no acknowledged mesh identity")
+            wire = validate_v2_native_envelope(frame, mesh_id=self._mesh_id)
+            envelope = native_v2_envelope_as_legacy(wire, mesh_id=self._mesh_id)
+            return await self._dispatch_envelope(envelope, generation)
+        except Exception as exc:
+            self._emit("protocol_error", exc)
+            return False
+
+    def _validate_native_v2_zstd_control(self, frame: JsonObject, expected_type: str) -> None:
+        if (
+            set(frame) != {"type", "profile", "mesh_id", "session_id", "compression"}
+            or frame.get("type") != expected_type
+            or frame.get("profile") != V2_PROTOCOL_VERSION
+            or frame.get("compression") != "zstd"
+            or self._mesh_id is None
+            or self._sid is None
+            or frame.get("mesh_id") != self._mesh_id
+            or frame.get("session_id") != self._sid
+        ):
+            raise ProtocolError("PMX.PROTOCOL.COMPRESSION", f"native v0.2 {expected_type} record is invalid")
+
+    async def _send_native_v2_zstd_proposal(self, generation: int) -> None:
+        if self._mesh_id is None or self._sid is None:
+            raise HandshakeError("MESH_SCOPE_MISMATCH", "native v0.2 zstd proposal has no session binding")
+        await self._send_record(
+            {
+                "type": "zstd.propose",
+                "profile": V2_PROTOCOL_VERSION,
+                "mesh_id": self._mesh_id,
+                "session_id": self._sid,
+                "compression": "zstd",
+            },
+            generation=generation,
+        )
+
+    async def _receive_native_v2_zstd_propose(self, frame: JsonObject, generation: int) -> bool:
+        # The client is always the native init/ack initiator.  The broker's
+        # only legal next compression control is its ready confirmation.
+        self._validate_native_v2_zstd_control(frame, "zstd.propose")
+        raise ProtocolError("PMX.PROTOCOL.COMPRESSION", "native v0.2 client received an unexpected zstd.propose")
+
+    async def _receive_native_v2_zstd_ready(self, frame: JsonObject, generation: int) -> bool:
+        self._validate_native_v2_zstd_control(frame, "zstd.ready")
+        if (
+            self._v2_native_compression_selected != "zstd"
+            or not self._v2_native_proposed
+            or self._v2_native_compression_active
+            or self._v2_native_ready_sent
+        ):
+            raise ProtocolError("PMX.PROTOCOL.COMPRESSION", "native v0.2 zstd.ready is invalid in the current state")
+        self._v2_native_ready_sent = True
+        if self._mesh_id is None or self._sid is None:
+            raise ProtocolError("MESH_SCOPE_MISMATCH", "native v0.2 zstd ready has no session binding")
+        await self._send_record(
+            {
+                "type": "zstd.ready",
+                "profile": V2_PROTOCOL_VERSION,
+                "mesh_id": self._mesh_id,
+                "session_id": self._sid,
+                "compression": "zstd",
+            },
+            generation=generation,
+        )
+        self._v2_native_compression_active = True
+        self._emit("compression", {"algorithm": "zstd"})
+        return True
+
+    async def _receive_native_v2_zstd_wrapper(self, frame: JsonObject, generation: int) -> bool:
+        if (
+            self._v2_native_compression_selected != "zstd"
+            or not self._v2_native_compression_active
+            or self._mesh_id is None
+            or self._sid is None
+        ):
+            raise ProtocolError("PMX.PROTOCOL.COMPRESSION", "native v0.2 zstd.wrapper arrived before zstd was active")
+        fields = {
+            "type", "profile", "mesh_id", "session_id", "compression",
+            "uncompressed_bytes", "compressed_bytes", "payload",
+        }
+        if (
+            set(frame) != fields
+            or frame.get("type") != "zstd.wrapper"
+            or frame.get("profile") != V2_PROTOCOL_VERSION
+            or frame.get("mesh_id") != self._mesh_id
+            or frame.get("session_id") != self._sid
+            or frame.get("compression") != "zstd"
+        ):
+            raise ProtocolError("PMX.PROTOCOL.COMPRESSION", "native v0.2 zstd.wrapper is malformed")
+        uncompressed_bytes = frame.get("uncompressed_bytes")
+        compressed_bytes = frame.get("compressed_bytes")
+        maximum_compressed, maximum_uncompressed, maximum_ratio = self._v2_offer_limits
+        if (
+            not isinstance(uncompressed_bytes, int)
+            or isinstance(uncompressed_bytes, bool)
+            or not isinstance(compressed_bytes, int)
+            or isinstance(compressed_bytes, bool)
+            or not 0 < uncompressed_bytes <= maximum_uncompressed
+            or not 0 < compressed_bytes <= maximum_compressed
+            or uncompressed_bytes / max(1, compressed_bytes) > maximum_ratio
+        ):
+            raise ProtocolError("PMX.PROTOCOL.COMPRESSION", "native v0.2 zstd.wrapper exceeds local limits")
+        payload = _v2_decode_base64url(frame.get("payload"))
+        if len(payload) != compressed_bytes:
+            raise ProtocolError("PMX.PROTOCOL.COMPRESSION", "native v0.2 zstd.wrapper payload length is invalid")
+        decoded = zstd_decompress(payload, max_output_bytes=maximum_uncompressed)
+        if len(decoded) != uncompressed_bytes:
+            raise ProtocolError("PMX.PROTOCOL.COMPRESSION", "native v0.2 zstd.wrapper output length is invalid")
+        decoded_record = parse_strict_json(decoded)
+        if not isinstance(decoded_record, dict):
+            raise ProtocolError("PMX.PROTOCOL.COMPRESSION", "native v0.2 zstd.wrapper did not decode to an envelope")
+        wire = validate_v2_native_envelope(decoded_record, mesh_id=self._mesh_id)
+        envelope = native_v2_envelope_as_legacy(wire, mesh_id=self._mesh_id)
+        return await self._dispatch_envelope(envelope, generation)
+
+    async def _receive_v2_compression_offer(self, frame: JsonObject, generation: int) -> bool:
+        """Accept a peer offer only after READY and never widen its limits."""
+
+        if frame.get("v") != V2_HANDSHAKE_VERSION or set(frame) - {"type", "v", "algorithms", "limits"}:
+            raise ProtocolError("COMPRESSION_OFFER_INVALID", "v0.2 compression offer is malformed")
+        algorithms = frame.get("algorithms")
+        if not isinstance(algorithms, list) or not algorithms or len(set(algorithms)) != len(algorithms) or any(item not in {"none", "zstd"} for item in algorithms) or "none" not in algorithms:
+            raise ProtocolError("COMPRESSION_OFFER_INVALID", "v0.2 compression offer has invalid algorithms")
+        offered_limits = frame.get("limits")
+        if ("zstd" in algorithms) != isinstance(offered_limits, dict):
+            raise ProtocolError("COMPRESSION_OFFER_INVALID", "v0.2 zstd offer has invalid limits")
+        selected: _V2Compression
+        if self._compression_enabled and zstd_available() and "zstd" in algorithms:
+            parsed = _v2_compression_limits(offered_limits)
+            if parsed is None:
+                raise ProtocolError("COMPRESSION_OFFER_INVALID", "v0.2 zstd offer has invalid limits")
+            own_compressed, own_uncompressed, own_ratio = self._v2_offer_limits
+            selected = _V2Compression(
+                "zstd",
+                min(parsed[0], own_compressed),
+                min(parsed[1], own_uncompressed),
+                min(parsed[2], own_ratio),
+            )
+        else:
+            selected = _V2Compression("none")
+        existing = self._v2_compression
+        if existing is not None and existing != selected:
+            raise ProtocolError("COMPRESSION_SELECTED_MISMATCH", "v0.2 compression cannot be renegotiated")
+        self._v2_compression = selected
+        response: JsonObject = {"type": "compression.selected", "v": V2_HANDSHAKE_VERSION, "algorithm": selected.algorithm}
+        if selected.algorithm == "zstd":
+            response["limits"] = {
+                "maxCompressedBytes": selected.max_compressed_bytes,
+                "maxUncompressedBytes": selected.max_uncompressed_bytes,
+                "maxExpansionRatio": selected.max_expansion_ratio,
+            }
+        await self._send_record(response, generation=generation)
+        return True
+
+    def _receive_v2_compression_selected(self, frame: JsonObject) -> bool:
+        if frame.get("v") != V2_HANDSHAKE_VERSION or set(frame) - {"type", "v", "algorithm", "limits"}:
+            raise ProtocolError("COMPRESSION_SELECTED_INVALID", "v0.2 compression selection is malformed")
+        algorithm = frame.get("algorithm")
+        if algorithm == "none":
+            if "limits" in frame:
+                raise ProtocolError("COMPRESSION_SELECTED_INVALID", "none compression selection must omit limits")
+            selected = _V2Compression("none")
+        elif algorithm == "zstd":
+            parsed = _v2_compression_limits(frame.get("limits") if isinstance(frame.get("limits"), dict) else {})
+            if parsed is None or not self._compression_enabled or not zstd_available():
+                raise ProtocolError("COMPRESSION_SELECTED_INVALID", "zstd compression is unavailable or malformed")
+            own_compressed, own_uncompressed, own_ratio = self._v2_offer_limits
+            if parsed[0] > own_compressed or parsed[1] > own_uncompressed or parsed[2] > own_ratio:
+                raise ProtocolError("COMPRESSION_SELECTED_MISMATCH", "peer widened v0.2 compression limits")
+            selected = _V2Compression("zstd", *parsed)
+        else:
+            raise ProtocolError("COMPRESSION_SELECTED_INVALID", "unknown v0.2 compression algorithm")
+        existing = self._v2_compression
+        if existing is not None and existing != selected:
+            raise ProtocolError("COMPRESSION_SELECTED_MISMATCH", "v0.2 compression cannot be renegotiated")
+        self._v2_compression = selected
+        self._emit("compression", {"algorithm": selected.algorithm})
+        return True
+
+    async def _receive_v2_compressed_frame(self, frame: JsonObject, generation: int) -> bool:
+        selection = self._v2_compression
+        if selection is None or selection.algorithm != "zstd" or (
+            selection.max_compressed_bytes is None
+            or selection.max_uncompressed_bytes is None
+            or selection.max_expansion_ratio is None
+        ):
+            raise ProtocolError("COMPRESSION_NOT_NEGOTIATED", "received zstd frame before negotiation")
+        fields = {"type", "v", "algorithm", "record_type", "compressed_bytes", "uncompressed_bytes", "payload"}
+        if frame.get("v") != V2_HANDSHAKE_VERSION or set(frame) != fields or frame.get("algorithm") != "zstd" or frame.get("record_type") not in _V2_COMPRESSIBLE_TYPES:
+            raise ProtocolError("COMPRESSION_FRAME_INVALID", "v0.2 zstd wrapper is malformed")
+        compressed_bytes = frame.get("compressed_bytes")
+        uncompressed_bytes = frame.get("uncompressed_bytes")
+        if (
+            not isinstance(compressed_bytes, int)
+            or isinstance(compressed_bytes, bool)
+            or not isinstance(uncompressed_bytes, int)
+            or isinstance(uncompressed_bytes, bool)
+            or not 0 < compressed_bytes <= selection.max_compressed_bytes
+            or not 0 < uncompressed_bytes <= selection.max_uncompressed_bytes
+            or uncompressed_bytes / max(1, compressed_bytes) > selection.max_expansion_ratio
+        ):
+            raise ProtocolError("COMPRESSION_LIMIT_EXCEEDED", "v0.2 zstd wrapper exceeds negotiated limits")
+        payload = _v2_decode_base64url(frame.get("payload"))
+        if len(payload) != compressed_bytes:
+            raise ProtocolError("COMPRESSION_FRAME_INVALID", "v0.2 zstd payload length does not match metadata")
+        decoded = zstd_decompress(payload, max_output_bytes=selection.max_uncompressed_bytes)
+        if len(decoded) != uncompressed_bytes:
+            raise ProtocolError("COMPRESSION_OUTPUT_SIZE_MISMATCH", "v0.2 zstd output length does not match metadata")
+        decoded_record = parse_strict_json(decoded)
+        if not isinstance(decoded_record, dict) or decoded_record.get("type") != frame["record_type"]:
+            raise ProtocolError("COMPRESSION_RECORD_TYPE_MISMATCH", "v0.2 zstd payload does not bind its declared record type")
+        # Re-enter the ordinary v2 application path without recursively
+        # treating a decoded envelope as another compression wrapper.
+        if self._mesh_id is None:
+            raise ProtocolError("MESH_SCOPE_MISMATCH", "v0.2 session has no authenticated mesh identity")
+        wire = validate_v2_envelope(decoded_record, mesh_id=self._mesh_id)
+        delivery_id = wire.get("delivery_id")
+        envelope = v2_envelope_as_legacy(wire, mesh_id=self._mesh_id)
+        valid = await self._dispatch_envelope(envelope, generation)
+        if valid and isinstance(delivery_id, str):
+            await self._send_v2_delivery_receipt(delivery_id, envelope.message_id, generation)
+        return valid
+
+    def _receive_v2_delivery_receipt(self, frame: JsonObject) -> bool:
+        if set(frame) != {"type", "v", "delivery_id", "message_id", "state"} or frame.get("v") != V2_HANDSHAKE_VERSION or frame.get("state") != "stored":
+            raise ProtocolError("MALFORMED_FRAME", "v0.2 delivery receipt is malformed")
+        # The durable relay receipt has no lifecycle authority.  Expose it to
+        # observers without confusing it with the v0.1 semantic receipt.
+        if not isinstance(frame.get("delivery_id"), str) or not isinstance(frame.get("message_id"), str):
+            raise ProtocolError("MALFORMED_FRAME", "v0.2 delivery receipt identifiers are invalid")
+        self._emit("delivery_receipt", dict(frame))
+        return True
+
+    async def _send_v2_delivery_receipt(self, delivery_id: str, message_id: str, generation: int) -> None:
+        await self._send_record(
+            {
+                "type": "delivery.receipt",
+                "v": V2_HANDSHAKE_VERSION,
+                "delivery_id": delivery_id,
+                "message_id": message_id,
+                "state": "stored",
+            },
+            generation=generation,
+        )
 
     async def _heartbeat(self, transport: WireTransport, generation: int) -> None:
         try:
@@ -857,6 +1762,14 @@ class PolyMeshClient:
         self._broker_card = None
         self._broker_identity = None
         self._broker_principal = None
+        self._v2_compression = None
+        self._v2_compression_offered = False
+        self._v2_initiator_hello = None
+        self._v2_responder_hello = None
+        self._v2_native_compression_selected = "none"
+        self._v2_native_compression_active = False
+        self._v2_native_proposed = False
+        self._v2_native_ready_sent = False
         self._outstanding_pong = None
         # A transport loss fences every inbound handler.  Letting application
         # code continue during reconnect would allow side effects after the
@@ -1086,7 +1999,11 @@ class PolyMeshClient:
             return None, supplied
         if version is not None or digest is not None:
             raise ContractMismatchError("CAPABILITY_CONTRACT_MISMATCH", "capability version and digest must be supplied together")
-        if self._allow_insecure_loopback_development:
+        # Compact native v2 has no card-discovery exchange.  Its native
+        # envelope still carries a deterministic default contract tuple, so
+        # a client can complete the bounded standard task lifecycle without
+        # treating this as a v0.1 security downgrade.
+        if self._profile == V2_PROTOCOL_VERSION or self._allow_insecure_loopback_development:
             candidate = Capability(id=capability, version=version or "1.0.0")
             return candidate, capability_contract_tuple(candidate)
         raise ContractMismatchError("CAPABILITY_CONTRACT_MISMATCH", "an exact capability contract is required")

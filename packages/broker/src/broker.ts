@@ -20,6 +20,10 @@ import {
   MAX_ROUTED_PROVENANCE_LIFETIME_MS,
   PROTOCOL_VERSION,
   SECURE_IDENTITY_PROFILE,
+  V2_COMPRESSION_ALGORITHMS,
+  V2_ERROR_CODES,
+  V2_NATIVE_ENVELOPE_TYPES,
+  V2_PROFILE,
   EnrollmentStore,
   ProtocolError,
   authTranscript,
@@ -34,6 +38,9 @@ import {
   isAgentCard,
   isCapabilityContractTuple,
   isEnvelope,
+  isJsonValue,
+  isTimestamp,
+  isUuidV7,
   parseStrictJson,
   randomInstanceId,
   randomNonce,
@@ -56,6 +63,14 @@ import {
   type VerifiedPrincipal,
   type WireTransport,
   type JsonObject,
+  type JsonValue,
+  type V2AckFrame,
+  type V2CompressionAlgorithm,
+  type V2ErrorCode,
+  type V2ErrorFrame,
+  type V2InitFrame,
+  type V2NativeEnvelope,
+  type V2NativeEnvelopeType,
   validateHandshakeFrame,
 } from "./protocol.js";
 import {
@@ -75,6 +90,11 @@ import {
   type PersistIngressResult,
   type RecoveryReport,
 } from "./durable-store.js";
+import type {
+  V2InboxRecord,
+  V2PersistEnvelopeInput,
+  V2PersistEnvelopeResult,
+} from "./durable-store-v2.js";
 import {
   HealthState,
   createRoutePin,
@@ -85,8 +105,11 @@ import {
   type RoutingInstance,
 } from "./routing.js";
 import {
+  CompressionTransportError,
+  V2ZstdStateMachine,
   compressionAllowedForRecord,
   compressionRateLimitCharges,
+  initializeZstd,
   validateDecompressedOutput,
   type CompressionNegotiation,
   type CompressionNegotiationResult,
@@ -165,6 +188,25 @@ export interface BrokerIdentityOptions {
   privateKey: Ed25519PrivateKey;
   /** Explicit local enrollment. Cards and mDNS records never add entries. */
   enrollments: EnrollmentStore | readonly Enrollment[];
+}
+
+/**
+ * Minimal durable mailbox surface used by the compact native v2 profile.
+ *
+ * It is deliberately separate from the pre-existing relay `DurableStore`:
+ * native envelopes have a different wire shape (`profile`, root `mesh_id`,
+ * and nested `delivery_id`) and must never be silently coerced into a legacy
+ * outbox row. `SqliteV2DurableStore` implements this interface.
+ */
+export interface NativeV2DurableStore {
+  persistEnvelopeAndInbox(input: V2PersistEnvelopeInput): Promise<V2PersistEnvelopeResult>;
+  replayInbox?(options: {
+    target: string;
+    cursor?: string | number;
+    limit?: number;
+    statuses?: readonly ("pending" | "delivered" | "acknowledged" | "expired")[];
+  }): Promise<{ deliveries: readonly V2InboxRecord[] }>;
+  markDelivered?(target: string, envelopeId: string, deliveredAt?: number): Promise<V2InboxRecord | undefined>;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -263,6 +305,14 @@ export interface BrokerOptions {
   /** Let an otherwise mutually supported zstd offer select zstd. Defaults to false. */
   allowZstdCompression?: boolean;
   /**
+   * Enable the compact `v2.init` / `v2.ack` SDK session in addition to the
+   * pre-existing relay v2 hello/card/ready path. It is on by default because
+   * it is independently token/mTLS authenticated and has no legacy fallback.
+   */
+  enableNativeV2?: boolean;
+  /** Optional compact-profile mailbox for atomic envelope + inbox storage. */
+  nativeV2Store?: NativeV2DurableStore;
+  /**
    * Serve the distinct `polymesh.0.2` session profile. It requires the
    * durable/multi-instance relay configuration and never changes v0.1
    * sessions. Defaults to true when `durableStore` is configured.
@@ -298,12 +348,17 @@ export interface BrokerOptions {
 export interface AttachOptions {
   /** Used only for a pre-existing non-HTTP transport. */
   token?: string;
-  /** Pin an in-memory transport to one profile instead of inferring hello.v. */
-  profile?: "v1" | "v2";
+  /**
+   * Pin an in-memory transport to one profile instead of inferring its first
+   * handshake record. `polymesh.0.2` selects the compact native SDK branch;
+   * `v2` remains the historical hello/card/ready relay branch.
+   */
+  profile?: "v1" | "v2" | "native-v2" | typeof V2_PROTOCOL_VERSION;
 }
 
 export type PeerPhase = "await_hello" | "await_card" | "await_auth" | "await_ready" | "active" | "closed";
-export type WireProfile = "v1" | "v2";
+/** `v2` is the older relay profile; native-v2 is selected by `v2.init`. */
+export type WireProfile = "v1" | "v2" | "native-v2";
 
 export interface BrokerPeer {
   transport: BrokerTransport;
@@ -335,6 +390,11 @@ export interface BrokerPeer {
   profile?: WireProfile;
   v2InitiatorHello?: V2HelloFrame;
   v2ResponderHello?: V2HelloFrame;
+  /** Compact native-v2 selected codec and post-ack zstd state, if any. */
+  nativeV2Compression?: V2CompressionAlgorithm;
+  nativeV2Zstd?: V2ZstdStateMachine;
+  /** Prevents a second init from racing asynchronous zstd initialisation. */
+  nativeV2InitPending?: boolean;
   connectedAt: number;
 }
 
@@ -406,6 +466,16 @@ interface LiveRoutingInstance extends RoutingInstance {
 
 interface ReplayLedgerRecord {
   semanticDigest: string;
+  expiresAt: number;
+}
+
+/** Immutable native-v2 source/target session binding for a task lifecycle. */
+interface NativeV2TaskRoute {
+  taskId: string;
+  submitMessageId: string;
+  source: { agentId: string; instanceId: string; sessionId: string };
+  target: { agentId: string; instanceId: string; sessionId: string };
+  deadlineAt: number;
   expiresAt: number;
 }
 
@@ -489,6 +559,163 @@ function isLifecycle(type: EnvelopeType): boolean {
   return type === "task.accepted" || type === "task.rejected" || type === "task.progress" || type === "task.completed";
 }
 
+/** The compact v2 profile uses a closed JSON object at every wire boundary. */
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyNativeV2Keys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).every((key) => keys.includes(key));
+}
+
+function hasNativeV2Keys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return keys.every((key) => Object.hasOwn(value, key));
+}
+
+const NATIVE_V2_AGENT_ID_RE = /^(?:[a-z]|[a-z][a-z0-9._-]*[a-z0-9])$/;
+const NATIVE_V2_INSTANCE_ID_RE = /^[A-Za-z0-9._-]+$/;
+const NATIVE_V2_IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9._~:\-]+$/;
+
+function isNativeV2AgentId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 255 && NATIVE_V2_AGENT_ID_RE.test(value);
+}
+
+function isNativeV2InstanceId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 255 && NATIVE_V2_INSTANCE_ID_RE.test(value);
+}
+
+function isNativeV2Compression(value: unknown): value is V2CompressionAlgorithm {
+  return typeof value === "string" && (V2_COMPRESSION_ALGORITHMS as readonly string[]).includes(value);
+}
+
+function isNativeV2ErrorCode(value: unknown): value is V2ErrorCode {
+  return typeof value === "string" && (V2_ERROR_CODES as readonly string[]).includes(value);
+}
+
+function isNativeV2InitRecord(value: unknown): value is V2InitFrame {
+  return isJsonRecord(value) && value.type === "v2.init";
+}
+
+/**
+ * Validate the compact profile's initial record before it can establish an
+ * identity.  A caller may hint a mesh, but the broker never adopts it.
+ */
+function validateNativeV2Init(value: unknown): V2InitFrame | undefined {
+  if (!isJsonRecord(value)) return undefined;
+  const allowed = ["type", "protocol", "profile", "supported_profiles", "mesh_id", "agent_id", "instance_id", "nonce", "compression"];
+  const required = ["type", "profile", "agent_id", "instance_id", "nonce"];
+  if (!hasNativeV2Keys(value, required) || !hasOnlyNativeV2Keys(value, allowed) ||
+    value.type !== "v2.init" || value.profile !== V2_PROFILE ||
+    (value.protocol !== undefined && value.protocol !== V2_PROFILE) ||
+    (value.mesh_id !== undefined && !isUuidV7(value.mesh_id)) ||
+    !isNativeV2AgentId(value.agent_id) || !isNativeV2InstanceId(value.instance_id) || !isUuidV7(value.nonce)) {
+    return undefined;
+  }
+  if (value.supported_profiles !== undefined) {
+    if (!Array.isArray(value.supported_profiles) || value.supported_profiles.length === 0 ||
+      new Set(value.supported_profiles).size !== value.supported_profiles.length ||
+      !value.supported_profiles.every((profile) => profile === V2_PROFILE) ||
+      !value.supported_profiles.includes(V2_PROFILE)) return undefined;
+  }
+  if (value.compression !== undefined) {
+    if (!Array.isArray(value.compression) || value.compression.length === 0 ||
+      new Set(value.compression).size !== value.compression.length ||
+      !value.compression.every((algorithm) => isNativeV2Compression(algorithm))) return undefined;
+  }
+  return value as unknown as V2InitFrame;
+}
+
+function isNativeV2Address(value: unknown, identity: boolean): boolean {
+  if (!isJsonRecord(value)) return false;
+  const allowed = ["agent_id", "instance_id"];
+  const required = identity ? ["agent_id", "instance_id"] : ["agent_id"];
+  return hasNativeV2Keys(value, required) && hasOnlyNativeV2Keys(value, allowed) &&
+    isNativeV2AgentId(value.agent_id) &&
+    (value.instance_id === undefined || isNativeV2InstanceId(value.instance_id));
+}
+
+/** Closed structural validation for a native-v2 application envelope. */
+function validateNativeV2Envelope(value: unknown): V2NativeEnvelope | undefined {
+  if (!isJsonRecord(value)) return undefined;
+  const allowed = ["protocol", "profile", "mesh_id", "type", "message_id", "timestamp", "source", "target", "delivery", "in_reply_to", "params"];
+  const required = ["protocol", "profile", "mesh_id", "type", "message_id", "timestamp", "source", "target", "delivery", "params"];
+  if (!hasNativeV2Keys(value, required) || !hasOnlyNativeV2Keys(value, allowed) ||
+    value.protocol !== V2_PROFILE || value.profile !== V2_PROFILE || !isUuidV7(value.mesh_id) ||
+    typeof value.type !== "string" || !(V2_NATIVE_ENVELOPE_TYPES as readonly string[]).includes(value.type) ||
+    !isUuidV7(value.message_id) || !isTimestamp(value.timestamp) ||
+    !isNativeV2Address(value.source, true) || !isNativeV2Address(value.target, false) ||
+    (value.in_reply_to !== undefined && !isUuidV7(value.in_reply_to)) ||
+    !isJsonRecord(value.params) || !isJsonValue(value.params) || !isJsonRecord(value.delivery)) {
+    return undefined;
+  }
+  const delivery = value.delivery;
+  if (!hasNativeV2Keys(delivery, ["delivery_id", "mode", "idempotency_key", "deadline"]) ||
+    !hasOnlyNativeV2Keys(delivery, ["delivery_id", "mode", "idempotency_key", "deadline"]) ||
+    !isUuidV7(delivery.delivery_id) || delivery.mode !== "at_least_once" ||
+    typeof delivery.idempotency_key !== "string" || delivery.idempotency_key.length === 0 ||
+    delivery.idempotency_key.length > 256 || !NATIVE_V2_IDEMPOTENCY_KEY_RE.test(delivery.idempotency_key) ||
+    !isTimestamp(delivery.deadline)) {
+    return undefined;
+  }
+  const params = value.params;
+  if (value.type === "task.submit") {
+    if (!hasNativeV2Keys(params, ["task_id", "capability", "input", "deadline"]) ||
+      !hasOnlyNativeV2Keys(params, ["task_id", "capability", "capability_version", "capability_contract_digest", "input", "deadline"]) ||
+      !isUuidV7(params.task_id) || !isNativeV2AgentId(params.capability) || !isJsonValue(params.input) ||
+      !isTimestamp(params.deadline) || params.deadline !== delivery.deadline ||
+      (params.capability_version !== undefined && (typeof params.capability_version !== "string" || !/^\d+\.\d+\.\d+$/.test(params.capability_version))) ||
+      (params.capability_contract_digest !== undefined && (typeof params.capability_contract_digest !== "string" || !/^[0-9a-f]{64}$/i.test(params.capability_contract_digest)))) {
+      return undefined;
+    }
+  }
+  if (value.type === "error") {
+    if (!hasNativeV2Keys(params, ["code", "message", "retryable"]) ||
+      !hasOnlyNativeV2Keys(params, ["code", "message", "retryable", "details"]) ||
+      !isNativeV2ErrorCode(params.code) || typeof params.message !== "string" || params.message.length === 0 ||
+      params.message.length > 1_024 || typeof params.retryable !== "boolean" ||
+      (params.details !== undefined && (!isJsonRecord(params.details) || !isJsonValue(params.details)))) {
+      return undefined;
+    }
+  }
+  return value as unknown as V2NativeEnvelope;
+}
+
+function nativeV2TaskId(envelope: V2NativeEnvelope): string | undefined {
+  const taskId = (envelope.params as JsonRecord).task_id;
+  return isUuidV7(taskId) ? taskId : undefined;
+}
+
+function isNativeV2Lifecycle(type: V2NativeEnvelopeType): boolean {
+  return type === "task.accepted" || type === "task.rejected" || type === "task.progress" || type === "task.completed";
+}
+
+function nativeEndpointMatchesPeer(
+  endpoint: { agentId: string; instanceId: string; sessionId: string },
+  peer: BrokerPeer,
+): boolean {
+  return peer.profile === "native-v2" && peer.agentId === endpoint.agentId &&
+    peer.instanceId === endpoint.instanceId && peer.sessionId === endpoint.sessionId;
+}
+
+function nativeTargetMatchesEndpoint(
+  target: V2NativeEnvelope["target"],
+  endpoint: { agentId: string; instanceId: string },
+): boolean {
+  return target.agent_id === endpoint.agentId &&
+    (target.instance_id === undefined || target.instance_id === endpoint.instanceId);
+}
+
+function nativeV2ContractFields(params: JsonRecord): JsonObject {
+  const capability = typeof params.capability === "string" ? params.capability : undefined;
+  const capabilityVersion = typeof params.capability_version === "string" ? params.capability_version : undefined;
+  const contractDigest = typeof params.capability_contract_digest === "string" ? params.capability_contract_digest : undefined;
+  return {
+    ...(capability === undefined ? {} : { capability }),
+    ...(capabilityVersion === undefined ? {} : { capability_version: capabilityVersion }),
+    ...(contractDigest === undefined ? {} : { capability_contract_digest: contractDigest }),
+  };
+}
+
 /** Records whose claimed remote source can change task or policy state. */
 function requiresRoutedProvenance(type: EnvelopeType): boolean {
   return type === "task.submit" || type === "task.cancel" || isLifecycle(type) || type === "error";
@@ -520,6 +747,8 @@ export class Broker {
   private readonly replayRetentionMs: number;
   private readonly allowedOrigins: readonly string[];
   private readonly meshId?: string;
+  /** Broker-owned UUIDv7 mesh scope for the compact native v2 profile. */
+  readonly nativeV2MeshId: string;
   private readonly multiInstanceRouting: boolean;
   private readonly allowInsecureMultiInstanceDevelopment: boolean;
   private readonly durableStore?: DurableStore;
@@ -529,6 +758,8 @@ export class Broker {
   private readonly compressionOffer: CompressionOffer;
   private readonly allowZstdCompression: boolean;
   private readonly v2Enabled: boolean;
+  private readonly nativeV2Enabled: boolean;
+  private readonly nativeV2Store?: NativeV2DurableStore;
   private readonly supportedSubprotocols: readonly string[];
   private readonly tokenAuthority?: RuntimeTokenAuthority;
   private readonly identityProfile?: {
@@ -538,6 +769,11 @@ export class Broker {
     localPrincipal: VerifiedPrincipal;
   };
   private readonly peers = new Set<BrokerPeer>();
+  /** Live compact-profile sessions, fenced by broker mesh + peer session. */
+  private readonly nativeV2Peers = new Map<string, BrokerPeer>();
+  private readonly nativeV2Tasks = new Map<string, NativeV2TaskRoute>();
+  private readonly nativeV2RoutesBySubmitMessageId = new Map<string, string>();
+  private readonly nativeV2ReplayLedger = new Map<string, ReplayLedgerRecord>();
   /** Process-local sockets keyed by a durable v0.2 instance identity. */
   private readonly routingInstances = new Map<string, LiveRoutingInstance>();
   /** Monotonic registration sequence per mesh/logical/physical instance. */
@@ -582,6 +818,10 @@ export class Broker {
     this.replayRetentionMs = Math.max(MIN_REPLAY_RETENTION_MS, options.replayRetentionMs ?? MIN_REPLAY_RETENTION_MS);
     this.allowedOrigins = Object.freeze([...(options.allowedOrigins ?? [])]);
     this.meshId = options.meshId;
+    // The compact native profile never accepts a caller-chosen mesh scope.
+    // A UUIDv7 is allocated once per Broker instance and becomes visible only
+    // in v2.ack, after the transport itself was authenticated.
+    this.nativeV2MeshId = uuidv7(this.now());
     this.multiInstanceRouting = options.multiInstanceRouting === true;
     this.allowInsecureMultiInstanceDevelopment = options.allowInsecureMultiInstanceDevelopment === true;
     this.durableStore = options.durableStore;
@@ -592,7 +832,9 @@ export class Broker {
     });
     this.allowZstdCompression = options.allowZstdCompression === true;
     this.v2Enabled = options.enableV2 ?? this.durableStore !== undefined;
-    this.supportedSubprotocols = Object.freeze(this.v2Enabled
+    this.nativeV2Enabled = options.enableNativeV2 !== false;
+    this.nativeV2Store = options.nativeV2Store;
+    this.supportedSubprotocols = Object.freeze(this.v2Enabled || this.nativeV2Enabled
       ? [V2_SUBPROTOCOL, PROTOCOL_VERSION]
       : [PROTOCOL_VERSION]);
     if (!Number.isInteger(this.maxFrameBytes) || this.maxFrameBytes <= 0 || this.maxFrameBytes > MAX_FRAME_BYTES) {
@@ -704,6 +946,11 @@ export class Broker {
   /** Current token generation; useful for observability without exposing secret material. */
   get authEpoch(): number | undefined {
     return this.tokenAuthority?.authEpoch;
+  }
+
+  /** Compact native-v2 mesh scope assigned once for this broker instance. */
+  get nativeMeshId(): string {
+    return this.nativeV2MeshId;
   }
 
   /**
@@ -1326,7 +1573,8 @@ export class Broker {
     if (!verification.valid || verification.authEpoch === undefined) {
       return this.rejectAttachment(normalized, "AUTHENTICATION_FAILED", "A valid PolyMesh runtime token is required", "identity");
     }
-    return this.attachPreAuthenticated(normalized, verification.authEpoch, false, options.profile);
+    const profile = options.profile === V2_PROTOCOL_VERSION ? "native-v2" : options.profile;
+    return this.attachPreAuthenticated(normalized, verification.authEpoch, false, profile);
   }
 
   private attachPreAuthenticated(
@@ -1676,6 +1924,7 @@ export class Broker {
       this.trackDurableMutation(this.durableRegistry.cleanupDurable(this.now()).catch(() => []));
     }
     this.pruneRouteAndReplayState();
+    this.pruneNativeV2State();
   }
 
   async close(): Promise<void> {
@@ -1697,6 +1946,10 @@ export class Broker {
     this.routesBySubmitMessageId.clear();
     this.pendingRoutesBySession.clear();
     this.replayLedger.clear();
+    this.nativeV2Peers.clear();
+    this.nativeV2Tasks.clear();
+    this.nativeV2RoutesBySubmitMessageId.clear();
+    this.nativeV2ReplayLedger.clear();
 
     const wsServer = this.wsServer;
     const server = this.server;
@@ -1875,6 +2128,8 @@ export class Broker {
     if (peer.phase === "active") {
       if (peer.profile === "v2") {
         void this.receiveV2Record(peer, frame);
+      } else if (peer.profile === "native-v2") {
+        void this.receiveNativeV2Record(peer, frame);
       } else {
         this.receiveEnvelope(peer, frame);
       }
@@ -1882,6 +2137,15 @@ export class Broker {
   }
 
   private receiveHello(peer: BrokerPeer, frame: unknown): void {
+    const nativeInit = isNativeV2InitRecord(frame);
+    // The compact SDK profile shares the `polymesh.0.2` WebSocket
+    // subprotocol with the historical relay profile, but has an unambiguous
+    // first record. Select it only from `v2.init`; no legacy hello is ever
+    // structurally interpreted as a native init.
+    if (nativeInit || peer.profile === "native-v2") {
+      this.receiveNativeV2Init(peer, frame);
+      return;
+    }
     const looksLikeV2 = typeof frame === "object" && frame !== null && !Array.isArray(frame) &&
       (frame as Record<string, unknown>).v === V2_HANDSHAKE_VERSION;
     // v0.2 is selected by the WebSocket subprotocol, never opportunistically
@@ -1932,6 +2196,554 @@ export class Broker {
     };
     peer.responderHello = responderHello;
     this.sendRaw(peer, responderHello);
+  }
+
+  /**
+   * Compact native-v2 session establishment. This is intentionally separate
+   * from `receiveV2Hello`: the latter is the established relay v2 profile
+   * with its own durable card/auth/ready transcript.
+   */
+  private receiveNativeV2Init(peer: BrokerPeer, frame: unknown): void {
+    if (!this.nativeV2Enabled) {
+      this.failNativeV2Handshake(peer, "PMX.SESSION.PROFILE", "The native polymesh.0.2 profile is disabled");
+      return;
+    }
+    if (peer.phase !== "await_hello" || peer.nativeV2InitPending) {
+      this.failNativeV2Handshake(peer, "PMX.SESSION.HANDSHAKE", "A native v2 session may be initialized once");
+      return;
+    }
+    const init = validateNativeV2Init(frame);
+    if (!init) {
+      this.failNativeV2Handshake(peer, "PMX.SESSION.HANDSHAKE", "v2.init does not match the selected native profile");
+      return;
+    }
+    if (init.agent_id === this.card.agent_id && init.instance_id === this.card.instance_id) {
+      this.failNativeV2Handshake(peer, "PMX.SESSION.AUTH", "An agent cannot connect to itself");
+      return;
+    }
+    peer.nativeV2InitPending = true;
+    void this.completeNativeV2Init(peer, init);
+  }
+
+  /** Select zstd only when the peer offered it and the portable codec loads. */
+  private async completeNativeV2Init(peer: BrokerPeer, init: V2InitFrame): Promise<void> {
+    let compression: V2CompressionAlgorithm = "none";
+    // The compact profile defaults to zstd when both sides can use it. The
+    // legacy relay remains intentionally governed by allowZstdCompression.
+    if (init.compression?.includes("zstd") && this.options.allowZstdCompression !== false) {
+      try {
+        await initializeZstd();
+        compression = "zstd";
+      } catch {
+        // An unavailable optional WASM codec is a safe negotiated `none`, not
+        // a reason to expose a session which claims a codec it cannot enforce.
+        compression = "none";
+      }
+    }
+    if (peer.phase !== "await_hello" || peer.nativeV2InitPending !== true || this.closing) return;
+
+    peer.nativeV2InitPending = false;
+    peer.profile = "native-v2";
+    peer.meshId = this.nativeV2MeshId;
+    peer.sessionId = uuidv7(this.now());
+    peer.agentId = init.agent_id;
+    peer.instanceId = init.instance_id;
+    peer.initiatorNonce = init.nonce;
+    peer.nativeV2Compression = compression;
+    if (compression === "zstd") {
+      peer.nativeV2Zstd = new V2ZstdStateMachine({
+        meshId: this.nativeV2MeshId,
+        sessionId: peer.sessionId,
+      }, "responder");
+    }
+    this.registerNativeV2Peer(peer);
+    peer.phase = "active";
+    this.clearHandshakeTimer(peer);
+
+    const ack: V2AckFrame = {
+      type: "v2.ack",
+      protocol: V2_PROFILE,
+      profile: V2_PROFILE,
+      mesh_id: this.nativeV2MeshId,
+      session_id: peer.sessionId,
+      agent_id: this.card.agent_id,
+      instance_id: this.card.instance_id,
+      compression,
+    };
+    if (!this.sendRaw(peer, ack)) return;
+    this.options.onPeerConnected?.(peer);
+    await this.drainNativeV2Inbox(peer);
+  }
+
+  /** Receive native application records and the post-ack JSON zstd controls. */
+  private async receiveNativeV2Record(peer: BrokerPeer, frame: unknown): Promise<void> {
+    try {
+      const type = isJsonRecord(frame) && typeof frame.type === "string" ? frame.type : undefined;
+      if (type === "zstd.propose" || type === "zstd.ready") {
+        this.receiveNativeV2ZstdControl(peer, frame);
+        return;
+      }
+      if (type === "zstd.wrapper") {
+        await this.receiveNativeV2ZstdWrapper(peer, frame);
+        return;
+      }
+      await this.receiveNativeV2Envelope(peer, frame);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Native v2 record could not be processed";
+      await this.sendNativeV2Error(peer, "PMX.PROTOCOL.ENVELOPE", message, undefined, false);
+    }
+  }
+
+  private receiveNativeV2ZstdControl(peer: BrokerPeer, frame: unknown): void {
+    const machine = peer.nativeV2Zstd;
+    if (peer.nativeV2Compression !== "zstd" || !machine) {
+      void this.sendNativeV2Error(peer, "PMX.PROTOCOL.COMPRESSION", "zstd was not selected for this session", undefined, false);
+      return;
+    }
+    try {
+      if (isJsonRecord(frame) && frame.type === "zstd.propose") {
+        machine.receivePropose(frame);
+        this.sendRaw(peer, machine.createReady());
+        return;
+      }
+      if (isJsonRecord(frame) && frame.type === "zstd.ready") {
+        machine.receiveReady(frame);
+        return;
+      }
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "Unknown native zstd control record");
+    } catch (error) {
+      machine.close();
+      const message = error instanceof Error ? error.message : "Native zstd control record is invalid";
+      void this.sendNativeV2Error(peer, "PMX.PROTOCOL.COMPRESSION", message, undefined, false);
+    }
+  }
+
+  private async receiveNativeV2ZstdWrapper(peer: BrokerPeer, frame: unknown): Promise<void> {
+    const machine = peer.nativeV2Zstd;
+    if (peer.nativeV2Compression !== "zstd" || !machine) {
+      await this.sendNativeV2Error(peer, "PMX.PROTOCOL.COMPRESSION", "zstd was not selected for this session", undefined, false);
+      return;
+    }
+    try {
+      const payload = await machine.unwrap(frame);
+      const parsed = parseStrictJson(payload, { maxBytes: this.maxFrameBytes });
+      if (!parsed.ok) throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.wrapper did not contain bounded strict JSON");
+      await this.receiveNativeV2Envelope(peer, parsed.value);
+    } catch (error) {
+      machine.close();
+      const message = error instanceof Error ? error.message : "Native zstd wrapper is invalid";
+      await this.sendNativeV2Error(peer, "PMX.PROTOCOL.COMPRESSION", message, undefined, false);
+    }
+  }
+
+  /** Validate mesh/session source fencing before a native envelope is routed. */
+  private async receiveNativeV2Envelope(peer: BrokerPeer, frame: unknown): Promise<void> {
+    const envelope = validateNativeV2Envelope(frame);
+    if (!envelope) {
+      await this.sendNativeV2Error(peer, "PMX.PROTOCOL.ENVELOPE", "Frame is not a valid native v2 envelope", undefined, false);
+      return;
+    }
+    if (peer.meshId !== this.nativeV2MeshId || envelope.mesh_id !== this.nativeV2MeshId) {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.MESH_MISMATCH", "Envelope mesh_id does not match this broker session", envelope.message_id, false);
+      return;
+    }
+    if (envelope.source.agent_id !== peer.agentId || envelope.source.instance_id !== peer.instanceId || !peer.sessionId) {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.FENCE", "Envelope source does not match the authenticated native session", envelope.message_id, false);
+      return;
+    }
+    const replay = this.admitNativeV2Replay(peer, envelope);
+    if (replay === "conflict") {
+      await this.sendNativeV2Error(peer, "PMX.DELIVERY.IDEMPOTENCY_CONFLICT", "message_id was reused with different native envelope semantics", envelope.message_id, false);
+      return;
+    }
+    if (replay === "overloaded") {
+      await this.sendNativeV2Error(peer, "PMX.INTERNAL", "Native replay ledger capacity is exhausted", envelope.message_id, true);
+      return;
+    }
+    if (envelope.type === "task.submit" && Date.parse(envelope.delivery.deadline) <= this.now()) {
+      await this.sendNativeV2Error(peer, "PMX.TASK.DEADLINE_EXCEEDED", "Task deadline has already elapsed", envelope.message_id, false);
+      return;
+    }
+    await this.routeNativeV2Envelope(peer, envelope);
+  }
+
+  /** Native routing is deliberately profile-local: no invisible v2-to-v1 downgrade. */
+  private async routeNativeV2Envelope(peer: BrokerPeer, envelope: V2NativeEnvelope): Promise<void> {
+    if (envelope.target.agent_id === this.card.agent_id &&
+      (envelope.target.instance_id === undefined || envelope.target.instance_id === this.card.instance_id)) {
+      await this.handleNativeV2BrokerEnvelope(peer, envelope);
+      return;
+    }
+    if (envelope.type === "task.submit") {
+      await this.routeNativeV2TaskSubmit(peer, envelope);
+      return;
+    }
+    if (isNativeV2Lifecycle(envelope.type)) {
+      await this.routeNativeV2Lifecycle(peer, envelope);
+      return;
+    }
+    if (envelope.type === "task.cancel") {
+      await this.routeNativeV2Cancel(peer, envelope);
+      return;
+    }
+    const target = this.lookupNativeV2Target(envelope.target);
+    if (!target) {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.TARGET_UNAVAILABLE", "No native v2 target is connected", envelope.message_id, true);
+      return;
+    }
+    await this.forwardNativeV2Envelope(peer, target, envelope);
+  }
+
+  private async routeNativeV2TaskSubmit(peer: BrokerPeer, envelope: V2NativeEnvelope): Promise<void> {
+    const taskId = nativeV2TaskId(envelope);
+    if (!taskId || !peer.sessionId) {
+      await this.sendNativeV2Error(peer, "PMX.PROTOCOL.ENVELOPE", "task.submit is missing a valid task_id", envelope.message_id, false);
+      return;
+    }
+    const existing = this.nativeV2Tasks.get(taskId);
+    if (existing) {
+      if (!nativeEndpointMatchesPeer(existing.source, peer)) {
+        await this.sendNativeV2Error(peer, "PMX.ROUTING.FENCE", "Task retry was received from a different native session", envelope.message_id, false);
+        return;
+      }
+      const target = this.lookupNativeV2ExactTarget(existing.target.agentId, existing.target.instanceId);
+      if (!target || !nativeEndpointMatchesPeer(existing.target, target)) {
+        await this.sendNativeV2Error(peer, "PMX.ROUTING.FENCE", "Task target session has been replaced", envelope.message_id, true);
+        return;
+      }
+      await this.forwardNativeV2Envelope(peer, target, envelope);
+      return;
+    }
+    const deadlineAt = Date.parse(envelope.delivery.deadline);
+    if (!Number.isFinite(deadlineAt) || deadlineAt <= this.now()) {
+      await this.sendNativeV2Error(peer, "PMX.TASK.DEADLINE_EXCEEDED", "Task deadline has elapsed", envelope.message_id, false);
+      return;
+    }
+    const target = this.lookupNativeV2Target(envelope.target);
+    if (!target || !target.sessionId) {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.TARGET_UNAVAILABLE", "No native v2 executor is connected", envelope.message_id, true);
+      return;
+    }
+    const route: NativeV2TaskRoute = {
+      taskId,
+      submitMessageId: envelope.message_id,
+      source: { agentId: peer.agentId!, instanceId: peer.instanceId!, sessionId: peer.sessionId },
+      target: { agentId: target.agentId!, instanceId: target.instanceId!, sessionId: target.sessionId },
+      deadlineAt,
+      expiresAt: Math.max(deadlineAt, this.now()) + this.replayRetentionMs,
+    };
+    this.nativeV2Tasks.set(taskId, route);
+    this.nativeV2RoutesBySubmitMessageId.set(envelope.message_id, taskId);
+    if (!await this.forwardNativeV2Envelope(peer, target, envelope)) this.removeNativeV2Task(route);
+  }
+
+  private async routeNativeV2Lifecycle(peer: BrokerPeer, envelope: V2NativeEnvelope): Promise<void> {
+    const taskId = nativeV2TaskId(envelope);
+    const route = taskId === undefined ? undefined : this.nativeV2Tasks.get(taskId);
+    if (!route || !nativeEndpointMatchesPeer(route.target, peer) || !nativeTargetMatchesEndpoint(envelope.target, route.source)) {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.FENCE", "Lifecycle record does not match its native task route", envelope.message_id, false);
+      return;
+    }
+    if ((envelope.type === "task.accepted" || envelope.type === "task.rejected") && envelope.in_reply_to !== route.submitMessageId) {
+      await this.sendNativeV2Error(peer, "PMX.TASK.EVENT_CONFLICT", "Task admission is not correlated to the submitted native message", envelope.message_id, false);
+      return;
+    }
+    const owner = this.lookupNativeV2ExactTarget(route.source.agentId, route.source.instanceId);
+    if (!owner || !nativeEndpointMatchesPeer(route.source, owner)) {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.FENCE", "Task owner session has been replaced", envelope.message_id, true);
+      return;
+    }
+    const forwarded = await this.forwardNativeV2Envelope(peer, owner, envelope);
+    if (forwarded && (envelope.type === "task.rejected" || envelope.type === "task.completed")) this.removeNativeV2Task(route);
+  }
+
+  private async routeNativeV2Cancel(peer: BrokerPeer, envelope: V2NativeEnvelope): Promise<void> {
+    const taskId = nativeV2TaskId(envelope);
+    const route = taskId === undefined ? undefined : this.nativeV2Tasks.get(taskId);
+    if (!route || !nativeEndpointMatchesPeer(route.source, peer) || !nativeTargetMatchesEndpoint(envelope.target, route.target)) {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.FENCE", "Cancellation does not match its native task route", envelope.message_id, false);
+      return;
+    }
+    const executor = this.lookupNativeV2ExactTarget(route.target.agentId, route.target.instanceId);
+    if (!executor || !nativeEndpointMatchesPeer(route.target, executor)) {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.FENCE", "Task executor session has been replaced", envelope.message_id, true);
+      return;
+    }
+    await this.forwardNativeV2Envelope(peer, executor, envelope);
+  }
+
+  private async handleNativeV2BrokerEnvelope(peer: BrokerPeer, envelope: V2NativeEnvelope): Promise<void> {
+    if (envelope.type === "ping") {
+      await this.sendNativeV2Envelope(peer, this.createNativeV2Envelope(peer, "pong", envelope.params, envelope.message_id, envelope.delivery.deadline));
+      return;
+    }
+    if (envelope.type !== "task.submit") {
+      await this.sendNativeV2Error(peer, "PMX.ROUTING.TARGET_UNAVAILABLE", "The broker only accepts native ping and task.submit records", envelope.message_id, false);
+      return;
+    }
+    const params = envelope.params as JsonRecord;
+    const taskId = nativeV2TaskId(envelope);
+    const capability = typeof params.capability === "string" ? params.capability : undefined;
+    if (!taskId || !capability) {
+      await this.sendNativeV2Error(peer, "PMX.PROTOCOL.ENVELOPE", "Native task submission is malformed", envelope.message_id, false);
+      return;
+    }
+    const result = capability === "org.polymesh.agent.ping"
+      ? {} as JsonValue
+      : capability === "org.polymesh.agent.info"
+        ? this.card as unknown as JsonValue
+        : capability === "org.polymesh.capabilities.list"
+          ? this.card.capabilities.map(({ id, version }) => ({ id, version })) as unknown as JsonValue
+          : undefined;
+    if (result === undefined) {
+      await this.sendNativeV2Envelope(peer, this.createNativeV2Envelope(peer, "task.rejected", {
+        task_id: taskId,
+        event_seq: 1,
+        code: "PMX.TASK.REJECTED",
+        message: `Broker does not implement ${capability}`,
+      }, envelope.message_id, envelope.delivery.deadline));
+      return;
+    }
+    const contract = nativeV2ContractFields(params);
+    await this.sendNativeV2Envelope(peer, this.createNativeV2Envelope(peer, "task.accepted", {
+      task_id: taskId,
+      event_seq: 1,
+      accepted_at: new Date(this.now()).toISOString(),
+      ...contract,
+    }, envelope.message_id, envelope.delivery.deadline));
+    await this.sendNativeV2Envelope(peer, this.createNativeV2Envelope(peer, "task.completed", {
+      task_id: taskId,
+      event_seq: 2,
+      ...contract,
+      terminal: { outcome: "succeeded", result, completed_at: new Date(this.now()).toISOString() },
+    }, undefined, envelope.delivery.deadline));
+  }
+
+  private createNativeV2Envelope(
+    target: BrokerPeer,
+    type: V2NativeEnvelopeType,
+    params: JsonObject,
+    inReplyTo?: string,
+    deadline = new Date(this.now() + 60_000).toISOString(),
+  ): V2NativeEnvelope {
+    if (!target.agentId || !target.instanceId) throw new Error("Cannot address a native v2 peer before init");
+    const messageId = uuidv7(this.now());
+    return {
+      protocol: V2_PROFILE,
+      profile: V2_PROFILE,
+      mesh_id: this.nativeV2MeshId,
+      type,
+      message_id: messageId,
+      timestamp: new Date(this.now()).toISOString(),
+      source: { agent_id: this.card.agent_id, instance_id: this.card.instance_id },
+      target: { agent_id: target.agentId, instance_id: target.instanceId },
+      delivery: {
+        delivery_id: uuidv7(this.now()),
+        mode: "at_least_once",
+        idempotency_key: `${type}:${messageId}`,
+        deadline,
+      },
+      ...(inReplyTo === undefined ? {} : { in_reply_to: inReplyTo }),
+      params,
+    } as V2NativeEnvelope;
+  }
+
+  private async sendNativeV2Error(
+    peer: BrokerPeer,
+    code: V2ErrorCode,
+    message: string,
+    inReplyTo?: string,
+    retryable = false,
+  ): Promise<void> {
+    if (peer.phase !== "active" || peer.profile !== "native-v2") return;
+    const envelope = this.createNativeV2Envelope(peer, "error", {
+      code,
+      message: message.slice(0, 1_024),
+      retryable,
+    }, inReplyTo);
+    await this.sendNativeV2Envelope(peer, envelope);
+  }
+
+  private failNativeV2Handshake(peer: BrokerPeer, code: V2ErrorCode, message: string): void {
+    if (peer.phase === "closed") return;
+    const error: V2ErrorFrame = {
+      type: "v2.error",
+      protocol: V2_PROFILE,
+      profile: V2_PROFILE,
+      // Even a rejected init identifies the broker mesh that made the
+      // decision. A client-provided pre-init mesh hint is never echoed.
+      mesh_id: this.nativeV2MeshId,
+      ...(peer.sessionId === undefined ? {} : { session_id: peer.sessionId }),
+      code,
+      message: message.slice(0, 1_024),
+      retryable: false,
+    };
+    this.sendRaw(peer, error);
+    // In-memory and browser-shaped transports enqueue `send`; closing in the
+    // same turn can otherwise cancel the bounded v2.error before the client
+    // sees it. The record is sent first, then the session is fail-closed.
+    queueMicrotask(() => this.closePeer(peer, `${code}: ${message}`));
+  }
+
+  private nativeV2PeerKey(agentId: string, instanceId: string): string {
+    return `${this.nativeV2MeshId}\0${agentId}\0${instanceId}`;
+  }
+
+  private nativeV2InboxTarget(agentId: string, instanceId: string): string {
+    return this.nativeV2PeerKey(agentId, instanceId);
+  }
+
+  /** A replacement can never inherit the replaced peer's native task routes. */
+  private registerNativeV2Peer(peer: BrokerPeer): void {
+    if (!peer.agentId || !peer.instanceId || !peer.sessionId) throw new Error("Native v2 init has no session identity");
+    const key = this.nativeV2PeerKey(peer.agentId, peer.instanceId);
+    const prior = this.nativeV2Peers.get(key);
+    this.nativeV2Peers.set(key, peer);
+    if (prior && prior !== peer && prior.phase !== "closed") this.closePeer(prior, "native v2 session replaced");
+  }
+
+  private removeNativeV2Peer(peer: BrokerPeer): void {
+    if (!peer.agentId || !peer.instanceId) return;
+    const key = this.nativeV2PeerKey(peer.agentId, peer.instanceId);
+    if (this.nativeV2Peers.get(key) === peer) this.nativeV2Peers.delete(key);
+    peer.nativeV2Zstd?.close();
+    if (!peer.sessionId) return;
+    for (const route of [...this.nativeV2Tasks.values()]) {
+      if (nativeEndpointMatchesPeer(route.source, peer) || nativeEndpointMatchesPeer(route.target, peer)) {
+        this.removeNativeV2Task(route);
+      }
+    }
+  }
+
+  private removeNativeV2Task(route: NativeV2TaskRoute): void {
+    if (this.nativeV2Tasks.get(route.taskId) !== route) return;
+    this.nativeV2Tasks.delete(route.taskId);
+    if (this.nativeV2RoutesBySubmitMessageId.get(route.submitMessageId) === route.taskId) {
+      this.nativeV2RoutesBySubmitMessageId.delete(route.submitMessageId);
+    }
+  }
+
+  private lookupNativeV2ExactTarget(agentId: string, instanceId: string): BrokerPeer | undefined {
+    const target = this.nativeV2Peers.get(this.nativeV2PeerKey(agentId, instanceId));
+    return target?.phase === "active" && target.profile === "native-v2" ? target : undefined;
+  }
+
+  /** Deterministic logical-agent selection; exact instance delivery never falls back. */
+  private lookupNativeV2Target(target: V2NativeEnvelope["target"]): BrokerPeer | undefined {
+    if (target.instance_id !== undefined) return this.lookupNativeV2ExactTarget(target.agent_id, target.instance_id);
+    const candidates = [...this.nativeV2Peers.values()]
+      .filter((peer) => peer.phase === "active" && peer.profile === "native-v2" && peer.agentId === target.agent_id)
+      .sort((left, right) => (left.instanceId ?? "").localeCompare(right.instanceId ?? ""));
+    return candidates[0];
+  }
+
+  /** Persist first when configured, then expose the same immutable envelope to a live peer. */
+  private async forwardNativeV2Envelope(
+    source: BrokerPeer,
+    target: BrokerPeer,
+    envelope: V2NativeEnvelope,
+  ): Promise<boolean> {
+    if (!target.agentId || !target.instanceId || !target.sessionId || target.phase !== "active" || target.profile !== "native-v2") {
+      await this.sendNativeV2Error(source, "PMX.ROUTING.TARGET_UNAVAILABLE", "Native target session is unavailable", envelope.message_id, true);
+      return false;
+    }
+    const store = this.nativeV2Store;
+    if (store) {
+      try {
+        await store.persistEnvelopeAndInbox({
+          id: envelope.delivery.delivery_id,
+          mesh_id: this.nativeV2MeshId,
+          profile: V2_PROFILE,
+          envelope: envelope as unknown as JsonObject,
+          target: this.nativeV2InboxTarget(target.agentId, target.instanceId),
+          created_at: this.now(),
+        });
+      } catch {
+        await this.sendNativeV2Error(source, "PMX.INTERNAL", "Native envelope could not be durably stored", envelope.message_id, true);
+        return false;
+      }
+    }
+    const sent = await this.sendNativeV2Envelope(target, envelope);
+    if (sent && store?.markDelivered) {
+      try {
+        await store.markDelivered(this.nativeV2InboxTarget(target.agentId, target.instanceId), envelope.delivery.delivery_id, this.now());
+      } catch {
+        // The delivery fact is already stored. A later SSE/replay reader can
+        // safely see it as pending instead of treating a local mark failure as
+        // a successfully acknowledged transport delivery.
+      }
+    }
+    return sent;
+  }
+
+  /** Send raw JSON until zstd reaches its bilateral ready barrier. */
+  private async sendNativeV2Envelope(peer: BrokerPeer, envelope: V2NativeEnvelope): Promise<boolean> {
+    const machine = peer.nativeV2Zstd;
+    if (peer.nativeV2Compression === "zstd" && machine?.active) {
+      try {
+        const payload = Buffer.from(JSON.stringify(envelope), "utf8");
+        const wrapper = await machine.wrap(payload);
+        return this.sendRaw(peer, wrapper);
+      } catch {
+        // A compression failure must not silently claim an encoded delivery.
+        // Raw native records remain valid during this experimental profile and
+        // preserve availability without changing the selected session scope.
+      }
+    }
+    return this.sendRaw(peer, envelope);
+  }
+
+  /** Replay pending durable native inbox entries when the exact peer reconnects. */
+  private async drainNativeV2Inbox(peer: BrokerPeer): Promise<void> {
+    const store = this.nativeV2Store;
+    if (!store?.replayInbox || !peer.agentId || !peer.instanceId || peer.phase !== "active") return;
+    const target = this.nativeV2InboxTarget(peer.agentId, peer.instanceId);
+    try {
+      const page = await store.replayInbox({ target, limit: 100, statuses: ["pending"] });
+      for (const delivery of page.deliveries) {
+        const envelope = validateNativeV2Envelope(delivery.envelope);
+        if (!envelope || envelope.mesh_id !== this.nativeV2MeshId ||
+          envelope.target.agent_id !== peer.agentId || envelope.target.instance_id !== peer.instanceId) continue;
+        if (await this.sendNativeV2Envelope(peer, envelope) && store.markDelivered) {
+          await store.markDelivered(target, delivery.envelope_id, this.now());
+        }
+      }
+    } catch {
+      // Inbox recovery is best effort. The transaction remains durable and
+      // will be retried by the next connection or an SSE mailbox reader.
+    }
+  }
+
+  private admitNativeV2Replay(peer: BrokerPeer, envelope: V2NativeEnvelope): "new" | "duplicate" | "conflict" | "overloaded" {
+    this.pruneNativeV2State();
+    let semanticDigest: string;
+    try {
+      const { message_id: _messageId, timestamp: _timestamp, ...semantic } = envelope;
+      void _messageId;
+      void _timestamp;
+      semanticDigest = canonicalize(semantic as unknown as JsonObject);
+    } catch {
+      return "conflict";
+    }
+    const key = `${this.nativeV2MeshId}\0${peer.agentId ?? ""}\0${peer.instanceId ?? ""}\0${envelope.message_id}`;
+    const prior = this.nativeV2ReplayLedger.get(key);
+    if (prior) return prior.semanticDigest === semanticDigest ? "duplicate" : "conflict";
+    if (this.nativeV2ReplayLedger.size >= this.maxReplayLedgerEntries) return "overloaded";
+    const deadlineAt = Date.parse(envelope.delivery.deadline);
+    this.nativeV2ReplayLedger.set(key, {
+      semanticDigest,
+      expiresAt: Math.max(this.now(), Number.isFinite(deadlineAt) ? deadlineAt : this.now()) + this.replayRetentionMs,
+    });
+    return "new";
+  }
+
+  private pruneNativeV2State(now = this.now()): void {
+    for (const route of [...this.nativeV2Tasks.values()]) {
+      if (route.expiresAt <= now || route.deadlineAt <= now) this.removeNativeV2Task(route);
+    }
+    for (const [key, record] of this.nativeV2ReplayLedger) {
+      if (record.expiresAt <= now) this.nativeV2ReplayLedger.delete(key);
+    }
   }
 
   /** Strict v0.2 hello branch: no v1 hello can enter this session. */
@@ -3463,7 +4275,9 @@ export class Broker {
     peer.phase = "closed";
     this.clearHandshakeTimer(peer);
     this.peers.delete(peer);
-    if (this.multiInstanceRouting) {
+    if (peer.profile === "native-v2") {
+      this.removeNativeV2Peer(peer);
+    } else if (this.multiInstanceRouting) {
       this.removeRoutingInstance(peer);
     } else if (peer.agentId) {
       this.registry.remove(peer.agentId, { sessionId: peer.sessionId, transport: peer });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { advertiseMdns, discoverMdns, type BonjourLike } from "@polymesh/client";
+import { advertiseMdns, discoverMdns, type BonjourLike } from "@latticeag/polymesh-client";
 
 function fakeBonjour() {
   let onUp: ((service: Record<string, unknown>) => void) | undefined;

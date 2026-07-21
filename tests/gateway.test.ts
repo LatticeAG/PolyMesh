@@ -104,6 +104,35 @@ function firstSseEvent(gateway: PolyMeshGateway, path: string): Promise<{ status
 }
 
 describe("PolyMesh v2 REST/SSE gateway", () => {
+  it("serves the native loopback /v2 paths with explicit profile and cursor negotiation", async () => {
+    const { gateway, broker } = await gatewayWithBroker();
+    const submitted = await request(gateway, "POST", "/v2/tasks", {
+      ...taskBody(),
+      profile: "polymesh.0.2",
+    }, { "idempotency-key": "gateway-native-1" });
+
+    expect(submitted.status).toBe(202);
+    expect(submitted.headers["x-polymesh-profile"]).toBe("polymesh.0.2");
+    expect(submitted.headers["x-polymesh-gateway-scope"]).toBe("loopback-only");
+    const response = JSON.parse(submitted.body) as { task_id: string; profile: string; events_url: string };
+    expect(response.profile).toBe("polymesh.0.2");
+    expect(response.events_url).toContain("/v2/events?");
+    expect(response.events_url).toContain("profile=polymesh.0.2");
+
+    broker.appendEvent(principalId, {
+      event_id: "evt_01234567890123456780",
+      task_id: response.task_id,
+      event_seq: 1,
+      type: "task.accepted",
+      occurred_at: "2026-07-20T12:00:04.000Z",
+      data: { state: "accepted" },
+    });
+    const stream = await firstSseEvent(gateway, `/v2/events?task_id=${response.task_id}&profile=polymesh.0.2`);
+    expect(stream.status).toBe(200);
+    expect(stream.headers["x-polymesh-profile"]).toBe("polymesh.0.2");
+    expect(stream.body).toContain("event: task.accepted");
+  });
+
   it("authenticates a caller, creates a sanitized v2 envelope, and replays idempotency", async () => {
     const { gateway, broker } = await gatewayWithBroker();
     const headers = { "idempotency-key": "gateway-submit-1" };

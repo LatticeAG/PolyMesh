@@ -3,31 +3,36 @@
 # Governance — only exists in authorized local clones
 AGENTS.md
 
-# Specifications — proprietary protocol design, not for public distribution
-SPEC*.md
-spec*.md
-V2-ROADMAP*.md
-V2-SPEC*.md
-PYTHON-SDK*.md
-python-sdk*.md
-v2-roadmap*.md
-v2-spec*.md
-
-# Codex design reviews — contains security analysis and internal critiques
-CODEIX-REVIEW*.md
-codeix-review*.md
-review-*.md
-REVIEW-*.md
-
-# Build artifacts and temporary files
-build-prompt*.md
-BUILD-PROMPT*.md
+# Specifications, roadmaps, build prompts — proprietary/internal, not for public distribution
+*SPEC*.md
+*spec*.md
+*ROADMAP*.md
+*roadmap*.md
+*WHAT-NEXT*.md
+*what-next*.md
+*prompt*.md
+*TEST-REPORT*.md
+*ARCHITECTURE*.md
+*REVIEW*.md
+*review*.md
 *.log
 *.tmp
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
 
 # Node
 node_modules/
 dist/
+
+# TypeScript package builds belong in each package's dist/ directory. These
+# patterns catch accidental source-tree emissions from an incorrectly scoped
+# compiler invocation.
+/packages/*/src/*.js
+/packages/*/src/*.d.ts
+/packages/*/src/*.js.map
+/packages/*/src/*.d.ts.map
 
 # Environment
 .env

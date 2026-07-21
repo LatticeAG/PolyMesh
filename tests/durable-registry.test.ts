@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   DurableIdentityCollisionError,
   DurableRegistry,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 import {
   InMemoryDurableStore,
   SqliteDurableStore,

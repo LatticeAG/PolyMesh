@@ -1,0 +1,20 @@
+# The Compose image receives only the sources and metadata needed to make its
+# npm release artifacts plus its small runner. This prevents local
+# specifications, test fixtures, credentials, or unrelated working-tree
+# artifacts from being sent to Docker at all.
+*
+!Dockerfile
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.build.json
+!packages/
+!packages/**
+!templategen/
+templategen/*
+!templategen/docker/
+!templategen/docker/**
+!templategen/packages/
+templategen/packages/*
+!templategen/packages/create-polymesh-app/
+!templategen/packages/create-polymesh-app/package.json

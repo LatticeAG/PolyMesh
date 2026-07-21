@@ -1,0 +1,183 @@
+{
+  "profile": "polymesh.0.1",
+  "vectors": [
+    {
+      "name": "alice-v1",
+      "card": {
+        "card_version": "1.0",
+        "agent_id": "org.example.compat.alice",
+        "instance_id": "AAECAwQFBgcICQoLDA0ODw",
+        "display_name": "Compatibility Alice",
+        "issued_at": "2030-01-02T03:00:00.000Z",
+        "expires_at": "2030-01-03T03:00:00.000Z",
+        "revision": 1,
+        "endpoints": [
+          {
+            "transport": "websocket",
+            "url": "ws://127.0.0.1:7337",
+            "scope": "loopback",
+            "security": "token"
+          }
+        ],
+        "capabilities": [
+          {
+            "id": "org.polymesh.agent.ping",
+            "version": "1.0.0",
+            "idempotency": "pure",
+            "side_effects": "none"
+          },
+          {
+            "id": "org.polymesh.agent.info",
+            "version": "1.0.0",
+            "idempotency": "pure",
+            "side_effects": "none"
+          },
+          {
+            "id": "org.polymesh.capabilities.list",
+            "version": "1.0.0",
+            "idempotency": "pure",
+            "side_effects": "none"
+          },
+          {
+            "id": "org.example.echo",
+            "version": "1.0.0",
+            "description": "Echo a bounded text value.",
+            "input_schema": {
+              "type": "object",
+              "required": ["message"],
+              "properties": {
+                "message": {
+                  "type": "string",
+                  "maxLength": 64
+                }
+              },
+              "additionalProperties": false
+            },
+            "result_schema": {
+              "type": "object",
+              "required": ["message"],
+              "properties": {
+                "message": {
+                  "type": "string",
+                  "maxLength": 64
+                }
+              },
+              "additionalProperties": false
+            },
+            "idempotency": "idempotent",
+            "side_effects": "none",
+            "cancellation": "supported",
+            "timeout_ceiling_seconds": 30
+          }
+        ],
+        "metadata": {
+          "description": "Shared v0.1 compatibility vector.",
+          "tags": ["compat", "v0.1"]
+        }
+      },
+      "expected": {
+        "digest": "b634ece8756ac890532afebd1c09f51ebf1b503082d40977ec89285e21b2b66e",
+        "canonical_json": "{\"agent_id\":\"org.example.compat.alice\",\"capabilities\":[{\"id\":\"org.polymesh.agent.ping\",\"idempotency\":\"pure\",\"side_effects\":\"none\",\"version\":\"1.0.0\"},{\"id\":\"org.polymesh.agent.info\",\"idempotency\":\"pure\",\"side_effects\":\"none\",\"version\":\"1.0.0\"},{\"id\":\"org.polymesh.capabilities.list\",\"idempotency\":\"pure\",\"side_effects\":\"none\",\"version\":\"1.0.0\"},{\"cancellation\":\"supported\",\"description\":\"Echo a bounded text value.\",\"id\":\"org.example.echo\",\"idempotency\":\"idempotent\",\"input_schema\":{\"additionalProperties\":false,\"properties\":{\"message\":{\"maxLength\":64,\"type\":\"string\"}},\"required\":[\"message\"],\"type\":\"object\"},\"result_schema\":{\"additionalProperties\":false,\"properties\":{\"message\":{\"maxLength\":64,\"type\":\"string\"}},\"required\":[\"message\"],\"type\":\"object\"},\"side_effects\":\"none\",\"timeout_ceiling_seconds\":30,\"version\":\"1.0.0\"}],\"card_version\":\"1.0\",\"display_name\":\"Compatibility Alice\",\"endpoints\":[{\"scope\":\"loopback\",\"security\":\"token\",\"transport\":\"websocket\",\"url\":\"ws://127.0.0.1:7337\"}],\"expires_at\":\"2030-01-03T03:00:00.000Z\",\"instance_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"issued_at\":\"2030-01-02T03:00:00.000Z\",\"metadata\":{\"description\":\"Shared v0.1 compatibility vector.\",\"tags\":[\"compat\",\"v0.1\"]},\"revision\":1}"
+      }
+    },
+    {
+      "name": "broker-v1",
+      "card": {
+        "card_version": "1.0",
+        "agent_id": "org.example.compat.broker",
+        "instance_id": "EBESExQVFhcYGRobHB0eHw",
+        "display_name": "Compatibility Broker",
+        "issued_at": "2030-01-02T03:00:00.000Z",
+        "expires_at": "2030-01-03T03:00:00.000Z",
+        "revision": 1,
+        "endpoints": [
+          {
+            "transport": "websocket",
+            "url": "ws://127.0.0.1:7337",
+            "scope": "loopback",
+            "security": "token"
+          }
+        ],
+        "capabilities": [
+          {
+            "id": "org.polymesh.agent.ping",
+            "version": "1.0.0",
+            "idempotency": "pure",
+            "side_effects": "none"
+          },
+          {
+            "id": "org.polymesh.agent.info",
+            "version": "1.0.0",
+            "idempotency": "pure",
+            "side_effects": "none"
+          },
+          {
+            "id": "org.polymesh.capabilities.list",
+            "version": "1.0.0",
+            "idempotency": "pure",
+            "side_effects": "none"
+          },
+          {
+            "id": "org.example.echo",
+            "version": "1.0.0",
+            "description": "Echo a bounded text value.",
+            "input_schema": {
+              "type": "object",
+              "required": ["message"],
+              "properties": {
+                "message": {
+                  "type": "string",
+                  "maxLength": 64
+                }
+              },
+              "additionalProperties": false
+            },
+            "result_schema": {
+              "type": "object",
+              "required": ["message"],
+              "properties": {
+                "message": {
+                  "type": "string",
+                  "maxLength": 64
+                }
+              },
+              "additionalProperties": false
+            },
+            "idempotency": "idempotent",
+            "side_effects": "none",
+            "cancellation": "supported",
+            "timeout_ceiling_seconds": 30
+          }
+        ],
+        "metadata": {
+          "description": "Shared v0.1 compatibility vector.",
+          "tags": ["compat", "v0.1"]
+        }
+      },
+      "expected": {
+        "digest": "db917059be15ee8389ee223702817eb04d114824fbe2e76b0cdb486e18f8a41a",
+        "canonical_json": "{\"agent_id\":\"org.example.compat.broker\",\"capabilities\":[{\"id\":\"org.polymesh.agent.ping\",\"idempotency\":\"pure\",\"side_effects\":\"none\",\"version\":\"1.0.0\"},{\"id\":\"org.polymesh.agent.info\",\"idempotency\":\"pure\",\"side_effects\":\"none\",\"version\":\"1.0.0\"},{\"id\":\"org.polymesh.capabilities.list\",\"idempotency\":\"pure\",\"side_effects\":\"none\",\"version\":\"1.0.0\"},{\"cancellation\":\"supported\",\"description\":\"Echo a bounded text value.\",\"id\":\"org.example.echo\",\"idempotency\":\"idempotent\",\"input_schema\":{\"additionalProperties\":false,\"properties\":{\"message\":{\"maxLength\":64,\"type\":\"string\"}},\"required\":[\"message\"],\"type\":\"object\"},\"result_schema\":{\"additionalProperties\":false,\"properties\":{\"message\":{\"maxLength\":64,\"type\":\"string\"}},\"required\":[\"message\"],\"type\":\"object\"},\"side_effects\":\"none\",\"timeout_ceiling_seconds\":30,\"version\":\"1.0.0\"}],\"card_version\":\"1.0\",\"display_name\":\"Compatibility Broker\",\"endpoints\":[{\"scope\":\"loopback\",\"security\":\"token\",\"transport\":\"websocket\",\"url\":\"ws://127.0.0.1:7337\"}],\"expires_at\":\"2030-01-03T03:00:00.000Z\",\"instance_id\":\"EBESExQVFhcYGRobHB0eHw\",\"issued_at\":\"2030-01-02T03:00:00.000Z\",\"metadata\":{\"description\":\"Shared v0.1 compatibility vector.\",\"tags\":[\"compat\",\"v0.1\"]},\"revision\":1}"
+      }
+    }
+  ],
+  "negative": [
+    {
+      "name": "missing-required-capability",
+      "card": {
+        "card_version": "1.0",
+        "agent_id": "org.example.compat.invalid",
+        "instance_id": "AAECAwQFBgcICQoLDA0ODw",
+        "issued_at": "2030-01-02T03:00:00.000Z",
+        "expires_at": "2030-01-03T03:00:00.000Z",
+        "revision": 1,
+        "capabilities": [
+          {
+            "id": "org.example.echo",
+            "version": "1.0.0"
+          }
+        ]
+      },
+      "accepted": false
+    }
+  ]
+}

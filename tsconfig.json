@@ -12,12 +12,12 @@
     "types": ["node", "vitest/globals"],
     "baseUrl": ".",
     "paths": {
-      "@polymesh/broker": ["packages/broker/src/index.ts"],
-      "@polymesh/broker/*": ["packages/broker/src/*"],
-      "@polymesh/client": ["packages/client/src/index.ts"],
-      "@polymesh/client/*": ["packages/client/src/*"],
-      "@polymesh/gateway": ["packages/gateway/src/index.ts"],
-      "@polymesh/gateway/*": ["packages/gateway/src/*"]
+      "@latticeag/polymesh-broker": ["packages/broker/src/index.ts"],
+      "@latticeag/polymesh-broker/*": ["packages/broker/src/*"],
+      "@latticeag/polymesh-client": ["packages/client/src/index.ts"],
+      "@latticeag/polymesh-client/*": ["packages/client/src/*"],
+      "@latticeag/polymesh-gateway": ["packages/gateway/src/index.ts"],
+      "@latticeag/polymesh-gateway/*": ["packages/gateway/src/*"]
     }
   },
   "include": ["packages/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]

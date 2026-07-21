@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { Broker, createAgentCard, createWirePair, generateRuntimeToken } from "@polymesh/broker";
+import { Broker, createAgentCard, createWirePair, generateRuntimeToken } from "@latticeag/polymesh-broker";
 import {
   AuditChain,
   HmacAuditSigner,
@@ -12,7 +12,7 @@ import {
   type ParameterizedSqlResult,
   type PolicyAuthorizationRequest,
   type PolicySubject,
-} from "@polymesh/client";
+} from "@latticeag/polymesh-client";
 
 const caller = {
   principalId: "key:caller",

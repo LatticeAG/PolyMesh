@@ -1,264 +1,126 @@
-<div align="center">
-
 # PolyMesh
 
-**The phone network for AI agents.** An open-sourced protocol — not a product — for agents to discover each other, exchange capabilities, and delegate tasks.
+PolyMesh is an experimental, local-first protocol implementation for agents to declare capabilities and exchange bounded tasks. Version 0.4.0 adds an explicitly selected, experimental `polymesh.0.2` native SDK profile while preserving the v0.1 wire path.
 
+[![CI](https://github.com/LatticeAG/PolyMesh/actions/workflows/ci-full.yml/badge.svg)](https://github.com/LatticeAG/PolyMesh/actions/workflows/ci-full.yml)
+[![Release](https://github.com/LatticeAG/PolyMesh/actions/workflows/release.yml/badge.svg)](https://github.com/LatticeAG/PolyMesh/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Language: TypeScript](https://img.shields.io/badge/language-TypeScript-3178C6.svg)](https://www.typescriptlang.org/)
-[![GitHub stars](https://img.shields.io/github/stars/LatticeAG/PolyMesh?style=social)](https://github.com/LatticeAG/PolyMesh/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/LatticeAG/PolyMesh)](https://github.com/LatticeAG/PolyMesh/issues)
-[![CI](https://github.com/LatticeAG/PolyMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/LatticeAG/PolyMesh/actions/workflows/ci.yml)
 
-<img align="center" alt="PolyMesh" src="https://img.shields.io/badge/status-experimental-orange">
+> Experimental software: review [SECURITY.md](SECURITY.md) before exposing a listener or allowing any side-effecting capability. PolyMesh does not provide a hosted relay in this repository.
 
-**The phone network for AI agents.** An open-sourced protocol — not a product.
+## Quick start
 
-[What is PolyMesh](#what-is-polymesh) · [Quick Start](#quick-start) · [Why PolyMesh](#why-polymesh) · [Architecture](#architecture) · [Features](#features) · [Examples](#examples) · [Security](SECURITY.md) · [Status](#status) · [License](#license)
-
-</div>
-
----
-
-## What is PolyMesh?
-
-PolyMesh is an **open protocol** to discover each other, exchange capability declarations, delegate tasks, and coordinate locally.
-
-> **Security:** Read [SECURITY.md](SECURITY.md) before exposing a listener or giving an agent access to data or side-effecting capabilities. The reference implementation is experimental; network deployment requires an explicitly configured secure profile.
-
-Think of it as the **phone network for AI agents**: any agent can pick up the protocol, announce what it can do, and call on another agent without needing cloud infrastructure, a global registry, or a blockchain.
-
-It is designed to be:
-
-- **Local-first** — works on the same machine via Unix sockets, and across a LAN via WebSocket + mDNS.
-- **Framework-agnostic** — Hermes Agent, Codex, Claude Code, or your custom agent can all implement it.
-- **Self-describing** — every agent publishes an **Agent Card** declaring its identity, capabilities, and endpoints.
-- **Internet-optional** — no cloud, no DNS, no chain. Internet bridging is a future opt-in layer.
-
-PolyMesh is part of the [LatticeAG](https://latticeag.com) ecosystem, alongside PolyBrain, PolyGnosis, PolyScribe, and PolyForge.
-
----
-
-## Quick Start
-
-### Install
+After the release artifacts have been published to npm, create the maintained example project from the published generator:
 
 ```bash
-# Clone the reference implementation
-git clone https://github.com/mosesman831/polymesh.git
-cd polymesh
-
-# Install dependencies and build
+npx @latticeag/create-polymesh-app my-agents
+cd my-agents
 npm install
-npm run build
+npm run demo
 ```
 
-### Start a local development broker
+The generated demo starts a local broker and client, exchanges a safe ping/pong, and exits cleanly. It uses only a numeric loopback endpoint and an ephemeral runtime token; do not reuse this development posture for LAN or Internet deployment.
+
+For a process-boundary demonstration, run the checked-in Compose fixture:
 
 ```bash
-# Create an owner-only 32-byte runtime token for this local session.
-umask 077
-node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))" \
-  > "${XDG_RUNTIME_DIR:?}/polymesh-token"
-
-# Plain ws:// is deliberately limited to an explicitly named loopback-dev profile.
-npx @polymesh/client start --token-file "${XDG_RUNTIME_DIR}/polymesh-token" --insecure-loopback-dev
+docker compose up --build
 ```
 
-The local development broker listens on `ws://127.0.0.1:7337` by default and maintains a local registry of connected agents. For LAN or production deployment, use the enrolled WSS profile described in [SECURITY.md](SECURITY.md).
+It prints the broker, Alice, and Bob lifecycle and exits when Alice receives Bob's echo result. The demo is intentionally local-only and is not a production container deployment guide.
 
-### Connect from a client
-
-```bash
-npx @polymesh/client connect ws://127.0.0.1:7337 \
-  --token-file "${XDG_RUNTIME_DIR}/polymesh-token" \
-  --insecure-loopback-dev
-```
-
-### Call another agent
-
-```bash
-npx @polymesh/client \
-  call calendar-agent org.polymesh.calendar.read '{"date": "2026-07-18"}' \
-  --url ws://127.0.0.1:7337 \
-  --token-file "${XDG_RUNTIME_DIR}/polymesh-token" \
-  --insecure-loopback-dev
-```
-
-That’s it. The broker routes the message, the target agent accepts or rejects the task, and you receive progress and completion events.
-
----
-
-## Why PolyMesh?
-
-| Problem | How PolyMesh solves it |
-|---------|------------------------|
-| Agents live in silos (Claude Code, Codex, Hermes, custom) | Common wire format + capability vocabulary |
-| Discovery requires manual configuration | mDNS + local registry: zero-config on LAN |
-| Cloud APIs add latency, cost, and lock-in | Local Unix sockets and loopback WebSockets |
-| Agents can't describe what they can do | Agent Cards publish typed capabilities with JSON Schema |
-| Task hand-off is ad-hoc | Deterministic lifecycle: submit → accept/reject → progress → complete/cancel |
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              PolyMesh Network                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   ┌──────────────┐      WebSocket / Unix socket      ┌──────────────┐       │
-│   │   Agent A    │ ◄──────────────────────────────► │   Broker     │       │
-│   │  (Hermes)    │                                 │   Registry   │       │
-│   └──────────────┘                                 └──────┬───────┘       │
-│          │                                                │               │
-│          │           ┌──────────────┐                     │               │
-│          │           │   Agent B    │ ◄───────────────────┘               │
-│          └────────►  │   (Codex)    │         mDNS / LAN                   │
-│                      └──────────────┘                                      │
-│                                                                              │
-│   Each agent publishes an Agent Card:                                        │
-│   { agent_id, capabilities[{method, input_schema, output_schema}], endpoints }│
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Reference implementation
+## Packages
 
 | Package | Purpose |
-|---------|---------|
-| `@polymesh/broker` | WebSocket broker + local agent registry |
-| `@polymesh/client` | Client SDK, CLI, and mDNS LAN discovery |
+| --- | --- |
+| `@latticeag/polymesh-broker` | TypeScript WebSocket broker and local registry |
+| `@latticeag/polymesh-client` | TypeScript client SDK, CLI, and constrained mDNS discovery |
+| `@latticeag/polymesh-gateway` | Node REST/SSE gateway reference adapter |
+| `@latticeag/create-polymesh-app` | Starter generator for the local ping/pong example |
+| `latticeag-polymesh` | Python distribution; import it as `polymesh` |
 
-- **Language:** TypeScript
-- **Tests:** 143 Vitest tests (across 26 files)
-- **Wire format:** JSON, JSON-RPC inspired
-- **Max message size:** 1 MiB
+The TypeScript CLI is provided by `@latticeag/polymesh-client`:
 
----
-
-## Features
-
-- **Agent Discovery**
-  - Local registry via Unix socket
-  - LAN discovery via mDNS
-  - Optional HTTP hint records
-- **Agent Cards**
-  - Capability declarations with JSON Schema typed inputs/outputs
-  - Automatic exchange on connection
-  - Digest-verified card snapshots
-- **Task Lifecycle**
-  - `task.submit`, `task.accepted`, `task.rejected`, `task.progress`, `task.completed`, `task.cancel`, `task.status`
-  - At-least-once delivery with idempotency keys
-  - Deadline-aware execution
-- **Transports**
-  - WebSocket (loopback and LAN)
-  - Unix domain sockets (same machine)
-- **Security Model**
-  - OS-authenticated local sessions
-  - Capability-level authorization
-  - Resource limits and message framing
-- **Error Taxonomy**
-  - Structured, machine-readable error codes
-  - Clear retry semantics
-
----
-
-## Why PolyMesh over A2A and alternatives
-
-| | PolyMesh | Google A2A | MCP (Anthropic) |
-|---|---|---|---|
-| **Architecture** | Peer-to-peer mesh | Client-server over HTTP | Client-server over HTTP |
-| **Transport** | WebSocket / Unix socket | HTTPS (REST + SSE) | HTTP + SSE |
-| **Internet needed?** | No — works fully offline | Yes — agents need public HTTPS | Yes (stdlib) or local (custom) |
-| **Discovery** | mDNS + local registry | Agent Card URL registry | None (manual endpoint config) |
-| **Push vs Poll** | Persistent connection, push | Webhook / polling | SSE push (server→client) |
-| **Auth** | Unix creds / loopback token / enrolled WSS | OAuth 2.0 + JWKS | None in spec |
-| **Latency** | Sub-millisecond (UDS), real-time WS | HTTP request-response (10-100ms+) | HTTP + SSE (similar) |
-| **Framework** | Framework-agnostic — any agent implements the spec | Google-centric | Anthropic-centric |
-| **Deploy** | `npm install && polymesh start` | Requires DNS, TLS, OAuth infra | Requires HTTP server |
-| **Offline** | Full local operation | Impossible | Partial (local transport exists) |
-| **License** | MIT | Apache 2.0 | MIT |
-
-### When to choose PolyMesh
-
-- **You want agents to talk on your laptop** without deploying infrastructure
-- **You need sub-millisecond latency** for tight agent coordination loops
-- **Your agents run in an air-gapped or local environment**
-- **You want framework-agnostic** — Hermes, Codex, Claude Code, or your custom agent
-- **You want real-time push** — no polling, no webhook configuration
-
-### When A2A makes more sense
-
-- **Cross-organization agent communication** over the public internet
-- **You're already in the Google Cloud ecosystem** and want native integration
-- **You need a published, multi-vendor standard** with Google's backing
-
-PolyMesh is not a competitor to A2A for the enterprise internet-scale use case. It's an alternative for the **local-first, low-latency, no-infrastructure** use case that A2A explicitly doesn't address — the same way WebSockets didn't replace HTTP, they serve different parts of the stack.
-
-
-
-For a local demo, use the token-file and explicit `--insecure-loopback-dev` commands in [Quick Start](#quick-start). Do not use a tokenless listener or put a runtime token in a URL. LAN and production demos require the enrolled WSS profile; see [SECURITY.md](SECURITY.md).
-
-### Programmatic client
-
-```typescript
-import { PolyMeshClient } from '@polymesh/client';
-import { createAgentCard } from '@polymesh/broker';
-
-const client = new PolyMeshClient({
-  card: createAgentCard({ agent_id: 'my-agent' }),
-  url: 'ws://127.0.0.1:7337',
-  // Read from an owner-only token file or keychain; never embed it in a URL.
-  token: process.env.POLYMESH_LOCAL_TOKEN,
-  allowInsecureLoopbackDevelopment: true,
-});
-
-await client.connect();
-
-const result = await client.call('executor-agent', 'echo', {
-  message: 'hello world',
-});
-
-console.log(result);
+```bash
+npx @latticeag/polymesh-client help
 ```
 
----
+Its configuration is TOML. It reads `~/.config/polymesh/config.toml` by default; use `POLYMESH_CONFIG` or `--config FILE` to select another file, then inspect effective non-secret settings with:
 
-## Status
+```bash
+npx @latticeag/polymesh-client config show
+```
 
-> **Version:** 0.2.0 · **Status:** Experimental reference implementation · **Tests:** 143 passing ✅
+## Support matrix
 
-PolyMesh is under active development. **Current version:** 0.2.0 — **Test suite:** 143 tests across 26 files.
+| Capability | Status in v0.4.0 | Notes |
+| --- | --- | --- |
+| v0.1 local task lifecycle | Supported | TypeScript broker/client and Python SDK are covered by shared compatibility vectors. |
+| `polymesh.0.2` native SDK profile | Experimental | TypeScript and Python clients select it explicitly, negotiate a profile and optional zstd framing, and retain v0.1 compatibility. |
+| v2 gateway REST/SSE adapter | Experimental, loopback-only | Node reference adapter only; `/v2/tasks` and `/v2/events` are local task submission and observation endpoints, not a remote relay. |
+| mDNS discovery | TypeScript supported, Python not yet native | TypeScript discovery is opt-in and WSS-only; it is a hint, never enrollment or auto-connect. |
+| Remote transport | Explicitly configured WSS only | Secure transport requires the exact enrolled profile. There is no deployed Worker, Durable Object, or managed relay. |
+| Docker Compose demo | Supported local fixture | A repeatable development demo, not a production deployment architecture. |
+| DeckAgent carrier | Client-side experimental component | No production DeckAgent service or relay deployment is claimed. |
 
-> **⚠️ Experimental:** This is a reference implementation for controlled experimentation. Review [SECURITY.md](SECURITY.md) before deploying with sensitive data, privileged handlers, LAN exposure, or internet access. No production security profile is claimed without a release explicitly documenting otherwise.
+### Profile support
 
-### Roadmap
+| Profile | TypeScript | Python | Security boundary |
+| --- | --- | --- | --- |
+| Numeric-loopback development WebSocket | Supported with an explicit runtime token and `--insecure-loopback-dev` | Supported for the v0.1 SDK path | Local development only; never advertise it or bridge it across a normal container, LAN, or Internet network. The Compose fixture deliberately shares the broker network namespace to retain numeric-loopback semantics. |
+| `polymesh.0.2` native profile | Experimental explicit opt-in | Experimental explicit opt-in | Negotiates profile and optional zstd framing. It is scoped to the selected broker mesh and does not imply hosted, multi-hop, or remote-relay support. |
+| Enrolled WSS | Supported where the exact carrier and enrollment requirements are configured | Not advertised as a general secure-carrier implementation | Mutual enrollment and TLS requirements fail closed. |
+| mDNS WSS discovery hints | Supported and opt-in | Optional dependency exists; no native network provider is claimed | Discovery conveys no trust and never initiates enrollment. |
+| Hosted/remote relay | Not available | Not available | Planned separately; no Worker relay deployment is included. |
 
-- [x] Core protocol specification
-- [x] TypeScript reference implementation
-- [x] Local broker + client
-- [x] mDNS LAN discovery
-- [x] Internet bridging via Cloudflare Workers (spec)
-- [x] DeckAgent tunnel carrier (implemented)
-- [ ] Additional language implementations
+## What the local flow does
 
----
+```text
+Alice client ── task.submit ──> Local broker ── task.submit ──> Bob agent
+Alice client <─ accepted/progress/completed ─ Local broker <─ lifecycle ─ Bob
+```
 
-## Links
+Each agent publishes an Agent Card with its identity and capability contracts. A task is validated against the target contract, accepted or rejected, and ends in one terminal lifecycle event. The generated quick start uses a harmless ping/pong; the Compose fixture uses a harmless echo capability. Neither needs filesystem, shell, network, or third-party credentials.
 
-- **Security guidance and disclosure:** [`SECURITY.md`](./SECURITY.md)
-- **Repository:** https://github.com/LatticeAG/PolyMesh
-| **Ecosystem:** https://latticeag.vercel.app
-- **Related protocols:**
-  - PolyBrain
-  - PolyGnosis
-  - PolyScribe
-  - PolyForge
+For the layered view and dependency graph, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Configuration precedence
+
+The TypeScript CLI merges settings in this order:
+
+```text
+defaults < TOML config file < environment variables < command-line flags
+```
+
+Supported TOML sections are `[broker]`, `[client]`, and `[discovery]`. Keep credentials in the configured token file, not in command arguments, URLs, or source code.
+
+## Verification
+
+The v0.4.0 release gate runs clean installs, TypeScript type checking/build/tests, Python tests/builds, package artifact smoke tests, and shared compatibility fixtures. It includes native-profile and zstd round-trip coverage alongside the existing v0.1 suites.
+
+From a source checkout:
+
+```bash
+npm ci
+npm run typecheck
+npm test
+npm run build
+
+uv sync --dev
+uv run pytest -q
+uv build
+```
+
+## Scope and limitations
+
+PolyMesh v0.4.0 does not claim generic end-to-end envelope signing, delegated authorization grants, continuous task-output streaming, generic pub/sub, automatic multi-hop routing, MCP/framework adapters, a hosted Worker relay, or production hosting. Gateway SSE is task-event observation, not general streaming or a topic system.
+
+The repository contains protocol design material governed by local repository policy. This README is intentionally a high-level implementation guide and does not publish or reproduce that material.
+
+## Development feedback
+
+When reporting an issue, include the package versions, selected profile, redacted command output, and a minimal reproduction. Do not include runtime tokens, private keys, certificates, raw task data, or confidential specifications.
 
 ## License
 
 PolyMesh is released under the [MIT License](LICENSE).
-
-A [LatticeAG](https://latticeag.vercel.app) protocol.

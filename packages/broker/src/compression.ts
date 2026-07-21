@@ -9,6 +9,11 @@
 
 import { validateV2ApplicationEnvelope } from "./protocol.js";
 import type { RateLimitCharge } from "./rate-limit.js";
+import {
+  compress as wasmZstdCompress,
+  decompress as wasmZstdDecompress,
+  init as initializeWasmZstd,
+} from "@bokuweb/zstd-wasm";
 
 /** The only algorithms in the v0.2 base profile. */
 export const COMPRESSION_ALGORITHMS = ["none", "zstd"] as const;
@@ -20,6 +25,172 @@ export const V2_COMPRESSION_EPOCH = "1" as const;
 export const V2_COMPRESSION_CONTENT_TYPE = "application/polymesh-envelope+json" as const;
 export const MAX_COMPRESSION_BYTES = 1_048_576;
 export const MAX_COMPRESSION_EXPANSION_RATIO = 64;
+
+/**
+ * Binary v2 carrier framing.  Each carrier frame is `[u32be length][flags]
+ * [payload]`, where `length` includes the one-byte flag.  JSON control
+ * records remain uncompressed; only a selected zstd application record sets
+ * `V2_TRANSPORT_FLAG_ZSTD`.
+ */
+export const V2_TRANSPORT_FRAME_HEADER_BYTES = 5;
+export const V2_TRANSPORT_FLAG_NONE = 0x00;
+export const V2_TRANSPORT_FLAG_ZSTD = 0x01;
+const V2_TRANSPORT_FLAG_MASK = V2_TRANSPORT_FLAG_ZSTD;
+
+export interface V2TransportFrame {
+  compressed: boolean;
+  payload: Uint8Array;
+}
+
+export interface V2TransportFrameEncodeOptions {
+  compression?: CompressionAlgorithm;
+  compressionLevel?: number;
+  maxWireBytes?: number;
+  maxUncompressedBytes?: number;
+}
+
+export interface V2TransportFrameDecodeOptions {
+  maxWireBytes?: number;
+  maxUncompressedBytes?: number;
+}
+
+/** A bounded codec error suitable for mapping to a PMX.PROTOCOL.COMPRESSION error. */
+export class CompressionTransportError extends Error {
+  readonly code:
+    | "PMX.PROTOCOL.COMPRESSION"
+    | "COMPRESSION_LIMIT_EXCEEDED"
+    | "COMPRESSION_FRAME_INVALID";
+
+  constructor(
+    code: CompressionTransportError["code"],
+    message: string,
+  ) {
+    super(message);
+    this.name = "CompressionTransportError";
+    this.code = code;
+  }
+}
+
+let wasmZstdReady: Promise<void> | undefined;
+
+/**
+ * Initialise the @bokuweb/zstd-wasm codec exactly once.  The package exports
+ * a Node implementation and a browser implementation through conditional
+ * exports, so this helper is safe for both SDK targets.
+ */
+export function initializeZstd(): Promise<void> {
+  wasmZstdReady ??= initializeWasmZstd();
+  return wasmZstdReady;
+}
+
+/** Compress one independent zstd payload; no dictionary or stream state is retained. */
+export async function compressZstd(input: Uint8Array, compressionLevel?: number): Promise<Uint8Array> {
+  if (!(input instanceof Uint8Array)) throw new TypeError("zstd input must be a Uint8Array");
+  await initializeZstd();
+  try {
+    return Uint8Array.from(wasmZstdCompress(input, compressionLevel));
+  } catch (error) {
+    throw new CompressionTransportError(
+      "PMX.PROTOCOL.COMPRESSION",
+      error instanceof Error ? `zstd compression failed: ${error.message}` : "zstd compression failed",
+    );
+  }
+}
+
+/** Decompress one independent zstd payload and enforce a post-codec output bound. */
+export async function decompressZstd(input: Uint8Array, maxOutputBytes = MAX_COMPRESSION_BYTES): Promise<Uint8Array> {
+  if (!(input instanceof Uint8Array)) throw new TypeError("zstd input must be a Uint8Array");
+  if (!isPositiveByteCount(maxOutputBytes) || maxOutputBytes > MAX_COMPRESSION_BYTES) {
+    throw new RangeError(`maxOutputBytes must be between 1 and ${MAX_COMPRESSION_BYTES}`);
+  }
+  await initializeZstd();
+  let output: Uint8Array;
+  try {
+    output = Uint8Array.from(wasmZstdDecompress(input));
+  } catch (error) {
+    throw new CompressionTransportError(
+      "PMX.PROTOCOL.COMPRESSION",
+      error instanceof Error ? `zstd decompression failed: ${error.message}` : "zstd decompression failed",
+    );
+  }
+  if (output.byteLength > maxOutputBytes) {
+    throw new CompressionTransportError("COMPRESSION_LIMIT_EXCEEDED", "zstd output exceeds the configured byte limit");
+  }
+  return output;
+}
+
+/** Concise aliases used by browser-oriented SDK adapters. */
+export const zstdCompress = compressZstd;
+export const zstdDecompress = decompressZstd;
+
+/**
+ * Encode a single length-prefixed carrier frame.  A zstd flag is emitted only
+ * when the caller explicitly selected zstd; negotiation/control records can
+ * therefore always remain plain JSON frames.
+ */
+export async function encodeV2TransportFrame(
+  payload: Uint8Array,
+  options: V2TransportFrameEncodeOptions = {},
+): Promise<Buffer> {
+  if (!(payload instanceof Uint8Array)) throw new TypeError("transport frame payload must be a Uint8Array");
+  const maxUncompressedBytes = options.maxUncompressedBytes ?? MAX_COMPRESSION_BYTES;
+  const maxWireBytes = options.maxWireBytes ?? MAX_COMPRESSION_BYTES;
+  if (!isPositiveByteCount(maxUncompressedBytes) || maxUncompressedBytes > MAX_COMPRESSION_BYTES ||
+    !isPositiveByteCount(maxWireBytes) || maxWireBytes > MAX_COMPRESSION_BYTES) {
+    throw new RangeError(`transport frame limits must be between 1 and ${MAX_COMPRESSION_BYTES}`);
+  }
+  if (payload.byteLength > maxUncompressedBytes) {
+    throw new CompressionTransportError("COMPRESSION_LIMIT_EXCEEDED", "transport payload exceeds the configured byte limit");
+  }
+  const compression = options.compression ?? "none";
+  if (!isCompressionAlgorithm(compression)) throw new TypeError("transport frame compression is invalid");
+  const encoded = compression === "zstd"
+    ? await compressZstd(payload, options.compressionLevel)
+    : Uint8Array.from(payload);
+  const length = encoded.byteLength + 1;
+  if (length + 4 > maxWireBytes || length + 4 > MAX_COMPRESSION_BYTES) {
+    throw new CompressionTransportError("COMPRESSION_LIMIT_EXCEEDED", "transport frame exceeds the configured wire-byte limit");
+  }
+  const frame = Buffer.allocUnsafe(V2_TRANSPORT_FRAME_HEADER_BYTES + encoded.byteLength);
+  frame.writeUInt32BE(length, 0);
+  frame[4] = compression === "zstd" ? V2_TRANSPORT_FLAG_ZSTD : V2_TRANSPORT_FLAG_NONE;
+  Buffer.from(encoded).copy(frame, V2_TRANSPORT_FRAME_HEADER_BYTES);
+  return frame;
+}
+
+/** Decode exactly one length-prefixed carrier frame and enforce output bounds. */
+export async function decodeV2TransportFrame(
+  frame: Uint8Array,
+  options: V2TransportFrameDecodeOptions = {},
+): Promise<V2TransportFrame> {
+  const maxWireBytes = options.maxWireBytes ?? MAX_COMPRESSION_BYTES;
+  const maxUncompressedBytes = options.maxUncompressedBytes ?? MAX_COMPRESSION_BYTES;
+  if (!isPositiveByteCount(maxWireBytes) || maxWireBytes > MAX_COMPRESSION_BYTES ||
+    !isPositiveByteCount(maxUncompressedBytes) || maxUncompressedBytes > MAX_COMPRESSION_BYTES) {
+    throw new RangeError(`transport frame limits must be between 1 and ${MAX_COMPRESSION_BYTES}`);
+  }
+  const input = Buffer.from(frame);
+  if (input.byteLength < V2_TRANSPORT_FRAME_HEADER_BYTES || input.byteLength > maxWireBytes) {
+    throw new CompressionTransportError("COMPRESSION_FRAME_INVALID", "transport frame has an invalid length");
+  }
+  const declaredLength = input.readUInt32BE(0);
+  if (declaredLength < 1 || declaredLength + 4 !== input.byteLength) {
+    throw new CompressionTransportError("COMPRESSION_FRAME_INVALID", "transport frame length prefix does not match payload");
+  }
+  const flags = input[4]!;
+  if ((flags & ~V2_TRANSPORT_FLAG_MASK) !== 0) {
+    throw new CompressionTransportError("COMPRESSION_FRAME_INVALID", "transport frame declares unknown compression flags");
+  }
+  const encoded = input.subarray(V2_TRANSPORT_FRAME_HEADER_BYTES);
+  const compressed = (flags & V2_TRANSPORT_FLAG_ZSTD) !== 0;
+  const payload = compressed
+    ? await decompressZstd(encoded, maxUncompressedBytes)
+    : Uint8Array.from(encoded);
+  if (payload.byteLength > maxUncompressedBytes) {
+    throw new CompressionTransportError("COMPRESSION_LIMIT_EXCEEDED", "transport frame output exceeds the configured byte limit");
+  }
+  return { compressed, payload };
+}
 
 /**
  * Historical v2 code called the first record an "offer".  The Ultra task
@@ -1124,6 +1295,237 @@ export class CompressionNegotiationStateMachine {
 
 /** Shorter alias for integrations that use `Machine` naming. */
 export const CompressionNegotiationMachine = CompressionNegotiationStateMachine;
+
+/**
+ * Compact native-SDK spelling for the post-ack zstd barrier.  It is separate
+ * from the richer relay `compression.*` records above so a native v0.4
+ * client can complete a one-shot init/ack handshake without pretending that
+ * it implements the older relay negotiation vocabulary.
+ */
+export const ZSTD_PROPOSE_RECORD_TYPE = "zstd.propose" as const;
+export const ZSTD_READY_RECORD_TYPE = "zstd.ready" as const;
+export const ZSTD_WRAPPER_RECORD_TYPE = "zstd.wrapper" as const;
+export const ZSTD_HANDSHAKE_PROFILE = "polymesh.0.2" as const;
+
+export interface V2ZstdSession {
+  meshId: string;
+  sessionId: string;
+}
+
+export interface V2ZstdProposeRecord {
+  type: typeof ZSTD_PROPOSE_RECORD_TYPE;
+  profile: typeof ZSTD_HANDSHAKE_PROFILE;
+  mesh_id: string;
+  session_id: string;
+  compression: "zstd";
+}
+
+export interface V2ZstdReadyRecord {
+  type: typeof ZSTD_READY_RECORD_TYPE;
+  profile: typeof ZSTD_HANDSHAKE_PROFILE;
+  mesh_id: string;
+  session_id: string;
+  compression: "zstd";
+}
+
+export interface V2ZstdWrapperRecord {
+  type: typeof ZSTD_WRAPPER_RECORD_TYPE;
+  profile: typeof ZSTD_HANDSHAKE_PROFILE;
+  mesh_id: string;
+  session_id: string;
+  compression: "zstd";
+  uncompressed_bytes: number;
+  compressed_bytes: number;
+  payload: string;
+}
+
+export type V2ZstdHandshakeRecord = V2ZstdProposeRecord | V2ZstdReadyRecord;
+export type V2ZstdRecord = V2ZstdHandshakeRecord | V2ZstdWrapperRecord;
+export type V2ZstdState = "plain" | "proposed" | "ready" | "active" | "closed";
+export type V2ZstdRole = "initiator" | "responder";
+
+function validNativeZstdSession(value: unknown): value is V2ZstdSession {
+  return isRecord(value) && isUuidV7(value.meshId) && isUuidV7(value.sessionId) &&
+    Object.keys(value).every((key) => key === "meshId" || key === "sessionId");
+}
+
+/** Validate one native zstd control record without making a phase decision. */
+export function validateV2ZstdHandshakeRecord(value: unknown): V2ZstdHandshakeRecord | undefined {
+  if (!isRecord(value) ||
+    (value.type !== ZSTD_PROPOSE_RECORD_TYPE && value.type !== ZSTD_READY_RECORD_TYPE) ||
+    value.profile !== ZSTD_HANDSHAKE_PROFILE || !isUuidV7(value.mesh_id) || !isUuidV7(value.session_id) ||
+    value.compression !== "zstd" ||
+    !hasExactKeys(value, ["type", "profile", "mesh_id", "session_id", "compression"])) {
+    return undefined;
+  }
+  return value as unknown as V2ZstdHandshakeRecord;
+}
+
+/** Validate a native zstd wrapper before any decompression allocation. */
+export function validateV2ZstdWrapperRecord(
+  value: unknown,
+  session: V2ZstdSession,
+  limits: CompressionLimits = DEFAULT_COMPRESSION_LIMITS,
+): V2ZstdWrapperRecord | undefined {
+  if (!validNativeZstdSession(session) || !validCompressionLimits(limits) || !isRecord(value) ||
+    value.type !== ZSTD_WRAPPER_RECORD_TYPE || value.profile !== ZSTD_HANDSHAKE_PROFILE ||
+    value.mesh_id !== session.meshId || value.session_id !== session.sessionId || value.compression !== "zstd" ||
+    !hasExactKeys(value, [
+      "type", "profile", "mesh_id", "session_id", "compression",
+      "uncompressed_bytes", "compressed_bytes", "payload",
+    ]) ||
+    !isPositiveByteCount(value.uncompressed_bytes) || !isPositiveByteCount(value.compressed_bytes) ||
+    !isCanonicalBase64Url(value.payload)) {
+    return undefined;
+  }
+  const payload = Buffer.from(value.payload, "base64url");
+  if (payload.byteLength !== value.compressed_bytes || value.compressed_bytes > limits.maxCompressedBytes ||
+    value.uncompressed_bytes > limits.maxUncompressedBytes ||
+    value.uncompressed_bytes / Math.max(1, value.compressed_bytes) > limits.maxExpansionRatio) {
+    return undefined;
+  }
+  return value as unknown as V2ZstdWrapperRecord;
+}
+
+/**
+ * Native v0.4 zstd handshake: initiator proposes, each peer confirms ready,
+ * then and only then can either side send a wrapper.  It deliberately owns
+ * no socket and no cross-frame compression context.
+ */
+export class V2ZstdStateMachine {
+  private stateValue: V2ZstdState = "plain";
+  private localReady = false;
+  private peerReady = false;
+
+  readonly role: V2ZstdRole;
+  readonly session: Readonly<V2ZstdSession>;
+  readonly limits: Readonly<CompressionLimits>;
+
+  constructor(
+    session: V2ZstdSession,
+    role: V2ZstdRole,
+    limits: CompressionLimits = DEFAULT_COMPRESSION_LIMITS,
+  ) {
+    if (!validNativeZstdSession(session) || (role !== "initiator" && role !== "responder") || !validCompressionLimits(limits)) {
+      throw new TypeError("Native zstd state machine options are invalid");
+    }
+    this.session = Object.freeze({ ...session });
+    this.role = role;
+    this.limits = freezeLimits(limits);
+  }
+
+  get state(): V2ZstdState {
+    return this.stateValue;
+  }
+
+  get active(): boolean {
+    return this.stateValue === "active";
+  }
+
+  createPropose(): V2ZstdProposeRecord {
+    if (this.role !== "initiator" || this.stateValue !== "plain") {
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.propose is invalid in the current session state");
+    }
+    this.stateValue = "proposed";
+    return this.controlRecord(ZSTD_PROPOSE_RECORD_TYPE);
+  }
+
+  receivePropose(value: unknown): V2ZstdProposeRecord {
+    if (this.role !== "responder" || this.stateValue !== "plain") {
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "Unexpected zstd.propose record");
+    }
+    const record = validateV2ZstdHandshakeRecord(value);
+    if (!record || record.type !== ZSTD_PROPOSE_RECORD_TYPE || !this.matches(record)) {
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.propose does not match this session");
+    }
+    this.stateValue = "proposed";
+    return record;
+  }
+
+  createReady(): V2ZstdReadyRecord {
+    if (this.stateValue !== "proposed" && this.stateValue !== "ready") {
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.ready requires a zstd proposal");
+    }
+    if (this.localReady) {
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.ready may be sent once per session");
+    }
+    this.localReady = true;
+    this.advanceReadyState();
+    return this.controlRecord(ZSTD_READY_RECORD_TYPE);
+  }
+
+  receiveReady(value: unknown): V2ZstdReadyRecord {
+    if (this.stateValue !== "proposed" && this.stateValue !== "ready") {
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "Unexpected zstd.ready record");
+    }
+    const record = validateV2ZstdHandshakeRecord(value);
+    if (!record || record.type !== ZSTD_READY_RECORD_TYPE || !this.matches(record) || this.peerReady) {
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.ready does not match this session");
+    }
+    this.peerReady = true;
+    this.advanceReadyState();
+    return record;
+  }
+
+  async wrap(payload: Uint8Array): Promise<V2ZstdWrapperRecord> {
+    if (!this.active) throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.wrapper is forbidden before both zstd.ready records");
+    if (!(payload instanceof Uint8Array) || payload.byteLength === 0 || payload.byteLength > this.limits.maxUncompressedBytes) {
+      throw new CompressionTransportError("COMPRESSION_LIMIT_EXCEEDED", "zstd wrapper payload exceeds negotiated limits");
+    }
+    const compressed = await compressZstd(payload);
+    if (compressed.byteLength === 0 || compressed.byteLength > this.limits.maxCompressedBytes ||
+      payload.byteLength / Math.max(1, compressed.byteLength) > this.limits.maxExpansionRatio) {
+      throw new CompressionTransportError("COMPRESSION_LIMIT_EXCEEDED", "zstd wrapper violates negotiated limits");
+    }
+    return Object.freeze({
+      type: ZSTD_WRAPPER_RECORD_TYPE,
+      profile: ZSTD_HANDSHAKE_PROFILE,
+      mesh_id: this.session.meshId,
+      session_id: this.session.sessionId,
+      compression: "zstd",
+      uncompressed_bytes: payload.byteLength,
+      compressed_bytes: compressed.byteLength,
+      payload: Buffer.from(compressed).toString("base64url"),
+    });
+  }
+
+  async unwrap(record: unknown): Promise<Uint8Array> {
+    if (!this.active) throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.wrapper is forbidden before both zstd.ready records");
+    const wrapper = validateV2ZstdWrapperRecord(record, this.session, this.limits);
+    if (!wrapper) throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "Invalid zstd.wrapper record");
+    const output = await decompressZstd(Buffer.from(wrapper.payload, "base64url"), this.limits.maxUncompressedBytes);
+    if (output.byteLength !== wrapper.uncompressed_bytes ||
+      output.byteLength / Math.max(1, wrapper.compressed_bytes) > this.limits.maxExpansionRatio) {
+      throw new CompressionTransportError("PMX.PROTOCOL.COMPRESSION", "zstd.wrapper output does not match its declared bounds");
+    }
+    return output;
+  }
+
+  close(): void {
+    this.stateValue = "closed";
+  }
+
+  private controlRecord<T extends typeof ZSTD_PROPOSE_RECORD_TYPE | typeof ZSTD_READY_RECORD_TYPE>(type: T): T extends typeof ZSTD_PROPOSE_RECORD_TYPE ? V2ZstdProposeRecord : V2ZstdReadyRecord {
+    return Object.freeze({
+      type,
+      profile: ZSTD_HANDSHAKE_PROFILE,
+      mesh_id: this.session.meshId,
+      session_id: this.session.sessionId,
+      compression: "zstd",
+    }) as unknown as T extends typeof ZSTD_PROPOSE_RECORD_TYPE ? V2ZstdProposeRecord : V2ZstdReadyRecord;
+  }
+
+  private matches(record: Pick<V2ZstdHandshakeRecord, "mesh_id" | "session_id">): boolean {
+    return record.mesh_id === this.session.meshId && record.session_id === this.session.sessionId;
+  }
+
+  private advanceReadyState(): void {
+    this.stateValue = this.localReady && this.peerReady ? "active" : "ready";
+  }
+}
+
+/** Native profile alias with a shorter name for SDK integrations. */
+export const ZstdHandshakeStateMachine = V2ZstdStateMachine;
 
 export interface CompressionProposalSelectionOptions {
   initiatorReceiveLimits: CompressionLimits;

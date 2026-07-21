@@ -11,8 +11,8 @@ import {
   uuidv7,
   validateEnvelope,
   type Envelope,
-} from "@polymesh/broker";
-import { PolyMeshClient } from "@polymesh/client";
+} from "@latticeag/polymesh-broker";
+import { PolyMeshClient } from "@latticeag/polymesh-client";
 
 const brokers: Broker[] = [];
 const clients: PolyMeshClient[] = [];

@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.polymesh.dev/v2/common.json",
+  "title": "PolyMesh v2 native profile common definitions",
+  "$defs": {
+    "Profile": {
+      "type": "string",
+      "const": "polymesh.0.2"
+    },
+    "UuidV7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "MeshId": {
+      "$ref": "#/$defs/UuidV7"
+    },
+    "SessionId": {
+      "$ref": "#/$defs/UuidV7"
+    },
+    "AgentId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[a-z][a-z0-9._-]*[a-z0-9]$|^[a-z]$"
+    },
+    "InstanceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "DateTime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "CompressionAlgorithm": {
+      "type": "string",
+      "enum": [
+        "zstd",
+        "none"
+      ]
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": [
+        "PMX.SESSION.AUTH",
+        "PMX.SESSION.PROFILE",
+        "PMX.SESSION.TRANSPORT",
+        "PMX.SESSION.HANDSHAKE",
+        "PMX.SESSION.CLOSED",
+        "PMX.TASK.DEADLINE_EXCEEDED",
+        "PMX.TASK.EVENT_CONFLICT",
+        "PMX.TASK.NOT_FOUND",
+        "PMX.TASK.REJECTED",
+        "PMX.TASK.CANCELLED",
+        "PMX.PROTOCOL.COMPRESSION",
+        "PMX.PROTOCOL.MALFORMED_FRAME",
+        "PMX.PROTOCOL.VERSION",
+        "PMX.PROTOCOL.ENVELOPE",
+        "PMX.ROUTING.MESH_MISMATCH",
+        "PMX.ROUTING.TARGET_UNAVAILABLE",
+        "PMX.ROUTING.FENCE",
+        "PMX.DELIVERY.DUPLICATE",
+        "PMX.DELIVERY.IDEMPOTENCY_CONFLICT",
+        "PMX.DELIVERY.CURSOR_EXPIRED",
+        "PMX.INTERNAL"
+      ]
+    },
+    "JsonValue": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JsonValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          }
+        }
+      ]
+    },
+    "JsonObject": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      }
+    },
+    "AgentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_id"
+      ],
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "instance_id": {
+          "$ref": "#/$defs/InstanceId"
+        }
+      }
+    },
+    "AgentIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "instance_id"
+      ],
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "instance_id": {
+          "$ref": "#/$defs/InstanceId"
+        }
+      }
+    }
+  }
+}

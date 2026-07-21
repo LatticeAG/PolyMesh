@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { Broker, createAgentCard, createWirePair, generateRuntimeToken, type Capability } from "@polymesh/broker";
+import { Broker, createAgentCard, createWirePair, generateRuntimeToken, type Capability } from "@latticeag/polymesh-broker";
 import {
   InMemoryPolicyStore,
   InMemoryReplayLedger,
   PolicyEngine,
   PolyMeshClient,
   type PolicySubject,
-} from "@polymesh/client";
+} from "@latticeag/polymesh-client";
 
 const brokers: Broker[] = [];
 const clients: PolyMeshClient[] = [];

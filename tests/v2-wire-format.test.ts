@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
-import { deriveV2SessionId as publicDeriveV2SessionId } from "@polymesh/broker";
+import { deriveV2SessionId as publicDeriveV2SessionId } from "@latticeag/polymesh-broker";
 
 import {
   CARD_VERSION,

@@ -10,7 +10,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 
-import { canonicalize, parseStrictJson, sha256, type JsonObject, type JsonValue } from "@polymesh/broker";
+import { canonicalize, parseStrictJson, sha256, type JsonObject, type JsonValue } from "@latticeag/polymesh-broker";
 
 export type AuthStrength =
   | "local-unix"

@@ -9,7 +9,7 @@ import {
   validateCapability,
   uuidv7,
   validateEnvelope,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 
 const source = { agent_id: "alice", instance_id: randomInstanceId() };
 const target = { agent_id: "bob", instance_id: randomInstanceId() };

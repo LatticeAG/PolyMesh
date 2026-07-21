@@ -1,6 +1,6 @@
 {
-  "name": "@polymesh/broker",
-  "version": "0.2.0",
+  "name": "@latticeag/polymesh-broker",
+  "version": "0.4.0",
   "description": "PolyMesh WebSocket broker and registry",
   "type": "module",
   "types": "./dist/index.d.ts",
@@ -31,6 +31,10 @@
       "types": "./dist/durable-store.d.ts",
       "default": "./dist/durable-store.js"
     },
+    "./durable-store-v2": {
+      "types": "./dist/durable-store-v2.d.ts",
+      "default": "./dist/durable-store-v2.js"
+    },
     "./routing": {
       "types": "./dist/routing.d.ts",
       "default": "./dist/routing.js"
@@ -49,6 +53,7 @@
     }
   },
   "dependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.27",
     "better-sqlite3": "^11.10.0",
     "ws": "^8.21.1"
   }

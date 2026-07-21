@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.polymesh.dev/v2/handshake-v2.json",
+  "title": "PolyMesh native v2 profile handshake",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Init"
+    },
+    {
+      "$ref": "#/$defs/Ack"
+    },
+    {
+      "$ref": "#/$defs/Error"
+    }
+  ],
+  "$defs": {
+    "Protocol": {
+      "type": "string",
+      "const": "polymesh.0.2"
+    },
+    "ProfileList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "common.json#/$defs/Profile"
+      }
+    },
+    "CompressionList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "common.json#/$defs/CompressionAlgorithm"
+      }
+    },
+    "Init": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "profile",
+        "agent_id",
+        "instance_id",
+        "nonce"
+      ],
+      "properties": {
+        "type": {
+          "const": "v2.init"
+        },
+        "protocol": {
+          "$ref": "#/$defs/Protocol"
+        },
+        "profile": {
+          "$ref": "common.json#/$defs/Profile"
+        },
+        "supported_profiles": {
+          "$ref": "#/$defs/ProfileList"
+        },
+        "mesh_id": {
+          "$ref": "common.json#/$defs/MeshId"
+        },
+        "agent_id": {
+          "$ref": "common.json#/$defs/AgentId"
+        },
+        "instance_id": {
+          "$ref": "common.json#/$defs/InstanceId"
+        },
+        "nonce": {
+          "$ref": "common.json#/$defs/UuidV7"
+        },
+        "compression": {
+          "$ref": "#/$defs/CompressionList"
+        }
+      }
+    },
+    "Ack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "profile",
+        "mesh_id",
+        "session_id",
+        "compression"
+      ],
+      "properties": {
+        "type": {
+          "const": "v2.ack"
+        },
+        "protocol": {
+          "$ref": "#/$defs/Protocol"
+        },
+        "profile": {
+          "$ref": "common.json#/$defs/Profile"
+        },
+        "mesh_id": {
+          "$ref": "common.json#/$defs/MeshId"
+        },
+        "session_id": {
+          "$ref": "common.json#/$defs/SessionId"
+        },
+        "agent_id": {
+          "$ref": "common.json#/$defs/AgentId"
+        },
+        "instance_id": {
+          "$ref": "common.json#/$defs/InstanceId"
+        },
+        "compression": {
+          "$ref": "common.json#/$defs/CompressionAlgorithm"
+        }
+      }
+    },
+    "Error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "profile",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "v2.error"
+        },
+        "protocol": {
+          "$ref": "#/$defs/Protocol"
+        },
+        "profile": {
+          "$ref": "common.json#/$defs/Profile"
+        },
+        "mesh_id": {
+          "$ref": "common.json#/$defs/MeshId"
+        },
+        "session_id": {
+          "$ref": "common.json#/$defs/SessionId"
+        },
+        "code": {
+          "$ref": "common.json#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

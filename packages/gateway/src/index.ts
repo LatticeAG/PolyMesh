@@ -4,7 +4,8 @@
  * The gateway deliberately has a small adapter boundary.  HTTP credentials
  * are verified here and reduced to a closed authorization context before a
  * broker sees a request; raw bearer tokens never enter an envelope, task
- * input, event, or broker adapter call.
+ * input, event, or broker adapter call.  This is a loopback-only local
+ * gateway adapter: it deliberately does not claim to be a remote relay.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -18,11 +19,14 @@ import {
   uuidv7,
   type JsonObject,
   type JsonValue,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 
 export const GATEWAY_MAX_REQUEST_BYTES = 256 * 1024;
 export const GATEWAY_MAX_INPUT_BYTES = 256 * 1024;
 export const GATEWAY_MAX_IDEMPOTENCY_KEY_BYTES = 200;
+/** The only profile exposed by the v0.4 loopback gateway. */
+export const GATEWAY_PROFILE = V2_PROTOCOL_VERSION;
+export const GATEWAY_SCOPE = "loopback-only" as const;
 
 export const GATEWAY_TASK_REQUEST_SCHEMA = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -31,12 +35,22 @@ export const GATEWAY_TASK_REQUEST_SCHEMA = {
   additionalProperties: false,
   required: ["target", "capability", "input", "deadline"],
   properties: {
+    profile: { const: GATEWAY_PROFILE },
     target: {
       type: "object",
       additionalProperties: false,
       required: ["mesh_id", "agent_id"],
       properties: {
-        mesh_id: { type: "string", pattern: "^msh_[A-Za-z0-9_-]{8,120}$", maxLength: 124 },
+        // Earlier v2 adapters use msh_ IDs; the native v0.4 profile uses a
+        // UUIDv7 broker mesh identity.  The loopback gateway accepts either
+        // while profile selection remains explicit at the HTTP boundary.
+        mesh_id: {
+          type: "string",
+          anyOf: [
+            { pattern: "^msh_[A-Za-z0-9_-]{8,120}$", maxLength: 124 },
+            { pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", maxLength: 36 },
+          ],
+        },
         agent_id: { type: "string", pattern: "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9_-]*)+$", maxLength: 255 },
         instance_id: { type: "string", pattern: "^[A-Za-z0-9_-]{16,128}$", maxLength: 128 },
       },
@@ -58,7 +72,7 @@ export const GATEWAY_EVENT_SCHEMA = {
     event_id: { type: "string", pattern: "^evt_[A-Za-z0-9_-]{20,120}$", maxLength: 124 },
     task_id: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
     event_seq: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
-    type: { type: "string", enum: ["task.accepted", "task.rejected", "task.progress", "task.completed", "delivery.error"] },
+    type: { type: "string", enum: ["task.accepted", "task.rejected", "task.progress", "task.completed", "error", "delivery.error"] },
     occurred_at: { type: "string", format: "date-time", maxLength: 40 },
     data: { type: ["object", "array", "string", "number", "integer", "boolean", "null"] },
   },
@@ -76,6 +90,7 @@ const EVENT_TYPES = new Set<GatewayEventType>([
   "task.rejected",
   "task.progress",
   "task.completed",
+  "error",
   "delivery.error",
 ]);
 
@@ -100,6 +115,8 @@ export interface GatewayTarget {
 }
 
 export interface GatewayTaskRequest {
+  /** Selected explicitly by the native /v2/tasks endpoint. */
+  profile?: typeof GATEWAY_PROFILE;
   target: GatewayTarget;
   capability: string;
   capability_version?: string;
@@ -155,6 +172,7 @@ export type GatewayEventType =
   | "task.rejected"
   | "task.progress"
   | "task.completed"
+  | "error"
   | "delivery.error";
 
 /** The closed event payload which is sent verbatim as SSE JSON data. */
@@ -169,8 +187,9 @@ export interface GatewayEvent {
 
 export interface GatewayEventQuery {
   authorization: GatewayAuthorizationContext;
+  profile?: typeof GATEWAY_PROFILE;
   task_id?: string;
-  /** Last-Event-ID wins over the `after` query field. */
+  /** Last-Event-ID wins over the `cursor` / legacy `after` query field. */
   after?: string;
 }
 
@@ -222,10 +241,13 @@ export interface GatewayOptions {
   maxInputBytes?: number;
   /** Bound only keepalive comments; comments never advance an event cursor. */
   sseKeepaliveMs?: number;
+  /** Native v0.4 is intentionally a single-profile local gateway. */
+  supportedProfiles?: readonly [typeof GATEWAY_PROFILE];
   now?: () => number;
 }
 
 export interface GatewayTaskResponse {
+  profile?: typeof GATEWAY_PROFILE;
   task_id: string;
   state: "submitted";
   receipt: "stored";
@@ -274,9 +296,8 @@ export class GatewayCursorExpiredError extends GatewayHttpError {
 }
 
 /**
- * Node HTTP implementation of the v2 gateway.  The server can also be used
- * as a request listener through `.handle`, which keeps integration with an
- * application's existing TLS terminator straightforward.
+ * Node HTTP implementation of the v2 gateway. It binds numeric loopback
+ * only; deploy a separate authenticated relay for remote access.
  */
 export class PolyMeshGateway {
   readonly server: Server;
@@ -302,6 +323,10 @@ export class PolyMeshGateway {
     this.maxRequestBytes = boundedPositiveInteger(options.maxRequestBytes, GATEWAY_MAX_REQUEST_BYTES, GATEWAY_MAX_REQUEST_BYTES);
     this.maxInputBytes = boundedPositiveInteger(options.maxInputBytes, GATEWAY_MAX_INPUT_BYTES, GATEWAY_MAX_INPUT_BYTES);
     this.sseKeepaliveMs = boundedPositiveInteger(options.sseKeepaliveMs, 15_000, 60_000);
+    if (options.supportedProfiles !== undefined &&
+      (options.supportedProfiles.length !== 1 || options.supportedProfiles[0] !== GATEWAY_PROFILE)) {
+      throw new TypeError(`Gateway supports only ${GATEWAY_PROFILE}`);
+    }
     this.server = createServer((request, response) => {
       void this.handle(request, response).catch(() => {
         if (!response.headersSent) this.writeProblem(response, new GatewayHttpError(500, "PMX.GATEWAY.INTERNAL", "Gateway request failed.", { retryable: true }));
@@ -316,6 +341,9 @@ export class PolyMeshGateway {
 
   async listen(port = 0, host = "127.0.0.1"): Promise<this> {
     if (this.server.listening) return this;
+    if (!isLoopbackHost(host)) {
+      throw new GatewayHttpError(400, "PMX.GATEWAY.LOOPBACK_ONLY", "The v2 gateway may bind only a loopback address.");
+    }
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => {
         this.server.off("listening", onListening);
@@ -341,11 +369,19 @@ export class PolyMeshGateway {
   async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://polymesh.invalid");
     if (request.method === "POST" && url.pathname === "/v2/gateway/tasks") {
-      await this.handleSubmit(request, response);
+      await this.handleSubmit(request, response, false);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/v2/tasks") {
+      await this.handleSubmit(request, response, true);
       return;
     }
     if (request.method === "GET" && url.pathname === "/v2/gateway/events") {
-      await this.handleEvents(request, response, url);
+      await this.handleEvents(request, response, url, false);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/v2/events") {
+      await this.handleEvents(request, response, url, true);
       return;
     }
     // The task-scoped endpoint is a strict alias of the general event stream.
@@ -356,17 +392,17 @@ export class PolyMeshGateway {
         return;
       }
       url.searchParams.set("task_id", decodeURIComponent(eventAlias[1]!));
-      await this.handleEvents(request, response, url);
+      await this.handleEvents(request, response, url, false);
       return;
     }
     this.writeProblem(response, new GatewayHttpError(404, "PMX.GATEWAY.NOT_FOUND", "Gateway route was not found."));
   }
 
-  private async handleSubmit(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async handleSubmit(request: IncomingMessage, response: ServerResponse, nativePath: boolean): Promise<void> {
     try {
       const principal = await this.authenticate(request);
       const idempotencyKey = readIdempotencyKey(request);
-      const parsed = await this.readTaskRequest(request);
+      const parsed = await this.readTaskRequest(request, nativePath);
       if (parsed.target.mesh_id !== principal.mesh_id) {
         throw new GatewayHttpError(403, "PMX.AUTHORIZATION_DENIED", "Caller is not authorized for the requested mesh.");
       }
@@ -386,7 +422,7 @@ export class PolyMeshGateway {
         return;
       }
 
-      const admission = this.createAdmission(authorization, parsed, idempotencyKey, fingerprint);
+      const admission = this.createAdmission(authorization, parsed, idempotencyKey, fingerprint, nativePath);
       const record: IdempotencyRecord = { fingerprint, response: admission };
       this.idempotency.set(scope, record);
       try {
@@ -407,6 +443,7 @@ export class PolyMeshGateway {
     request: GatewayTaskRequest,
     idempotencyKey: string,
     fingerprint: string,
+    nativePath = false,
   ): Promise<GatewayTaskResponse> {
     const contract = await this.options.broker.resolveTask({ authorization, request });
     if (!isCapabilityContract(contract) || (request.capability_version !== undefined && request.capability_version !== contract.capability_version)) {
@@ -457,13 +494,13 @@ export class PolyMeshGateway {
     if (admitted.receipt !== undefined && admitted.receipt !== "stored") {
       throw new GatewayHttpError(503, "PMX.GATEWAY.ADMISSION_UNAVAILABLE", "Broker admission was not durably stored.", { retryable: true, retryAfterSeconds: 1 });
     }
-    return taskResponse(taskId);
+    return taskResponse(taskId, nativePath);
   }
 
-  private async handleEvents(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+  private async handleEvents(request: IncomingMessage, response: ServerResponse, url: URL, nativePath: boolean): Promise<void> {
     try {
       const principal = await this.authenticate(request);
-      const query = parseEventQuery(request, url, authorizationContext(principal));
+      const query = parseEventQuery(request, url, authorizationContext(principal), nativePath);
       const page = this.options.broker.readEvents
         ? await this.options.broker.readEvents(query)
         : { events: [] };
@@ -476,6 +513,8 @@ export class PolyMeshGateway {
       response.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-store",
+        "x-polymesh-profile": GATEWAY_PROFILE,
+        "x-polymesh-gateway-scope": GATEWAY_SCOPE,
         connection: "keep-alive",
         "x-accel-buffering": "no",
       });
@@ -532,7 +571,7 @@ export class PolyMeshGateway {
     return principal;
   }
 
-  private async readTaskRequest(request: IncomingMessage): Promise<GatewayTaskRequest> {
+  private async readTaskRequest(request: IncomingMessage, requireProfile = false): Promise<GatewayTaskRequest> {
     const contentLength = request.headers["content-length"];
     if (typeof contentLength === "string") {
       const declared = Number(contentLength);
@@ -545,7 +584,7 @@ export class PolyMeshGateway {
     if (!parsed.ok || !isObject(parsed.value)) {
       throw new GatewayHttpError(400, "PMX.GATEWAY.INVALID_REQUEST", "Request body must be valid JSON.");
     }
-    return decodeGatewayTaskRequest(parsed.value, this.maxInputBytes);
+    return decodeGatewayTaskRequest(parsed.value, this.maxInputBytes, requireProfile);
   }
 
   private writeJson(response: ServerResponse, status: number, body: unknown): void {
@@ -554,6 +593,8 @@ export class PolyMeshGateway {
     response.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
+      "x-polymesh-profile": GATEWAY_PROFILE,
+      "x-polymesh-gateway-scope": GATEWAY_SCOPE,
       "content-length": Buffer.byteLength(encoded),
     });
     response.end(encoded);
@@ -570,6 +611,8 @@ export class PolyMeshGateway {
     response.writeHead(error.status, {
       "content-type": "application/problem+json; charset=utf-8",
       "cache-control": "no-store",
+      "x-polymesh-profile": GATEWAY_PROFILE,
+      "x-polymesh-gateway-scope": GATEWAY_SCOPE,
       "content-length": Buffer.byteLength(encoded),
       ...(error.retryAfterSeconds === undefined ? {} : { "retry-after": String(error.retryAfterSeconds) }),
     });
@@ -676,16 +719,24 @@ export class InMemoryGatewayBroker implements GatewayBroker {
   }
 }
 
-function decodeGatewayTaskRequest(value: Record<string, JsonValue>, maxInputBytes: number): GatewayTaskRequest {
-  if (!hasOnlyKeys(value, ["target", "capability", "capability_version", "input", "deadline"]) ||
-    !hasKeys(value, ["target", "capability", "input", "deadline"])) {
+function decodeGatewayTaskRequest(
+  value: Record<string, JsonValue>,
+  maxInputBytes: number,
+  requireProfile = false,
+): GatewayTaskRequest {
+  if (!hasOnlyKeys(value, ["profile", "target", "capability", "capability_version", "input", "deadline"]) ||
+    !hasKeys(value, ["target", "capability", "input", "deadline"]) ||
+    (requireProfile && !Object.hasOwn(value, "profile"))) {
     throw invalidRequest("Request body does not match the gateway task schema.");
+  }
+  if (value.profile !== undefined && value.profile !== GATEWAY_PROFILE) {
+    throw new GatewayHttpError(409, "PMX.SESSION.PROFILE", `Gateway does not support profile ${String(value.profile)}.`);
   }
   if (!isObject(value.target) || !hasOnlyKeys(value.target, ["mesh_id", "agent_id", "instance_id"]) || !hasKeys(value.target, ["mesh_id", "agent_id"])) {
     throw invalidRequest("target does not match the gateway task schema.");
   }
   const target = value.target;
-  if (typeof target.mesh_id !== "string" || !MESH_ID_RE.test(target.mesh_id) ||
+  if (typeof target.mesh_id !== "string" || !isGatewayMeshId(target.mesh_id) ||
     typeof target.agent_id !== "string" || !AGENT_OR_CAPABILITY_RE.test(target.agent_id) ||
     (target.instance_id !== undefined && (typeof target.instance_id !== "string" || !INSTANCE_ID_RE.test(target.instance_id)))) {
     throw invalidRequest("target does not contain a valid mesh and agent identity.");
@@ -713,6 +764,7 @@ function decodeGatewayTaskRequest(value: Record<string, JsonValue>, maxInputByte
   if (!Number.isFinite(parsedDeadline)) throw invalidRequest("deadline is invalid.");
   const deadline = new Date(parsedDeadline).toISOString();
   return {
+    ...(value.profile === undefined ? {} : { profile: GATEWAY_PROFILE }),
     target: {
       mesh_id: target.mesh_id,
       agent_id: target.agent_id,
@@ -725,8 +777,13 @@ function decodeGatewayTaskRequest(value: Record<string, JsonValue>, maxInputByte
   };
 }
 
-function parseEventQuery(request: IncomingMessage, url: URL, authorization: GatewayAuthorizationContext): GatewayEventQuery {
-  const permitted = new Set(["task_id", "after"]);
+function parseEventQuery(
+  request: IncomingMessage,
+  url: URL,
+  authorization: GatewayAuthorizationContext,
+  nativePath = false,
+): GatewayEventQuery {
+  const permitted = new Set(["task_id", "after", "cursor", "profile"]);
   for (const key of url.searchParams.keys()) {
     if (!permitted.has(key) || url.searchParams.getAll(key).length !== 1) {
       throw new GatewayHttpError(400, "PMX.GATEWAY.INVALID_REQUEST", "Event query contains an unsupported parameter.");
@@ -739,11 +796,26 @@ function parseEventQuery(request: IncomingMessage, url: URL, authorization: Gate
   const headerCursor = request.headers["last-event-id"];
   const after = typeof headerCursor === "string" && headerCursor.length > 0
     ? headerCursor
-    : url.searchParams.get("after") ?? undefined;
+    : url.searchParams.get("cursor") ?? url.searchParams.get("after") ?? undefined;
+  const profile = url.searchParams.get("profile") ?? undefined;
+  if (profile !== undefined && profile !== GATEWAY_PROFILE) {
+    throw new GatewayHttpError(409, "PMX.SESSION.PROFILE", `Gateway does not support profile ${profile}.`);
+  }
+  if (nativePath && profile === undefined) {
+    // The local gateway still uses the one native profile by default.  This
+    // keeps EventSource usable while exposing an explicit profile parameter
+    // for clients that negotiate/select it themselves.
+    // No error is emitted for omission because it is not a protocol downgrade.
+  }
   if (after !== undefined && !EVENT_ID_RE.test(after)) {
     throw new GatewayCursorExpiredError();
   }
-  return { authorization, ...(taskId === undefined ? {} : { task_id: taskId }), ...(after === undefined ? {} : { after }) };
+  return {
+    authorization,
+    ...(profile === undefined ? {} : { profile: GATEWAY_PROFILE }),
+    ...(taskId === undefined ? {} : { task_id: taskId }),
+    ...(after === undefined ? {} : { after }),
+  };
 }
 
 function readIdempotencyKey(request: IncomingMessage): string {
@@ -762,13 +834,16 @@ function authorizationContext(principal: GatewayPrincipal): GatewayAuthorization
   };
 }
 
-function taskResponse(taskId: string): GatewayTaskResponse {
+function taskResponse(taskId: string, nativePath = false): GatewayTaskResponse {
   return {
+    ...(nativePath ? { profile: GATEWAY_PROFILE } : {}),
     task_id: taskId,
     state: "submitted",
     receipt: "stored",
-    status_url: `/v2/gateway/tasks/${taskId}`,
-    events_url: `/v2/gateway/events?task_id=${taskId}`,
+    status_url: nativePath ? `/v2/tasks/${taskId}` : `/v2/gateway/tasks/${taskId}`,
+    events_url: nativePath
+      ? `/v2/events?task_id=${taskId}&profile=${encodeURIComponent(GATEWAY_PROFILE)}`
+      : `/v2/gateway/events?task_id=${taskId}`,
   };
 }
 
@@ -813,8 +888,17 @@ function normalizeGatewayIdentity(identity?: GatewayIdentity): GatewayIdentity {
 
 function isGatewayPrincipal(value: unknown): value is GatewayPrincipal {
   return isObject(value) && typeof value.principal_id === "string" && value.principal_id.length > 0 && value.principal_id.length <= 192 &&
-    typeof value.mesh_id === "string" && MESH_ID_RE.test(value.mesh_id) &&
+    typeof value.mesh_id === "string" && isGatewayMeshId(value.mesh_id) &&
     (value.delegation_id === undefined || (typeof value.delegation_id === "string" && value.delegation_id.length > 0 && value.delegation_id.length <= 192));
+}
+
+function isGatewayMeshId(value: string): boolean {
+  return MESH_ID_RE.test(value) || UUID_V7_RE.test(value);
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return normalized === "::1" || normalized === "localhost" || /^127(?:\.\d{1,3}){3}$/.test(normalized);
 }
 
 function isCapabilityContract(value: unknown): value is GatewayCapabilityContract {

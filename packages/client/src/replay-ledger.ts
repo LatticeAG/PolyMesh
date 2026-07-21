@@ -14,7 +14,7 @@ import {
   type AgentRef,
   type Envelope,
   type JsonValue,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 
 export interface ReplayPrincipal {
   /** Stable authenticated principal, such as `key:<key-id>` or `uid:1000`. */

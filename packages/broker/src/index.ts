@@ -6,6 +6,7 @@ import { deriveV2SessionId as deriveLegacyV2SessionId } from "./v2.js";
 export * from "./protocol.js";
 export * from "./registry.js";
 export * from "./durable-store.js";
+export * from "./durable-store-v2.js";
 export * from "./security.js";
 // v2.ts is retained for the pre-Ultra broker implementation.  The public
 // barrel names the normative protocol declarations; callers that still need
