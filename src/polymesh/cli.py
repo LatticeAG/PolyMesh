@@ -768,7 +768,9 @@ def create_polymesh_app(directory: Path) -> None:
     requirements = target / "requirements.txt"
     config = target / "polymesh.toml"
     app.write_text(_APP_PY, encoding="utf-8")
-    requirements.write_text("polymesh>=0.1.0\n", encoding="utf-8")
+    # The PyPI distribution is namespaced while its Python import remains
+    # `polymesh`; generated projects must install the published artifact.
+    requirements.write_text("latticeag-polymesh>=0.3.0\n", encoding="utf-8")
     config.write_text(
         "[client]\nurl = \"ws://127.0.0.1:7337/polymesh\"\ninsecure_loopback_dev = true\n",
         encoding="utf-8",

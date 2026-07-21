@@ -1,3 +1,0 @@
-[console_scripts]
-create-polymesh-app = polymesh.cli:create_polymesh_app
-polymesh = polymesh.cli:main

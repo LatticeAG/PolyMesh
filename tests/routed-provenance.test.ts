@@ -18,8 +18,8 @@ import {
   type AgentCard,
   type BrokerPeer,
   type Envelope,
-} from "@polymesh/broker";
-import { PolyMeshClient } from "@polymesh/client";
+} from "@latticeag/polymesh-broker";
+import { PolyMeshClient } from "@latticeag/polymesh-client";
 
 function signedCard(agentId: string): { card: AgentCard; privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"] } {
   const keys = generateKeyPairSync("ed25519");

@@ -1,6 +1,6 @@
 {
-  "name": "@polymesh/gateway",
-  "version": "0.2.0",
+  "name": "@latticeag/polymesh-gateway",
+  "version": "0.3.0",
   "description": "PolyMesh v2 REST and SSE gateway",
   "type": "module",
   "types": "./dist/index.d.ts",
@@ -15,6 +15,6 @@
     }
   },
   "dependencies": {
-    "@polymesh/broker": "file:../broker"
+    "@latticeag/polymesh-broker": "^0.3.0"
   }
 }

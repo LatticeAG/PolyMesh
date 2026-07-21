@@ -24,10 +24,22 @@ build-prompt*.md
 BUILD-PROMPT*.md
 *.log
 *.tmp
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
 
 # Node
 node_modules/
 dist/
+
+# TypeScript package builds belong in each package's dist/ directory. These
+# patterns catch accidental source-tree emissions from an incorrectly scoped
+# compiler invocation.
+/packages/*/src/*.js
+/packages/*/src/*.d.ts
+/packages/*/src/*.js.map
+/packages/*/src/*.d.ts.map
 
 # Environment
 .env

@@ -1,0 +1,50 @@
+name: polymesh-demo
+
+x-demo-build: &demo-build
+  context: .
+  dockerfile: Dockerfile
+
+services:
+  broker:
+    build: *demo-build
+    command: ["broker"]
+    init: true
+    volumes:
+      - demo-runtime:/run/polymesh
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /run/polymesh/broker-ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 15
+      start_period: 2s
+
+  bob:
+    build: *demo-build
+    command: ["bob"]
+    init: true
+    # `service:broker` makes 127.0.0.1 mean the broker's network namespace.
+    # This preserves PolyMesh's deliberately constrained loopback-development
+    # transport posture; it is not a claim that plaintext inter-container
+    # networking is secure.
+    network_mode: "service:broker"
+    depends_on:
+      broker:
+        condition: service_healthy
+    volumes:
+      - demo-runtime:/run/polymesh
+
+  alice:
+    build: *demo-build
+    command: ["alice"]
+    init: true
+    network_mode: "service:broker"
+    depends_on:
+      broker:
+        condition: service_healthy
+      bob:
+        condition: service_started
+    volumes:
+      - demo-runtime:/run/polymesh
+
+volumes:
+  demo-runtime:

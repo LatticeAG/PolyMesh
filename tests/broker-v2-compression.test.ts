@@ -28,7 +28,7 @@ import {
   uuidv7,
   type AgentCard,
   type Capability,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 
 const brokers: Broker[] = [];
 const meshId = "msh-compression-wire";

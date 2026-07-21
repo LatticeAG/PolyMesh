@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { Broker, capabilityContractTuple, createAgentCard, createEnvelope, createWirePair, generateRuntimeToken, randomInstanceId, uuidv7 } from "@polymesh/broker";
-import { PolyMeshClient } from "@polymesh/client";
+import { Broker, capabilityContractTuple, createAgentCard, createEnvelope, createWirePair, generateRuntimeToken, randomInstanceId, uuidv7 } from "@latticeag/polymesh-broker";
+import { PolyMeshClient } from "@latticeag/polymesh-client";
 
 const clients: PolyMeshClient[] = [];
 const brokers: Broker[] = [];

@@ -1,0 +1,63 @@
+name: Full CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-full-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: TypeScript and Python verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Install TypeScript dependencies
+        run: npm ci
+
+      - name: Type-check TypeScript
+        run: npm run typecheck
+
+      - name: Run TypeScript tests
+        run: npm test
+
+      - name: Build TypeScript packages from clean output
+        shell: bash
+        run: |
+          rm -rf packages/broker/dist packages/client/dist packages/gateway/dist
+          npm run build
+
+      - name: Synchronize Python development environment
+        run: uv sync --dev --locked
+
+      - name: Run Python tests
+        run: uv run pytest -q
+
+      - name: Build Python distribution
+        run: uv build --out-dir dist/python

@@ -21,7 +21,7 @@ import {
   type WireMessageListener,
   type WireOpenListener,
   type WireTransport,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 
 /** Reserved DeckAgent tool name. It is never delegated to an arbitrary tool. */
 export const DECKAGENT_ENVELOPE_TOOL = "__polymesh_envelope__" as const;

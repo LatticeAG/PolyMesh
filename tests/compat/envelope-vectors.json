@@ -1,0 +1,140 @@
+{
+  "profile": "polymesh.0.1",
+  "vectors": [
+    {
+      "name": "ping-canonical",
+      "input": {
+        "type": "ping",
+        "source": {
+          "agent_id": "org.example.compat.alice",
+          "instance_id": "AAECAwQFBgcICQoLDA0ODw"
+        },
+        "target": {
+          "agent_id": "org.example.compat.broker",
+          "instance_id": "EBESExQVFhcYGRobHB0eHw"
+        },
+        "params": {
+          "n": 7
+        },
+        "idempotency_key": "compat:ping:7",
+        "deadline": "2030-01-02T03:04:05.006Z",
+        "message_id": "018cc251-f400-7000-8000-000000000001",
+        "timestamp": "2030-01-02T03:04:00.000Z"
+      },
+      "expected": {
+        "envelope": {
+          "protocol": "polymesh.0.1",
+          "type": "ping",
+          "message_id": "018cc251-f400-7000-8000-000000000001",
+          "timestamp": "2030-01-02T03:04:00.000Z",
+          "source": {
+            "agent_id": "org.example.compat.alice",
+            "instance_id": "AAECAwQFBgcICQoLDA0ODw"
+          },
+          "target": {
+            "agent_id": "org.example.compat.broker",
+            "instance_id": "EBESExQVFhcYGRobHB0eHw"
+          },
+          "delivery": {
+            "mode": "at_least_once",
+            "idempotency_key": "compat:ping:7",
+            "deadline": "2030-01-02T03:04:05.006Z"
+          },
+          "params": {
+            "n": 7
+          }
+        },
+        "canonical_json": "{\"delivery\":{\"deadline\":\"2030-01-02T03:04:05.006Z\",\"idempotency_key\":\"compat:ping:7\",\"mode\":\"at_least_once\"},\"message_id\":\"018cc251-f400-7000-8000-000000000001\",\"params\":{\"n\":7},\"protocol\":\"polymesh.0.1\",\"source\":{\"agent_id\":\"org.example.compat.alice\",\"instance_id\":\"AAECAwQFBgcICQoLDA0ODw\"},\"target\":{\"agent_id\":\"org.example.compat.broker\",\"instance_id\":\"EBESExQVFhcYGRobHB0eHw\"},\"timestamp\":\"2030-01-02T03:04:00.000Z\",\"type\":\"ping\"}"
+      }
+    },
+    {
+      "name": "task-submit-canonical",
+      "input": {
+        "type": "task.submit",
+        "source": {
+          "agent_id": "org.example.compat.alice",
+          "instance_id": "AAECAwQFBgcICQoLDA0ODw"
+        },
+        "target": {
+          "agent_id": "org.example.compat.broker",
+          "instance_id": "EBESExQVFhcYGRobHB0eHw"
+        },
+        "params": {
+          "task_id": "018cc251-f400-7000-8000-000000000002",
+          "method": "org.example.echo",
+          "capability_version": "1.0.0",
+          "capability_contract_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "params": {
+            "message": "hello",
+            "tags": ["one", "two"]
+          },
+          "deadline": "2030-01-02T03:04:05.006Z"
+        },
+        "idempotency_key": "compat:submit:1",
+        "deadline": "2030-01-02T03:04:05.006Z",
+        "message_id": "018cc251-f400-7000-8000-000000000003",
+        "timestamp": "2030-01-02T03:04:01.000Z"
+      },
+      "expected": {
+        "envelope": {
+          "protocol": "polymesh.0.1",
+          "type": "task.submit",
+          "message_id": "018cc251-f400-7000-8000-000000000003",
+          "timestamp": "2030-01-02T03:04:01.000Z",
+          "source": {
+            "agent_id": "org.example.compat.alice",
+            "instance_id": "AAECAwQFBgcICQoLDA0ODw"
+          },
+          "target": {
+            "agent_id": "org.example.compat.broker",
+            "instance_id": "EBESExQVFhcYGRobHB0eHw"
+          },
+          "delivery": {
+            "mode": "at_least_once",
+            "idempotency_key": "compat:submit:1",
+            "deadline": "2030-01-02T03:04:05.006Z"
+          },
+          "params": {
+            "task_id": "018cc251-f400-7000-8000-000000000002",
+            "method": "org.example.echo",
+            "capability_version": "1.0.0",
+            "capability_contract_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+            "params": {
+              "message": "hello",
+              "tags": ["one", "two"]
+            },
+            "deadline": "2030-01-02T03:04:05.006Z"
+          }
+        },
+        "canonical_json": "{\"delivery\":{\"deadline\":\"2030-01-02T03:04:05.006Z\",\"idempotency_key\":\"compat:submit:1\",\"mode\":\"at_least_once\"},\"message_id\":\"018cc251-f400-7000-8000-000000000003\",\"params\":{\"capability_contract_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"capability_version\":\"1.0.0\",\"deadline\":\"2030-01-02T03:04:05.006Z\",\"method\":\"org.example.echo\",\"params\":{\"message\":\"hello\",\"tags\":[\"one\",\"two\"]},\"task_id\":\"018cc251-f400-7000-8000-000000000002\"},\"protocol\":\"polymesh.0.1\",\"source\":{\"agent_id\":\"org.example.compat.alice\",\"instance_id\":\"AAECAwQFBgcICQoLDA0ODw\"},\"target\":{\"agent_id\":\"org.example.compat.broker\",\"instance_id\":\"EBESExQVFhcYGRobHB0eHw\"},\"timestamp\":\"2030-01-02T03:04:01.000Z\",\"type\":\"task.submit\"}"
+      }
+    }
+  ],
+  "negative": [
+    {
+      "name": "wildcard-target-is-not-an-envelope",
+      "wire": {
+        "protocol": "polymesh.0.1",
+        "type": "ping",
+        "message_id": "018cc251-f400-7000-8000-000000000001",
+        "timestamp": "2030-01-02T03:04:00.000Z",
+        "source": {
+          "agent_id": "org.example.compat.alice",
+          "instance_id": "AAECAwQFBgcICQoLDA0ODw"
+        },
+        "target": {
+          "agent_id": "*"
+        },
+        "delivery": {
+          "mode": "at_least_once",
+          "idempotency_key": "compat:ping:7",
+          "deadline": "2030-01-02T03:04:05.006Z"
+        },
+        "params": {
+          "n": 7
+        }
+      },
+      "accepted": false
+    }
+  ]
+}

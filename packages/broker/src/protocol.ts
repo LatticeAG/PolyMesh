@@ -3414,6 +3414,24 @@ export function createErrorEnvelope(
 
 export const createError = createErrorEnvelope;
 
+/**
+ * Validate and deterministically encode one v0.1 application or handshake
+ * record.  Keeping this at the protocol boundary makes fixture consumers and
+ * non-WebSocket transports use the same canonical bytes as the Python SDK.
+ */
+export function encodeRecordText(record: unknown): string {
+  const envelope = validateEnvelope(record);
+  if (envelope.ok) return canonicalize(envelope.value as unknown as JsonObject);
+  const handshake = validateHandshakeFrame(record);
+  if (handshake.ok) return canonicalize(handshake.value as unknown as JsonObject);
+  throw new TypeError("Record must be a valid PolyMesh envelope or handshake frame");
+}
+
+/** UTF-8 bytes for a validated canonical v0.1 record. */
+export function encodeRecord(record: unknown): Buffer {
+  return Buffer.from(encodeRecordText(record), "utf8");
+}
+
 export function encodeUnixFrame(payload: string | JsonValue): Buffer {
   if (typeof payload === "string" && !validUnicodeScalarSequence(payload)) {
     throw new ProtocolError("MALFORMED_JSON", "Unix frame contains invalid UTF-8 string data", "parse");

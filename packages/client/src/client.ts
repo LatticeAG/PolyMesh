@@ -58,7 +58,7 @@ import {
   type ReceiptParams,
   type VerifiedPrincipal as EnrolledPrincipal,
   type WireTransport,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 import {
   PolicyEngine,
   isPolicyAuthorizationDecision,

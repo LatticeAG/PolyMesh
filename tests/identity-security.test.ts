@@ -18,8 +18,8 @@ import {
   verifyEnrolledCard,
   type AgentCard,
   type HelloFrame,
-} from "@polymesh/broker";
-import { PolyMeshClient } from "@polymesh/client";
+} from "@latticeag/polymesh-broker";
+import { PolyMeshClient } from "@latticeag/polymesh-client";
 
 function signedCard(agentId: string) {
   const keys = generateKeyPairSync("ed25519");

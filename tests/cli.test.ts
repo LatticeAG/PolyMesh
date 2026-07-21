@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createAgentCard } from "@polymesh/broker";
-import { main } from "@polymesh/client";
+import { createAgentCard } from "@latticeag/polymesh-broker";
+import { main } from "@latticeag/polymesh-client";
 
 function ioCapture() {
   const stdout: string[] = [];

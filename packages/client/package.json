@@ -1,6 +1,6 @@
 {
-  "name": "@polymesh/client",
-  "version": "0.2.0",
+  "name": "@latticeag/polymesh-client",
+  "version": "0.3.0",
   "description": "PolyMesh client and CLI",
   "type": "module",
   "types": "./dist/index.d.ts",
@@ -27,6 +27,10 @@
       "types": "./dist/cli.d.ts",
       "default": "./dist/cli.js"
     },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    },
     "./mdns": {
       "types": "./dist/mdns.d.ts",
       "default": "./dist/mdns.js"
@@ -36,7 +40,8 @@
     "polymesh": "./dist/cli.js"
   },
   "dependencies": {
-    "@polymesh/broker": "file:../broker",
+    "@iarna/toml": "^2.2.5",
+    "@latticeag/polymesh-broker": "^0.3.0",
     "bonjour-service": "^1.4.3",
     "ws": "^8.21.1"
   }

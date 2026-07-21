@@ -12,8 +12,8 @@ import {
   randomInstanceId,
   uuidv7,
   type Capability,
-} from "@polymesh/broker";
-import { PolyMeshClient } from "@polymesh/client";
+} from "@latticeag/polymesh-broker";
+import { PolyMeshClient } from "@latticeag/polymesh-client";
 
 const brokers: Broker[] = [];
 const clients: PolyMeshClient[] = [];

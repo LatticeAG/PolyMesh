@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { DuplicateAgentError, Registry } from "@polymesh/broker";
+import { DuplicateAgentError, Registry } from "@latticeag/polymesh-broker";
 
 describe("Registry", () => {
   it("registers live agents and rejects a competing live agent id", () => {

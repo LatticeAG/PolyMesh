@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createEnvelope, randomInstanceId } from "@polymesh/broker";
-import { DeckAgentCarrier } from "@polymesh/client";
+import { createEnvelope, randomInstanceId } from "@latticeag/polymesh-broker";
+import { DeckAgentCarrier } from "@latticeag/polymesh-client";
 
 type TunnelListener = (...args: unknown[]) => void;
 

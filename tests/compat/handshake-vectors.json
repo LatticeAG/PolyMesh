@@ -1,0 +1,112 @@
+{
+  "profile": "polymesh.0.1",
+  "flows": [
+    {
+      "name": "v0.1-handshake-record-sequence",
+      "initiator_nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "responder_nonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+      "expected_session_id": "Q48LluVCyNNPXDfI-FckFQvORFHE0igCK4VawRWhAiA",
+      "frames": [
+        {
+          "name": "initiator-hello",
+          "direction": "initiator-to-responder",
+          "frame": {
+            "type": "hello",
+            "v": "0.1",
+            "role": "initiator",
+            "agent_id": "org.example.compat.alice",
+            "instance_id": "AAECAwQFBgcICQoLDA0ODw",
+            "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+          }
+        },
+        {
+          "name": "responder-hello",
+          "direction": "responder-to-initiator",
+          "frame": {
+            "type": "hello",
+            "v": "0.1",
+            "role": "responder",
+            "agent_id": "org.example.compat.broker",
+            "instance_id": "EBESExQVFhcYGRobHB0eHw",
+            "nonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+            "echo": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            "sid": "Q48LluVCyNNPXDfI-FckFQvORFHE0igCK4VawRWhAiA"
+          }
+        },
+        {
+          "name": "initiator-card",
+          "direction": "initiator-to-responder",
+          "frame": {
+            "type": "card",
+            "sid": "Q48LluVCyNNPXDfI-FckFQvORFHE0igCK4VawRWhAiA",
+            "for_nonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+            "digest": "b634ece8756ac890532afebd1c09f51ebf1b503082d40977ec89285e21b2b66e",
+            "card_vector": "alice-v1"
+          }
+        },
+        {
+          "name": "responder-card",
+          "direction": "responder-to-initiator",
+          "frame": {
+            "type": "card",
+            "sid": "Q48LluVCyNNPXDfI-FckFQvORFHE0igCK4VawRWhAiA",
+            "for_nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            "digest": "db917059be15ee8389ee223702817eb04d114824fbe2e76b0cdb486e18f8a41a",
+            "card_vector": "broker-v1"
+          }
+        },
+        {
+          "name": "initiator-auth",
+          "direction": "initiator-to-responder",
+          "frame": {
+            "type": "auth",
+            "sid": "Q48LluVCyNNPXDfI-FckFQvORFHE0igCK4VawRWhAiA",
+            "agent_id": "org.example.compat.alice",
+            "key_id": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+            "signature": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw"
+          }
+        },
+        {
+          "name": "responder-auth",
+          "direction": "responder-to-initiator",
+          "frame": {
+            "type": "auth",
+            "sid": "Q48LluVCyNNPXDfI-FckFQvORFHE0igCK4VawRWhAiA",
+            "agent_id": "org.example.compat.broker",
+            "key_id": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+            "signature": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw"
+          }
+        },
+        {
+          "name": "initiator-ready",
+          "direction": "initiator-to-responder",
+          "frame": {
+            "type": "ready",
+            "sid": "Q48LluVCyNNPXDfI-FckFQvORFHE0igCK4VawRWhAiA",
+            "self_card": "b634ece8756ac890532afebd1c09f51ebf1b503082d40977ec89285e21b2b66e",
+            "peer_card": "db917059be15ee8389ee223702817eb04d114824fbe2e76b0cdb486e18f8a41a"
+          }
+        },
+        {
+          "name": "responder-ready",
+          "direction": "responder-to-initiator",
+          "frame": {
+            "type": "ready",
+            "sid": "Q48LluVCyNNPXDfI-FckFQvORFHE0igCK4VawRWhAiA",
+            "self_card": "db917059be15ee8389ee223702817eb04d114824fbe2e76b0cdb486e18f8a41a",
+            "peer_card": "b634ece8756ac890532afebd1c09f51ebf1b503082d40977ec89285e21b2b66e"
+          }
+        }
+      ]
+    }
+  ],
+  "negative": [
+    {
+      "name": "unknown-handshake-record",
+      "frame": {
+        "type": "unsupported"
+      },
+      "accepted": false
+    }
+  ]
+}

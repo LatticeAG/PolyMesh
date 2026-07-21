@@ -18,7 +18,7 @@ import {
   uuidv7,
   type JsonObject,
   type JsonValue,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 
 export const GATEWAY_MAX_REQUEST_BYTES = 256 * 1024;
 export const GATEWAY_MAX_INPUT_BYTES = 256 * 1024;

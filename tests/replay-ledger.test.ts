@@ -7,12 +7,12 @@ import {
   uuidv7,
   type Envelope,
   type JsonObject,
-} from "@polymesh/broker";
+} from "@latticeag/polymesh-broker";
 import {
   InMemoryReplayLedger,
   replayLedgerKeys,
   type ReplayAdmission,
-} from "@polymesh/client";
+} from "@latticeag/polymesh-client";
 
 const deadline = "2026-07-18T12:10:00.000Z";
 const target = { agent_id: "com.example.target", instance_id: randomInstanceId() };

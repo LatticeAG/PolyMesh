@@ -1,6 +1,6 @@
 {
-  "name": "@polymesh/broker",
-  "version": "0.2.0",
+  "name": "@latticeag/polymesh-broker",
+  "version": "0.3.0",
   "description": "PolyMesh WebSocket broker and registry",
   "type": "module",
   "types": "./dist/index.d.ts",
