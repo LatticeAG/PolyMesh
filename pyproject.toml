@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "latticeag-polymesh"
-version = "0.3.0"
-description = "Async Python SDK for the PolyMesh polymesh.0.1 wire profile"
+version = "0.4.0"
+description = "Async Python SDK for the PolyMesh polymesh.0.1 and experimental polymesh.0.2 profiles"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -25,6 +25,7 @@ dependencies = [
   "cryptography>=42,<46",
   "platformdirs>=4,<5",
   "pydantic>=2.7,<3",
+  "pyzstd>=0.15,<1",
   "websockets>=13,<16",
 ]
 
@@ -47,7 +48,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-polymesh = ["py.typed", "schemas/*.json"]
+polymesh = ["py.typed", "schemas/*.json", "schemas/v2/*.json"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

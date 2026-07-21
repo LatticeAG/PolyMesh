@@ -1,6 +1,6 @@
 # PolyMesh
 
-PolyMesh is an experimental, local-first protocol implementation for agents to declare capabilities and exchange bounded tasks. Version 0.3.0 focuses on a reproducible local evaluation path: installable packages, a runnable broker-and-agents demo, cross-language fixtures, and clear support boundaries.
+PolyMesh is an experimental, local-first protocol implementation for agents to declare capabilities and exchange bounded tasks. Version 0.4.0 adds an explicitly selected, experimental `polymesh.0.2` native SDK profile while preserving the v0.1 wire path.
 
 [![CI](https://github.com/LatticeAG/PolyMesh/actions/workflows/ci-full.yml/badge.svg)](https://github.com/LatticeAG/PolyMesh/actions/workflows/ci-full.yml)
 [![Release](https://github.com/LatticeAG/PolyMesh/actions/workflows/release.yml/badge.svg)](https://github.com/LatticeAG/PolyMesh/actions/workflows/release.yml)
@@ -53,11 +53,11 @@ npx @latticeag/polymesh-client config show
 
 ## Support matrix
 
-| Capability | Status in v0.3.0 | Notes |
+| Capability | Status in v0.4.0 | Notes |
 | --- | --- | --- |
 | v0.1 local task lifecycle | Supported | TypeScript broker/client and Python SDK are covered by shared compatibility vectors. |
-| v2 gateway REST/SSE adapter | Experimental | Node reference adapter only; its current scope is task submission and task-event observation. |
-| v2 native SDK clients | Not supported as a release promise | The Python SDK remains a v0.1 surface; do not infer v2 support from package versioning. |
+| `polymesh.0.2` native SDK profile | Experimental | TypeScript and Python clients select it explicitly, negotiate a profile and optional zstd framing, and retain v0.1 compatibility. |
+| v2 gateway REST/SSE adapter | Experimental, loopback-only | Node reference adapter only; `/v2/tasks` and `/v2/events` are local task submission and observation endpoints, not a remote relay. |
 | mDNS discovery | TypeScript supported, Python not yet native | TypeScript discovery is opt-in and WSS-only; it is a hint, never enrollment or auto-connect. |
 | Remote transport | Explicitly configured WSS only | Secure transport requires the exact enrolled profile. There is no deployed Worker, Durable Object, or managed relay. |
 | Docker Compose demo | Supported local fixture | A repeatable development demo, not a production deployment architecture. |
@@ -68,6 +68,7 @@ npx @latticeag/polymesh-client config show
 | Profile | TypeScript | Python | Security boundary |
 | --- | --- | --- | --- |
 | Numeric-loopback development WebSocket | Supported with an explicit runtime token and `--insecure-loopback-dev` | Supported for the v0.1 SDK path | Local development only; never advertise it or bridge it across a normal container, LAN, or Internet network. The Compose fixture deliberately shares the broker network namespace to retain numeric-loopback semantics. |
+| `polymesh.0.2` native profile | Experimental explicit opt-in | Experimental explicit opt-in | Negotiates profile and optional zstd framing. It is scoped to the selected broker mesh and does not imply hosted, multi-hop, or remote-relay support. |
 | Enrolled WSS | Supported where the exact carrier and enrollment requirements are configured | Not advertised as a general secure-carrier implementation | Mutual enrollment and TLS requirements fail closed. |
 | mDNS WSS discovery hints | Supported and opt-in | Optional dependency exists; no native network provider is claimed | Discovery conveys no trust and never initiates enrollment. |
 | Hosted/remote relay | Not available | Not available | Planned separately; no Worker relay deployment is included. |
@@ -95,7 +96,7 @@ Supported TOML sections are `[broker]`, `[client]`, and `[discovery]`. Keep cred
 
 ## Verification
 
-The v0.3.0 release gate runs clean installs, TypeScript type checking/build/tests, Python tests/builds, package artifact smoke tests, and shared compatibility fixtures. The baseline suites contain 157 TypeScript tests and 60 Python tests; the release workflows also run the added conformance checks.
+The v0.4.0 release gate runs clean installs, TypeScript type checking/build/tests, Python tests/builds, package artifact smoke tests, and shared compatibility fixtures. It includes native-profile and zstd round-trip coverage alongside the existing v0.1 suites.
 
 From a source checkout:
 
@@ -112,7 +113,7 @@ uv build
 
 ## Scope and limitations
 
-PolyMesh v0.3.0 does not claim generic end-to-end envelope signing, delegated authorization grants, continuous task-output streaming, generic pub/sub, automatic multi-hop routing, a native v2 Python client, or production hosting. Gateway SSE is task-event observation, not general streaming or a topic system.
+PolyMesh v0.4.0 does not claim generic end-to-end envelope signing, delegated authorization grants, continuous task-output streaming, generic pub/sub, automatic multi-hop routing, MCP/framework adapters, a hosted Worker relay, or production hosting. Gateway SSE is task-event observation, not general streaming or a topic system.
 
 The repository contains protocol design material governed by local repository policy. This README is intentionally a high-level implementation guide and does not publish or reproduce that material.
 

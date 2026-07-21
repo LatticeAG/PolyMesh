@@ -334,6 +334,196 @@ export type V2AuthenticationMethod =
   | "oauth-mtls"
   | "deckagent-bound";
 
+/**
+ * The compact native-v2 SDK profile records published in `schemas/v2/`.
+ *
+ * These names are deliberately additive.  The longer-lived v0.2 relay
+ * declarations below (`V2HelloFrame`, `V2AgentCard`, and friends) retain
+ * their existing wire contracts; a new SDK client explicitly selects this
+ * profile with a `v2.init` record instead of structurally merging it into a
+ * legacy hello frame.
+ */
+export const V2_PROFILE = V2_PROTOCOL_VERSION;
+export const V2_SUPPORTED_PROFILES = [V2_PROTOCOL_VERSION] as const;
+export type V2Profile = (typeof V2_SUPPORTED_PROFILES)[number];
+
+/** A native-v2 mesh identifier is a broker-generated UUIDv7. */
+export type V2NativeMeshId = string;
+export type V2NativeSessionId = string;
+export type V2NativeNonce = string;
+
+export const V2_COMPRESSION_ALGORITHMS = ["zstd", "none"] as const;
+export type V2CompressionAlgorithm = (typeof V2_COMPRESSION_ALGORITHMS)[number];
+
+/** Closed native-v2 error vocabulary shared by the schema bundle and SDKs. */
+export const V2_ERROR_CODES = [
+  "PMX.SESSION.AUTH",
+  "PMX.SESSION.PROFILE",
+  "PMX.SESSION.TRANSPORT",
+  "PMX.SESSION.HANDSHAKE",
+  "PMX.SESSION.CLOSED",
+  "PMX.TASK.DEADLINE_EXCEEDED",
+  "PMX.TASK.EVENT_CONFLICT",
+  "PMX.TASK.NOT_FOUND",
+  "PMX.TASK.REJECTED",
+  "PMX.TASK.CANCELLED",
+  "PMX.PROTOCOL.COMPRESSION",
+  "PMX.PROTOCOL.MALFORMED_FRAME",
+  "PMX.PROTOCOL.VERSION",
+  "PMX.PROTOCOL.ENVELOPE",
+  "PMX.ROUTING.MESH_MISMATCH",
+  "PMX.ROUTING.TARGET_UNAVAILABLE",
+  "PMX.ROUTING.FENCE",
+  "PMX.DELIVERY.DUPLICATE",
+  "PMX.DELIVERY.IDEMPOTENCY_CONFLICT",
+  "PMX.DELIVERY.CURSOR_EXPIRED",
+  "PMX.INTERNAL",
+] as const;
+export type V2ErrorCode = (typeof V2_ERROR_CODES)[number];
+
+/** Stable locations of the native-v2 JSON Schema bundle. */
+export const V2_NATIVE_SCHEMA_IDS = Object.freeze({
+  common: "https://schemas.polymesh.dev/v2/common.json",
+  envelope: "https://schemas.polymesh.dev/v2/envelope-v2.json",
+  handshake: "https://schemas.polymesh.dev/v2/handshake-v2.json",
+  card: "https://schemas.polymesh.dev/v2/card-v2.json",
+});
+
+/** Agent addresses in native-v2 envelopes inherit mesh scope from the envelope. */
+export interface V2NativeAgentRef {
+  agent_id: string;
+  instance_id?: string;
+}
+
+export interface V2NativeAgentIdentity extends V2NativeAgentRef {
+  instance_id: string;
+}
+
+/** `delivery_id` belongs to the nested delivery structure, never the envelope root. */
+export interface V2NativeDelivery {
+  delivery_id: string;
+  mode: "at_least_once";
+  idempotency_key: string;
+  deadline: string;
+}
+
+export const V2_NATIVE_ENVELOPE_TYPES = [
+  "card",
+  "task.submit",
+  "task.accepted",
+  "task.rejected",
+  "task.progress",
+  "task.completed",
+  "task.cancel",
+  "task.status",
+  "ping",
+  "pong",
+  "receipt",
+  "error",
+] as const;
+export type V2NativeEnvelopeType = (typeof V2_NATIVE_ENVELOPE_TYPES)[number];
+
+/** Native-v2 task submission params use capability/input, not v0.1 method/params. */
+export type V2NativeTaskSubmitParams = JsonObject & {
+  task_id: string;
+  capability: string;
+  input: JsonValue;
+  deadline: string;
+  capability_version?: string;
+  capability_contract_digest?: string;
+};
+
+/** A mesh-scoped native-v2 application envelope. */
+export interface V2NativeEnvelope<
+  T extends V2NativeEnvelopeType = V2NativeEnvelopeType,
+  P extends JsonObject = JsonObject,
+> {
+  protocol: V2Profile;
+  profile: V2Profile;
+  mesh_id: V2NativeMeshId;
+  type: T;
+  message_id: string;
+  timestamp: string;
+  source: V2NativeAgentIdentity;
+  target: V2NativeAgentRef;
+  delivery: V2NativeDelivery;
+  in_reply_to?: string;
+  params: P;
+}
+
+/** Client profile proposal. `mesh_id` is optional until the broker selects one. */
+export interface V2InitFrame {
+  type: "v2.init";
+  /** Accepted for explicitness but not required on the compact handshake. */
+  protocol?: V2Profile;
+  profile: V2Profile;
+  supported_profiles?: readonly V2Profile[];
+  mesh_id?: V2NativeMeshId;
+  agent_id: string;
+  instance_id: string;
+  nonce: V2NativeNonce;
+  compression?: readonly V2CompressionAlgorithm[];
+}
+
+/** Broker profile selection and session establishment response. */
+export interface V2AckFrame {
+  type: "v2.ack";
+  /** Accepted for explicitness but not required on the compact handshake. */
+  protocol?: V2Profile;
+  profile: V2Profile;
+  mesh_id: V2NativeMeshId;
+  session_id: V2NativeSessionId;
+  agent_id?: string;
+  instance_id?: string;
+  compression: V2CompressionAlgorithm;
+}
+
+/** Bounded handshake failure that can be emitted before a session exists. */
+export interface V2ErrorFrame {
+  type: "v2.error";
+  /** Accepted for explicitness but not required on the compact handshake. */
+  protocol?: V2Profile;
+  profile: V2Profile;
+  mesh_id?: V2NativeMeshId;
+  session_id?: V2NativeSessionId;
+  code: V2ErrorCode;
+  message: string;
+  retryable?: boolean;
+}
+
+export type V2NativeHandshakeRecord = V2InitFrame | V2AckFrame | V2ErrorFrame;
+/** Aliases make the profile-specific names clear at SDK call sites. */
+export type V2ProfileInitFrame = V2InitFrame;
+export type V2ProfileAckFrame = V2AckFrame;
+export type V2ProfileErrorFrame = V2ErrorFrame;
+export type V2ProfileHandshakeRecord = V2NativeHandshakeRecord;
+
+/** A native-v2 card advertises its primary and supported protocol profiles. */
+export interface V2NativeCapability {
+  id: string;
+  version: string;
+  description?: string;
+  input_schema?: JsonObject;
+  result_schema?: JsonObject;
+  contract_digest?: string;
+}
+
+export interface V2NativeAgentCard {
+  card_version: typeof V2_CARD_VERSION;
+  profile: V2Profile;
+  profiles: readonly V2Profile[];
+  mesh_id: V2NativeMeshId;
+  agent_id: string;
+  instance_id: string;
+  display_name?: string;
+  issued_at: string;
+  expires_at: string;
+  revision: number;
+  capabilities: readonly V2NativeCapability[];
+  metadata?: JsonObject;
+  signature?: string;
+}
+
 /** Limits a peer is willing to receive; they are not send authorization. */
 export interface V2ReceiveLimits {
   max_wire_bytes: number;

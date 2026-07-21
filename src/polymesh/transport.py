@@ -13,6 +13,7 @@ one complete PolyMesh record.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import ipaddress
@@ -39,8 +40,119 @@ from .errors import (
 
 
 PROTOCOL_SUBPROTOCOL = "polymesh.0.1"
+V2_PROTOCOL_SUBPROTOCOL = "polymesh.0.2"
+SUPPORTED_SUBPROTOCOLS = frozenset({PROTOCOL_SUBPROTOCOL, V2_PROTOCOL_SUBPROTOCOL})
 POLYMESH_PATH = "/polymesh"
 MAX_FRAME_BYTES = 1_048_576
+
+
+def normalize_protocol_profile(profile: str | None = None) -> str:
+    """Return one explicit WebSocket profile; no implicit version upgrade."""
+
+    selected = PROTOCOL_SUBPROTOCOL if profile is None else profile
+    if selected not in SUPPORTED_SUBPROTOCOLS:
+        raise TransportError("UNSUPPORTED_PROTOCOL_VERSION", "unsupported PolyMesh protocol profile")
+    return selected
+
+
+def _zstd_module() -> tuple[str, Any] | None:
+    """Resolve the optional codec lazily so normal v0.1 installs stay small."""
+
+    try:
+        import pyzstd  # type: ignore[import-not-found]
+
+        if callable(getattr(pyzstd, "compress", None)) and (
+            callable(getattr(pyzstd, "decompress", None)) or hasattr(pyzstd, "ZstdDecompressor")
+        ):
+            return "pyzstd", pyzstd
+    except ImportError:
+        pass
+    try:
+        import zstandard  # type: ignore[import-not-found]
+
+        if hasattr(zstandard, "ZstdCompressor") and hasattr(zstandard, "ZstdDecompressor"):
+            return "zstandard", zstandard
+    except ImportError:
+        pass
+    return None
+
+
+def zstd_available() -> bool:
+    """Whether this interpreter can safely offer zstd for the selected v2 profile."""
+
+    return _zstd_module() is not None
+
+
+def zstd_compress(data: bytes | bytearray | memoryview) -> bytes:
+    """Compress one independent zstd frame using pyzstd or zstandard.
+
+    The caller owns protocol metadata and must never reuse a compressor across
+    PolyMesh records.  One call therefore always creates one independent
+    frame, matching the TypeScript broker's wrapper semantics.
+    """
+
+    raw = bytes(data)
+    backend = _zstd_module()
+    if backend is None:
+        raise TransportError("COMPRESSION_UNAVAILABLE", "zstd codec is not installed")
+    name, module = backend
+    try:
+        if name == "pyzstd":
+            return bytes(module.compress(raw))
+        return bytes(module.ZstdCompressor().compress(raw))
+    except Exception as exc:
+        raise TransportError("COMPRESSION_FAILED", "zstd compression failed") from exc
+
+
+def zstd_decompress(data: bytes | bytearray | memoryview, *, max_output_bytes: int = MAX_FRAME_BYTES) -> bytes:
+    """Decompress one bounded independent zstd frame.
+
+    ``zstandard`` has a native output cap.  pyzstd has used a few names for
+    its capped decompression argument across releases, so prefer all known
+    bounded forms and retain a postcondition check for older bindings.
+    """
+
+    if not isinstance(max_output_bytes, int) or isinstance(max_output_bytes, bool) or not 0 < max_output_bytes <= MAX_FRAME_BYTES:
+        raise ValueError("max_output_bytes must be a positive bounded integer")
+    raw = bytes(data)
+    backend = _zstd_module()
+    if backend is None:
+        raise TransportError("COMPRESSION_UNAVAILABLE", "zstd codec is not installed")
+    name, module = backend
+    try:
+        if name == "zstandard":
+            result = module.ZstdDecompressor().decompress(raw, max_output_size=max_output_bytes)
+        else:
+            decompressor = getattr(module, "ZstdDecompressor", None)
+            if decompressor is not None:
+                decoder = decompressor()
+                try:
+                    result = decoder.decompress(raw, max_length=max_output_bytes)
+                except TypeError:
+                    try:
+                        result = decoder.decompress(raw, max_output_size=max_output_bytes)
+                    except TypeError:
+                        result = decoder.decompress(raw)
+            else:
+                try:
+                    result = module.decompress(raw, max_length=max_output_bytes)
+                except TypeError:
+                    try:
+                        result = module.decompress(raw, max_output_size=max_output_bytes)
+                    except TypeError:
+                        result = module.decompress(raw)
+        output = bytes(result)
+    except Exception as exc:
+        raise TransportError("COMPRESSION_FAILED", "zstd decompression failed") from exc
+    if len(output) > max_output_bytes:
+        raise TransportError("COMPRESSION_LIMIT_EXCEEDED", "zstd output exceeds negotiated limit")
+    return output
+
+
+# Friendly aliases for users and integration adapters that spell codecs in
+# verb-first order.  Keep both public names stable for Python parity tests.
+compress_zstd = zstd_compress
+decompress_zstd = zstd_decompress
 
 
 class ConnectionState(str, Enum):
@@ -329,6 +441,7 @@ async def _open_standard_websocket(
     endpoint: ValidatedEndpoint,
     *,
     token: str,
+    profile: str,
     open_timeout: float,
     max_frame_bytes: int,
 ) -> WebSocketTransport:
@@ -343,7 +456,7 @@ async def _open_standard_websocket(
             raise TransportError("TRANSPORT_UNAVAILABLE", "websockets is not installed") from exc
 
     options: dict[str, Any] = {
-        "subprotocols": [PROTOCOL_SUBPROTOCOL],
+        "subprotocols": [profile],
         "compression": None,
         "max_size": max_frame_bytes,
         "max_queue": 16,
@@ -372,9 +485,9 @@ async def _open_standard_websocket(
     except Exception as exc:
         raise TransportError("TRANSPORT_CONNECT_FAILED", "Unable to open PolyMesh WebSocket", retryable=True) from exc
     transport = WebSocketTransport(websocket, max_frame_bytes=max_frame_bytes)
-    if transport.selected_subprotocol != PROTOCOL_SUBPROTOCOL:
+    if transport.selected_subprotocol != profile:
         await transport.close(1002, "subprotocol mismatch")
-        raise TransportError("SUBPROTOCOL_MISMATCH", "Peer did not select polymesh.0.1")
+        raise TransportError("SUBPROTOCOL_MISMATCH", f"Peer did not select {profile}")
     return transport
 
 
@@ -385,6 +498,7 @@ async def open_websocket_transport(
     allow_insecure_loopback_development: bool = False,
     secure_identity: object | None = None,
     secure_transport_factory: SecureTransportFactory | None = None,
+    profile: str = PROTOCOL_SUBPROTOCOL,
     open_timeout: float = 5.0,
     max_frame_bytes: int = MAX_FRAME_BYTES,
 ) -> WireTransport:
@@ -396,6 +510,7 @@ async def open_websocket_transport(
     certificate fingerprint is not an interchangeable channel binding.
     """
 
+    selected_profile = normalize_protocol_profile(profile)
     endpoint = validate_broker_url(
         url,
         allow_insecure_loopback_development=allow_insecure_loopback_development,
@@ -405,7 +520,7 @@ async def open_websocket_transport(
     if endpoint.scheme == "ws":
         assert token is not None
         return await _open_standard_websocket(
-            endpoint, token=token, open_timeout=open_timeout, max_frame_bytes=max_frame_bytes
+            endpoint, token=token, profile=selected_profile, open_timeout=open_timeout, max_frame_bytes=max_frame_bytes
         )
     if secure_transport_factory is None:
         raise SecureProfileUnsupportedError(
@@ -447,6 +562,7 @@ class WebSocketConnector:
         allow_insecure_loopback_development: bool = False,
         secure_identity: object | None = None,
         secure_transport_factory: SecureTransportFactory | None = None,
+        profile: str = PROTOCOL_SUBPROTOCOL,
         open_timeout: float = 5.0,
         max_frame_bytes: int = MAX_FRAME_BYTES,
     ) -> None:
@@ -458,6 +574,7 @@ class WebSocketConnector:
         self.allow_insecure_loopback_development = allow_insecure_loopback_development
         self.secure_identity = secure_identity
         self.secure_transport_factory = secure_transport_factory
+        self.profile = normalize_protocol_profile(profile)
         self.open_timeout = open_timeout
         self.max_frame_bytes = max_frame_bytes
 
@@ -471,6 +588,7 @@ class WebSocketConnector:
             allow_insecure_loopback_development=self.allow_insecure_loopback_development,
             secure_identity=self.secure_identity,
             secure_transport_factory=self.secure_transport_factory,
+            profile=self.profile,
             open_timeout=self.open_timeout,
             max_frame_bytes=self.max_frame_bytes,
         )

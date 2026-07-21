@@ -211,7 +211,7 @@ def test_create_polymesh_app_template_contains_no_runtime_token() -> None:
         app = (target / "app.py").read_text(encoding="utf-8")
         assert "TokenStore().read()" in app
         assert "POLYMESH_TOKEN" not in app
-        assert (target / "requirements.txt").read_text(encoding="utf-8") == "latticeag-polymesh>=0.3.0\n"
+        assert (target / "requirements.txt").read_text(encoding="utf-8") == "latticeag-polymesh>=0.4.0\n"
         assert (target / "polymesh.toml").is_file()
 
 

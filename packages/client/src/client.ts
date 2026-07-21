@@ -12,6 +12,9 @@ import {
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   SECURE_IDENTITY_PROFILE,
+  V2_PROFILE,
+  V2_PROTOCOL_VERSION,
+  V2_SUBPROTOCOL,
   EnrollmentStore,
   authTranscript,
   capabilityContractTuple,
@@ -20,11 +23,14 @@ import {
   createAuthProof,
   createCardIdentityFromPrivateKey,
   createEnvelope,
+  V2ZstdStateMachine,
   decodeRuntimeToken,
   deriveSessionId,
+  isAgentId,
   isAgentCard,
   isCapabilityContractTuple,
   isEnvelope,
+  isInstanceId,
   isJsonValue,
   isTimestamp,
   isUuidV7,
@@ -57,6 +63,11 @@ import {
   type JsonValue,
   type ReceiptParams,
   type VerifiedPrincipal as EnrolledPrincipal,
+  type V2AckFrame,
+  type V2CompressionAlgorithm,
+  type V2ErrorFrame,
+  type V2InitFrame,
+  type V2NativeEnvelope,
   type WireTransport,
 } from "@latticeag/polymesh-broker";
 import {
@@ -77,8 +88,12 @@ import {
 
 export type ClientPhase = "idle" | "await_hello" | "await_card" | "await_auth" | "await_ready" | "active" | "closed";
 
+/** The selected profile is immutable for the lifetime of a client session. */
+export type ClientProfile = typeof PROTOCOL_VERSION | typeof V2_PROTOCOL_VERSION;
+export const CLIENT_PROFILES = [PROTOCOL_VERSION, V2_PROTOCOL_VERSION] as const;
+
 export interface ClientTransport {
-  send(data: string, callback?: (error?: Error) => void): unknown;
+  send(data: string | Uint8Array, callback?: (error?: Error) => void): unknown;
   close?(code?: number, reason?: string): unknown;
   terminate?(): unknown;
   on?(event: "open" | "message" | "close" | "error", listener: (...args: any[]) => void): unknown;
@@ -163,6 +178,12 @@ export interface SecureIdentityOptions {
 
 export interface ClientOptions {
   card: AgentCard;
+  /** Select native `polymesh.0.2`; v0.1 remains the default. */
+  profile?: ClientProfile;
+  /** Optional native-v2 broker mesh hint. The v2.ack selection is authoritative. */
+  meshId?: string;
+  /** Ordered native-v2 compression preferences; `none` is retained automatically. */
+  compression?: readonly V2CompressionAlgorithm[];
   url?: string;
   token?: string;
   /**
@@ -490,6 +511,33 @@ function capabilityContractFromParams(params: Record<string, unknown>): Capabili
   return isCapabilityContractTuple(candidate) ? candidate : undefined;
 }
 
+/**
+ * Native v2 lifecycle records spell the capability name `capability`, while
+ * the mature internal lifecycle machinery uses `capability_id`.  Convert
+ * only the closed fields it understands; the legacy envelope validator below
+ * remains the final guard for every value and type.
+ */
+function nativeLifecycleParams(
+  params: JsonObject,
+  fields: readonly string[],
+  includeCapabilityContract: boolean,
+): JsonObject {
+  const result: JsonObject = {};
+  for (const field of fields) {
+    if (!Object.hasOwn(params, field)) return {};
+    result[field] = params[field]!;
+  }
+  if (!includeCapabilityContract) return result;
+  const capability = params.capability ?? params.capability_id;
+  if (capability === undefined || params.capability_version === undefined || params.capability_contract_digest === undefined) {
+    return {};
+  }
+  result.capability_id = capability;
+  result.capability_version = params.capability_version;
+  result.capability_contract_digest = params.capability_contract_digest;
+  return result;
+}
+
 interface ResolvedCapabilityContract {
   tuple: CapabilityContractTuple;
   capability?: Capability;
@@ -584,6 +632,8 @@ export class PolyMeshClient extends EventEmitter {
   readonly cardDigest: string;
   readonly handlers = new Map<string, TaskHandler>();
   readonly defaultTimeoutMs: number;
+  /** Profile selected at construction; it never changes during reconnects. */
+  readonly profile: ClientProfile;
 
   private readonly now: () => number;
   private readonly handshakeTimeoutMs: number;
@@ -605,6 +655,8 @@ export class PolyMeshClient extends EventEmitter {
   private readonly replayLedger?: ReplayLedger;
   private readonly resolveReplayPrincipal?: NonNullable<ClientOptions["resolveReplayPrincipal"]>;
   private readonly token?: string;
+  private readonly nativeMeshHint?: string;
+  private readonly nativeCompressionPreferences: readonly V2CompressionAlgorithm[];
   private readonly allowInsecureLoopbackDevelopment: boolean;
   private readonly identityProfile?: {
     privateKey: Ed25519PrivateKey;
@@ -628,6 +680,12 @@ export class PolyMeshClient extends EventEmitter {
   private peerCardDigest?: string;
   private peerIdentity?: AgentIdentity;
   private peerPrincipal?: EnrolledPrincipal;
+  private nativeMeshId?: string;
+  private nativeSessionId?: string;
+  private nativeInit?: V2InitFrame;
+  private nativeZstd?: V2ZstdStateMachine;
+  /** Serializes asynchronous zstd wrapper writes in lifecycle order. */
+  private nativeSendQueue: Promise<void> = Promise.resolve();
   private pendingByTask = new Map<string, Set<PendingCall>>();
   private pendingByMessage = new Map<string, PendingCall>();
   private localTasks = new Map<string, LocalTask>();
@@ -643,6 +701,27 @@ export class PolyMeshClient extends EventEmitter {
   constructor(options: ClientOptions) {
     super();
     if (!isAgentCard(options.card)) throw new TypeError("Client card is not a valid AgentCard");
+    this.profile = options.profile ?? PROTOCOL_VERSION;
+    if (this.profile !== PROTOCOL_VERSION && this.profile !== V2_PROTOCOL_VERSION) {
+      throw new TypeError(`Unsupported PolyMesh profile: ${String(options.profile)}`);
+    }
+    if (options.meshId !== undefined && !isUuidV7(options.meshId)) {
+      throw new TypeError("meshId must be a UUIDv7 when selecting the native v2 profile");
+    }
+    this.nativeMeshHint = options.meshId;
+    const requestedCompression = options.compression ?? ["zstd", "none"];
+    if (!Array.isArray(requestedCompression) || requestedCompression.length === 0 ||
+      requestedCompression.some((algorithm) => algorithm !== "zstd" && algorithm !== "none") ||
+      new Set(requestedCompression).size !== requestedCompression.length) {
+      throw new TypeError("compression must be a non-empty unique list of zstd and/or none");
+    }
+    this.nativeCompressionPreferences = Object.freeze([
+      ...requestedCompression,
+      ...(requestedCompression.includes("none") ? [] : ["none" as const]),
+    ]);
+    if (this.profile === V2_PROTOCOL_VERSION && options.identity !== undefined) {
+      throw new TypeError("The compact native v2 profile does not support the enrolled v0.1 identity handshake");
+    }
     this.now = options.now ?? Date.now;
     let localCard = options.card;
     if (options.identity) {
@@ -813,7 +892,11 @@ export class PolyMeshClient extends EventEmitter {
       perMessageDeflate: false,
       followRedirects: false,
     };
-    return this.connectTransport(this.createWebSocket(this.configuredUrl, PROTOCOL_VERSION, connectionOptions));
+    return this.connectTransport(this.createWebSocket(
+      this.configuredUrl,
+      this.profile === V2_PROTOCOL_VERSION ? V2_SUBPROTOCOL : PROTOCOL_VERSION,
+      connectionOptions,
+    ));
   }
 
   /** Connect an already-open WebSocket-shaped transport (ideal for unit tests). */
@@ -951,6 +1034,8 @@ export class PolyMeshClient extends EventEmitter {
   close(code = 1000, reason = "client closed"): void {
     this.clearHandshakeTimer();
     this.stopHeartbeat();
+    this.nativeZstd?.close();
+    this.nativeZstd = undefined;
     this.abortLocalTasks();
     const safeCode = isValidWebSocketCloseCode(code) ? code : 1000;
     const normalizedReason = sanitizeCloseReason(reason);
@@ -1000,6 +1085,10 @@ export class PolyMeshClient extends EventEmitter {
 
   private beginHandshake(): void {
     if (!this.transport || this.phase !== "idle") return;
+    if (this.profile === V2_PROTOCOL_VERSION) {
+      this.beginNativeV2Handshake();
+      return;
+    }
     this.nonce = randomNonce();
     this.initiatorHello = {
       type: "hello",
@@ -1017,6 +1106,32 @@ export class PolyMeshClient extends EventEmitter {
     this.sendRaw(this.initiatorHello);
   }
 
+  /**
+   * Native v2 deliberately selects a profile before any legacy hello/card
+   * record is emitted. The mesh id here is only a routing hint; the broker's
+   * v2.ack is authoritative and fences every subsequent envelope.
+   */
+  private beginNativeV2Handshake(): void {
+    if (!this.transport || this.phase !== "idle") return;
+    const init: V2InitFrame = {
+      type: "v2.init",
+      protocol: V2_PROFILE,
+      profile: V2_PROFILE,
+      mesh_id: this.nativeMeshHint ?? uuidv7(this.now()),
+      agent_id: this.card.agent_id,
+      instance_id: this.card.instance_id,
+      nonce: uuidv7(this.now()),
+      supported_profiles: [V2_PROFILE],
+      compression: this.nativeCompressionPreferences,
+    };
+    this.nativeInit = init;
+    this.phase = "await_hello";
+    this.handshakeTimer = setTimeout(() => {
+      this.failSession(new PolyMeshError("HANDSHAKE_TIMEOUT", "Native v2 handshake did not complete in time", "protocol", true));
+    }, this.handshakeTimeoutMs);
+    this.sendRaw(init);
+  }
+
   private receive(input: string | Uint8Array): void {
     const parsed = parseStrictJson(input, { maxBytes: MAX_FRAME_BYTES });
     if (!parsed.ok) {
@@ -1024,6 +1139,10 @@ export class PolyMeshClient extends EventEmitter {
       return;
     }
     const frame: unknown = parsed.value;
+    if (this.profile === V2_PROTOCOL_VERSION) {
+      void this.receiveNativeV2Record(frame);
+      return;
+    }
     if (this.phase !== "active" && isObject(frame) && frame.type === "error") {
       const params = isObject(frame.params) ? frame.params : {};
       this.failSession(new PolyMeshError(
@@ -1039,6 +1158,275 @@ export class PolyMeshClient extends EventEmitter {
     if (this.phase === "await_auth") return this.receiveAuth(frame);
     if (this.phase === "await_ready") return this.receiveReady(frame);
     if (this.phase === "active") this.receiveEnvelope(frame);
+  }
+
+  /** Dispatch the compact v2 init/ack, zstd, and application vocabulary. */
+  private async receiveNativeV2Record(frame: unknown, decodedFromZstdWrapper = false): Promise<void> {
+    if (!isObject(frame)) {
+      this.nativeProtocolFailure("PMX.PROTOCOL.MALFORMED_FRAME", "Native v2 record must be an object");
+      return;
+    }
+    if (frame.type === "v2.error") {
+      const error = frame as unknown as V2ErrorFrame;
+      if (error.profile !== V2_PROFILE || typeof error.code !== "string" || typeof error.message !== "string") {
+        this.nativeProtocolFailure("PMX.PROTOCOL.MALFORMED_FRAME", "Native v2 error record is malformed");
+        return;
+      }
+      if ((this.nativeMeshId !== undefined && error.mesh_id !== this.nativeMeshId) ||
+        (this.nativeSessionId !== undefined && error.session_id !== undefined && error.session_id !== this.nativeSessionId)) {
+        this.nativeProtocolFailure("PMX.ROUTING.MESH_MISMATCH", "Native v2 error does not match the selected mesh/session");
+        return;
+      }
+      const failure = new PolyMeshError(error.code, error.message, "protocol", error.retryable === true);
+      if (this.phase === "active") this.emit("protocolError", failure);
+      else this.failSession(failure);
+      return;
+    }
+    if (this.phase === "await_hello") {
+      this.receiveNativeV2Ack(frame);
+      return;
+    }
+    if (this.phase !== "active" && this.phase !== "await_ready") {
+      this.nativeProtocolFailure("PMX.SESSION.HANDSHAKE", "Native v2 record arrived outside an active session");
+      return;
+    }
+    if (frame.type === "zstd.ready") {
+      this.receiveNativeZstdReady(frame);
+      return;
+    }
+    if (frame.type === "zstd.wrapper") {
+      await this.receiveNativeZstdWrapper(frame);
+      return;
+    }
+    if (frame.type === "zstd.propose") {
+      // The client is the compact handshake initiator. A peer proposal would
+      // create an ambiguous second state machine, so reject it fail closed.
+      this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", "Unexpected zstd proposal from native v2 responder");
+      return;
+    }
+    if (this.phase !== "active") {
+      this.nativeProtocolFailure("PMX.SESSION.HANDSHAKE", "Native v2 application traffic arrived before compression negotiation completed");
+      return;
+    }
+    if (this.nativeZstd?.active && !decodedFromZstdWrapper) {
+      this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", "Native v2 application traffic must use zstd.wrapper after compression activates");
+      return;
+    }
+    this.receiveNativeEnvelope(frame);
+  }
+
+  private receiveNativeV2Ack(frame: Record<string, unknown>): void {
+    const ack = frame as unknown as V2AckFrame;
+    const selectedProfile = frame.selected_profile;
+    if (!this.nativeInit || ack.type !== "v2.ack" || ack.profile !== V2_PROFILE ||
+      (ack.protocol !== undefined && ack.protocol !== V2_PROFILE) ||
+      (selectedProfile !== undefined && selectedProfile !== V2_PROFILE) ||
+      !isUuidV7(ack.mesh_id) || !isUuidV7(ack.session_id) ||
+      (ack.compression !== "zstd" && ack.compression !== "none") ||
+      !this.nativeCompressionPreferences.includes(ack.compression)) {
+      this.nativeProtocolFailure("PMX.SESSION.PROFILE", "Native v2 acknowledgement does not match the proposed profile");
+      return;
+    }
+    this.nativeMeshId = ack.mesh_id;
+    this.nativeSessionId = ack.session_id;
+    if (isAgentId(ack.agent_id) && isInstanceId(ack.instance_id)) {
+      // A native ack may omit broker identity. When it includes a plausible
+      // pair, retain it for pings and observability without making it an
+      // authorization assertion.
+      this.peerIdentity = { agent_id: ack.agent_id, instance_id: ack.instance_id };
+    }
+    if (ack.compression === "zstd") {
+      try {
+        this.nativeZstd = new V2ZstdStateMachine({ meshId: ack.mesh_id, sessionId: ack.session_id }, "initiator");
+      } catch {
+        this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", "Could not initialize native v2 zstd negotiation");
+        return;
+      }
+    }
+    this.phase = "await_ready";
+    if (this.nativeZstd) {
+      try {
+        this.sendRaw(this.nativeZstd.createPropose());
+      } catch {
+        this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", "Could not propose native v2 zstd compression");
+        return;
+      }
+      return;
+    }
+    this.finishNativeV2Ready();
+  }
+
+  /** Complete v2 only after the selected compression mode is usable. */
+  private finishNativeV2Ready(): void {
+    if (this.phase === "active") return;
+    if (this.phase !== "await_ready") {
+      this.nativeProtocolFailure("PMX.SESSION.HANDSHAKE", "Native v2 session entered an invalid ready state");
+      return;
+    }
+    this.clearHandshakeTimer();
+    this.phase = "active";
+    this.startHeartbeat();
+    this.readyDeferred?.resolve(this);
+    this.emit("ready", this);
+  }
+
+  private receiveNativeZstdReady(frame: unknown): void {
+    const machine = this.nativeZstd;
+    if (!machine) {
+      this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", "zstd.ready arrived without a zstd selection");
+      return;
+    }
+    try {
+      machine.receiveReady(frame);
+      this.sendRaw(machine.createReady());
+      if (machine.active) this.finishNativeV2Ready();
+    } catch (error) {
+      this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", error instanceof Error ? error.message : "Native zstd ready is invalid");
+    }
+  }
+
+  private async receiveNativeZstdWrapper(frame: unknown): Promise<void> {
+    const machine = this.nativeZstd;
+    if (!machine) {
+      this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", "zstd.wrapper arrived without a zstd selection");
+      return;
+    }
+    try {
+      const decoded = await machine.unwrap(frame);
+      const parsed = parseStrictJson(decoded, { maxBytes: MAX_FRAME_BYTES });
+      if (!parsed.ok) {
+        this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", "Native zstd wrapper did not contain strict JSON");
+        return;
+      }
+      await this.receiveNativeV2Record(parsed.value, true);
+    } catch (error) {
+      this.nativeProtocolFailure("PMX.PROTOCOL.COMPRESSION", error instanceof Error ? error.message : "Native zstd wrapper is invalid");
+    }
+  }
+
+  private nativeProtocolFailure(code: string, message: string): void {
+    const error = new PolyMeshError(code, message, "protocol");
+    this.failSession(error);
+  }
+
+  /** Convert a native envelope into the legacy internal lifecycle shape. */
+  private receiveNativeEnvelope(frame: Record<string, unknown>): void {
+    const envelope = this.nativeEnvelopeAsLegacy(frame);
+    if (!envelope) {
+      this.emit("protocolError", new PolyMeshError("PMX.PROTOCOL.ENVELOPE", "Peer sent an invalid native v2 envelope", "parse"));
+      return;
+    }
+    this.receiveEnvelope(envelope, true);
+  }
+
+  private nativeEnvelopeAsLegacy(frame: Record<string, unknown>): Envelope | undefined {
+    const type = frame.type;
+    const messageId = frame.message_id;
+    const timestamp = frame.timestamp;
+    const source = frame.source;
+    const target = frame.target;
+    const delivery = frame.delivery;
+    const rawParams = frame.params;
+    const inReplyTo = frame.in_reply_to;
+    if (!this.nativeMeshId || frame.protocol !== V2_PROFILE || frame.profile !== V2_PROFILE ||
+      frame.mesh_id !== this.nativeMeshId || typeof type !== "string" || !isUuidV7(messageId) ||
+      !isTimestamp(timestamp) || !isObject(source) || !isObject(target) ||
+      !isObject(delivery) || !isObject(rawParams) || !isJsonValue(rawParams) ||
+      (inReplyTo !== undefined && !isUuidV7(inReplyTo))) {
+      return undefined;
+    }
+    if (!isAgentId(source.agent_id) || !isInstanceId(source.instance_id) ||
+      !isAgentId(target.agent_id) ||
+      (target.instance_id !== undefined && !isInstanceId(target.instance_id)) ||
+      !isUuidV7(delivery.delivery_id) || delivery.mode !== "at_least_once" ||
+      typeof delivery.idempotency_key !== "string" || !isTimestamp(delivery.deadline)) {
+      return undefined;
+    }
+    const params = rawParams as JsonObject;
+    let legacyParams: JsonObject;
+    switch (type) {
+      case "task.submit": {
+        const taskId = params.task_id;
+        const capability = params.capability;
+        const input = params.input;
+        const deadline = params.deadline;
+        if (!isUuidV7(taskId) || typeof capability !== "string" || !isObject(input) || !isTimestamp(deadline) ||
+          deadline !== delivery.deadline) return undefined;
+        const version = typeof params.capability_version === "string" ? params.capability_version : "1.0.0";
+        let inferred: CapabilityContractTuple;
+        try {
+          inferred = capabilityContractTuple({ id: capability, version });
+        } catch {
+          return undefined;
+        }
+        const digest = typeof params.capability_contract_digest === "string"
+          ? params.capability_contract_digest
+          : inferred.capability_contract_digest;
+        legacyParams = {
+          task_id: taskId,
+          method: capability,
+          capability_version: version,
+          capability_contract_digest: digest,
+          params: input as JsonObject,
+          deadline,
+        };
+        break;
+      }
+      case "task.accepted":
+        legacyParams = nativeLifecycleParams(params, ["task_id", "event_seq", "accepted_at"], true);
+        break;
+      case "task.rejected":
+        legacyParams = nativeLifecycleParams(params, ["task_id", "event_seq", "code", "message"], false);
+        break;
+      case "task.progress":
+        legacyParams = nativeLifecycleParams(params, ["task_id", "event_seq", "progress"], false);
+        break;
+      case "task.completed":
+        legacyParams = nativeLifecycleParams(params, ["task_id", "event_seq", "terminal"], true);
+        break;
+      case "task.cancel":
+        legacyParams = params.reason === undefined
+          ? { task_id: params.task_id }
+          : { task_id: params.task_id, reason: params.reason };
+        break;
+      case "task.status":
+      case "ping":
+      case "pong":
+      case "receipt":
+      case "card":
+        legacyParams = { ...params };
+        break;
+      case "error":
+        legacyParams = {
+          category: typeof params.category === "string" ? params.category : "protocol",
+          code: params.code,
+          message: params.message,
+          retryable: params.retryable,
+          retry_after_ms: params.retry_after_ms ?? null,
+          ...(params.details === undefined ? {} : { details: params.details }),
+        };
+        break;
+      default:
+        return undefined;
+    }
+    const legacy: Envelope = {
+      protocol: PROTOCOL_VERSION,
+      type: type as Envelope["type"],
+      message_id: messageId,
+      timestamp,
+      source: { agent_id: source.agent_id, instance_id: source.instance_id },
+      target: target.instance_id === undefined
+        ? { agent_id: target.agent_id }
+        : { agent_id: target.agent_id, instance_id: target.instance_id },
+      delivery: {
+        mode: "at_least_once",
+        idempotency_key: delivery.idempotency_key,
+        deadline: delivery.deadline,
+      },
+      ...(inReplyTo === undefined ? {} : { in_reply_to: inReplyTo }),
+      params: legacyParams,
+    };
+    return isEnvelope(legacy) ? legacy : undefined;
   }
 
   private receiveHello(frame: unknown): void {
@@ -1191,7 +1579,12 @@ export class PolyMeshClient extends EventEmitter {
     this.emit("ready", this);
   }
 
-  private receiveEnvelope(frame: unknown): void {
+  /**
+   * The native v2 broker has already authenticated and fenced a mesh-scoped
+   * record before it reaches this adapter.  Its source can be a routed peer,
+   * so do not apply the legacy broker-source/provenance checks a second time.
+   */
+  private receiveEnvelope(frame: unknown, native = false): void {
     if (!isEnvelope(frame)) {
       this.emit("protocolError", new PolyMeshError("MALFORMED_FRAME", "Peer sent an invalid protocol envelope", "parse"));
       return;
@@ -1202,7 +1595,7 @@ export class PolyMeshClient extends EventEmitter {
       this.emit("protocolError", new PolyMeshError("SOURCE_IDENTITY_MISMATCH", "Envelope was not addressed to this client", "identity"));
       return;
     }
-    if ((envelope.type === "ping" || envelope.type === "pong" || envelope.type === "receipt") && !this.isBrokerSource(envelope.source)) {
+    if (!native && (envelope.type === "ping" || envelope.type === "pong" || envelope.type === "receipt") && !this.isBrokerSource(envelope.source)) {
       this.emit("protocolError", new PolyMeshError("SOURCE_IDENTITY_MISMATCH", "Control record was not sent by the authenticated broker", "identity"));
       return;
     }
@@ -1210,7 +1603,7 @@ export class PolyMeshClient extends EventEmitter {
     // claims it forwards. Every routed record that can affect policy, task,
     // cancellation, lifecycle, or error state therefore needs a fresh,
     // target-session-bound broker signature before it reaches a handler.
-    if (this.identityProfile && requiresRoutedProvenance(envelope.type) && !this.isBrokerSource(envelope.source) &&
+    if (!native && this.identityProfile && requiresRoutedProvenance(envelope.type) && !this.isBrokerSource(envelope.source) &&
       !this.hasValidRoutedProvenance(envelope)) {
       this.emit("protocolError", new PolyMeshError("ROUTED_PROVENANCE_INVALID", "Routed record lacks valid broker provenance", "identity"));
       return;
@@ -2166,7 +2559,123 @@ export class PolyMeshClient extends EventEmitter {
 
   private sendEnvelope(envelope: Envelope): void {
     if (this.phase !== "active") throw new PolyMeshError("SESSION_NOT_READY", "Application messages require an active session", "transport", true);
+    if (this.profile === V2_PROTOCOL_VERSION) {
+      this.sendNativeEnvelope(envelope);
+      return;
+    }
     this.sendRaw(envelope);
+  }
+
+  /** Map the stable internal task API onto the selected native-v2 wire shape. */
+  private nativeEnvelopeFromLegacy(envelope: Envelope): V2NativeEnvelope {
+    const meshId = this.nativeMeshId;
+    if (!meshId || !isUuidV7(meshId)) {
+      throw new PolyMeshError("PMX.SESSION.PROFILE", "Native v2 mesh identity has not been selected", "protocol");
+    }
+    const deadline = envelope.delivery.deadline ?? safeDeadline(this.now, this.defaultTimeoutMs);
+    if (!isTimestamp(deadline)) {
+      throw new PolyMeshError("PMX.PROTOCOL.ENVELOPE", "Native v2 delivery deadline is invalid", "protocol");
+    }
+    const params = this.nativeParamsFromLegacy(envelope, deadline);
+    return {
+      protocol: V2_PROFILE,
+      profile: V2_PROFILE,
+      mesh_id: meshId,
+      type: envelope.type,
+      message_id: envelope.message_id,
+      timestamp: envelope.timestamp,
+      source: {
+        agent_id: envelope.source.agent_id,
+        instance_id: envelope.source.instance_id,
+      },
+      target: envelope.target.instance_id === undefined
+        ? { agent_id: envelope.target.agent_id }
+        : { agent_id: envelope.target.agent_id, instance_id: envelope.target.instance_id },
+      delivery: {
+        delivery_id: uuidv7(this.now()),
+        mode: "at_least_once",
+        idempotency_key: envelope.delivery.idempotency_key,
+        deadline,
+      },
+      ...(envelope.in_reply_to === undefined ? {} : { in_reply_to: envelope.in_reply_to }),
+      params: this.nativeParamsFromLegacy(envelope, deadline),
+    } as V2NativeEnvelope;
+  }
+
+  /** Translate only fields whose spelling changed between the selected profiles. */
+  private nativeParamsFromLegacy(envelope: Envelope, deliveryDeadline: string): JsonObject {
+    const params = envelope.params as JsonObject;
+    if (envelope.type === "task.submit") {
+      const taskId = params.task_id;
+      const capability = params.method;
+      const input = params.params;
+      const deadline = deliveryDeadline;
+      if (!isUuidV7(taskId) || typeof capability !== "string" || !isJsonValue(input) || !isTimestamp(deadline)) {
+        throw new PolyMeshError("PMX.PROTOCOL.ENVELOPE", "Legacy task submit cannot be represented as a native v2 task", "protocol");
+      }
+      const native: JsonObject = {
+        task_id: taskId,
+        capability,
+        input,
+        deadline,
+      };
+      if (typeof params.capability_version === "string") native.capability_version = params.capability_version;
+      if (typeof params.capability_contract_digest === "string") {
+        native.capability_contract_digest = params.capability_contract_digest;
+      }
+      return native;
+    }
+    if (envelope.type === "task.accepted" || envelope.type === "task.completed") {
+      const native: JsonObject = { ...params };
+      const capabilityId = native.capability_id;
+      delete native.capability_id;
+      if (capabilityId !== undefined) native.capability = capabilityId;
+      return native;
+    }
+    if (envelope.type === "error") {
+      if (typeof params.code !== "string" || typeof params.message !== "string" || typeof params.retryable !== "boolean") {
+        throw new PolyMeshError("PMX.PROTOCOL.ENVELOPE", "Legacy error cannot be represented as a native v2 error", "protocol");
+      }
+      return {
+        code: params.code,
+        message: params.message,
+        retryable: params.retryable,
+        ...(isObject(params.details) && isJsonValue(params.details) ? { details: params.details as JsonObject } : {}),
+      };
+    }
+    return { ...params };
+  }
+
+  /**
+   * zstd wrapping is asynchronous in both Node and browser runtimes. Keep
+   * application writes ordered, while retaining raw JSON for the short
+   * post-ack/pre-ready barrier where wrappers are explicitly forbidden.
+   */
+  private sendNativeEnvelope(envelope: Envelope): void {
+    const native = this.nativeEnvelopeFromLegacy(envelope);
+    if (!this.nativeZstd?.active) {
+      this.sendRaw(native);
+      return;
+    }
+    const payload = Buffer.from(JSON.stringify(native), "utf8");
+    const write = this.nativeSendQueue.then(async () => {
+      if (this.phase !== "active") {
+        throw new PolyMeshError("TRANSPORT_CLOSED", "Native v2 session closed before compressed frame could be sent", "transport", true);
+      }
+      const machine = this.nativeZstd;
+      if (!machine?.active) {
+        // A close/reset can happen while a previous wrapper is completing;
+        // never emit a raw record after compression has been negotiated.
+        throw new PolyMeshError("PMX.PROTOCOL.COMPRESSION", "Native v2 compression is no longer active", "protocol");
+      }
+      this.sendRaw(await machine.wrap(payload));
+    });
+    this.nativeSendQueue = write.catch((error) => {
+      if (this.phase !== "closed") {
+        const message = error instanceof Error ? error.message : "Native v2 compression failed";
+        this.failSession(new PolyMeshError("PMX.PROTOCOL.COMPRESSION", message, "protocol"));
+      }
+    });
   }
 
   private sendRaw(frame: unknown): void {
@@ -2186,6 +2695,8 @@ export class PolyMeshClient extends EventEmitter {
     this.transport = undefined;
     this.clearHandshakeTimer();
     this.stopHeartbeat();
+    this.nativeZstd?.close();
+    this.nativeZstd = undefined;
     this.abortLocalTasks();
     const error = new PolyMeshError("TRANSPORT_CLOSED", reason || `Transport closed (${code})`, "transport", true);
     this.rejectOpenAndPending(error);
@@ -2200,6 +2711,8 @@ export class PolyMeshClient extends EventEmitter {
     this.transport = undefined;
     this.clearHandshakeTimer();
     this.stopHeartbeat();
+    this.nativeZstd?.close();
+    this.nativeZstd = undefined;
     this.abortLocalTasks();
     this.rejectOpenAndPending(error);
     try {

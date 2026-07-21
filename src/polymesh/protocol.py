@@ -42,6 +42,8 @@ from .types import (
     MAX_JSON_STRING_BYTES,
     MAX_SAFE_INTEGER,
     PROTOCOL_VERSION,
+    V2_HANDSHAKE_VERSION,
+    V2_PROTOCOL_VERSION,
     ROUTED_PROVENANCE_VERSION,
     SECURE_IDENTITY_PROFILE,
     AgentCard,
@@ -501,6 +503,599 @@ def derive_session_id(initiator_nonce: str, responder_nonce: str) -> str:
     responder = base64url_decode_exact(responder_nonce, 32)
     raw = hashlib.sha256(b"polymesh.0.1\x00" + initiator + responder).digest()
     return base64url_encode(raw)
+
+
+# v0.2 deliberately keeps a distinct derivation domain.  This helper lives
+# next to the legacy derivation rather than replacing it so a caller cannot
+# accidentally downgrade or cross-correlate sessions while negotiating a
+# profile.
+V2_MESH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
+V2_NATIVE_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+V2_NATIVE_AGENT_ID_RE = re.compile(r"^(?:[a-z]|[a-z][a-z0-9._-]*[a-z0-9])$")
+V2_NATIVE_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+V2_NATIVE_COMPRESSION_ALGORITHMS = frozenset({"zstd", "none"})
+
+
+def is_v2_native_uuid(value: Any) -> bool:
+    """Return whether a compact native-v2 identifier is a lowercase UUIDv7."""
+
+    return isinstance(value, str) and V2_NATIVE_UUID_RE.fullmatch(value) is not None
+
+
+def _validate_v2_native_identity(value: Any, *, required_instance: bool) -> JsonObject:
+    if not isinstance(value, Mapping):
+        raise SchemaValidationError("native v0.2 address must be an object")
+    allowed = {"agent_id", "instance_id"}
+    required = {"agent_id", *( {"instance_id"} if required_instance else set() )}
+    if set(value) - allowed or not required.issubset(value):
+        raise SchemaValidationError("native v0.2 address has unknown or missing fields")
+    agent_id = value.get("agent_id")
+    instance_id = value.get("instance_id")
+    if not isinstance(agent_id, str) or V2_NATIVE_AGENT_ID_RE.fullmatch(agent_id) is None:
+        raise SchemaValidationError("native v0.2 agent_id is invalid")
+    if instance_id is not None and (
+        not isinstance(instance_id, str) or V2_NATIVE_INSTANCE_ID_RE.fullmatch(instance_id) is None
+    ):
+        raise SchemaValidationError("native v0.2 instance_id is invalid")
+    if "instance_id" in value and instance_id is None:
+        raise SchemaValidationError("native v0.2 instance_id must be omitted rather than null")
+    result: JsonObject = {"agent_id": agent_id}
+    if instance_id is not None:
+        result["instance_id"] = instance_id
+    return result
+
+
+def validate_v2_init_frame(value: JsonValue | Mapping[str, Any]) -> JsonObject:
+    """Validate the compact native-v2 client profile proposal.
+
+    This is intentionally a separate grammar from the historical v0.2
+    ``hello`` frame.  A caller selects one before sending bytes, so a native
+    profile proposal cannot be interpreted as a legacy hello extension.
+    """
+
+    validate_json_tree(value)
+    if not isinstance(value, Mapping):
+        raise SchemaValidationError("native v0.2 init must be an object")
+    frame = dict(value)
+    allowed = {
+        "type", "protocol", "profile", "supported_profiles", "mesh_id", "agent_id",
+        "instance_id", "nonce", "compression",
+    }
+    required = {"type", "profile", "agent_id", "instance_id", "nonce"}
+    if set(frame) - allowed or not required.issubset(frame) or frame.get("type") != "v2.init":
+        raise SchemaValidationError("native v0.2 init has unknown or missing fields")
+    if frame.get("protocol") not in {None, V2_PROTOCOL_VERSION} or frame.get("profile") != V2_PROTOCOL_VERSION:
+        raise SchemaValidationError("native v0.2 init profile is invalid")
+    if "protocol" in frame and frame["protocol"] is None:
+        raise SchemaValidationError("native v0.2 init protocol must be omitted rather than null")
+    if not is_v2_native_uuid(frame.get("nonce")):
+        raise SchemaValidationError("native v0.2 init nonce must be UUIDv7")
+    identity = _validate_v2_native_identity(
+        {"agent_id": frame.get("agent_id"), "instance_id": frame.get("instance_id")}, required_instance=True
+    )
+    if "mesh_id" in frame and not is_v2_native_uuid(frame["mesh_id"]):
+        raise SchemaValidationError("native v0.2 init mesh_id must be UUIDv7")
+    supported = frame.get("supported_profiles")
+    if supported is not None:
+        if not isinstance(supported, list) or not supported or len(set(supported)) != len(supported) or any(item != V2_PROTOCOL_VERSION for item in supported):
+            raise SchemaValidationError("native v0.2 supported_profiles is invalid")
+    elif "supported_profiles" in frame:
+        raise SchemaValidationError("native v0.2 supported_profiles must be omitted rather than null")
+    compression = frame.get("compression")
+    if compression is not None:
+        if not isinstance(compression, list) or not compression or len(set(compression)) != len(compression) or any(item not in V2_NATIVE_COMPRESSION_ALGORITHMS for item in compression):
+            raise SchemaValidationError("native v0.2 compression proposal is invalid")
+    elif "compression" in frame:
+        raise SchemaValidationError("native v0.2 compression must be omitted rather than null")
+    result: JsonObject = {
+        "type": "v2.init",
+        "profile": V2_PROTOCOL_VERSION,
+        "agent_id": identity["agent_id"],
+        "instance_id": identity["instance_id"],
+        "nonce": frame["nonce"],
+    }
+    for optional in ("protocol", "supported_profiles", "mesh_id", "compression"):
+        if optional in frame:
+            result[optional] = frame[optional]
+    return result
+
+
+def validate_v2_ack_frame(value: JsonValue | Mapping[str, Any]) -> JsonObject:
+    """Validate a broker's native-v2 profile selection acknowledgement."""
+
+    validate_json_tree(value)
+    if not isinstance(value, Mapping):
+        raise SchemaValidationError("native v0.2 ack must be an object")
+    frame = dict(value)
+    allowed = {"type", "protocol", "profile", "mesh_id", "session_id", "agent_id", "instance_id", "compression"}
+    required = {"type", "profile", "mesh_id", "session_id", "compression"}
+    if set(frame) - allowed or not required.issubset(frame) or frame.get("type") != "v2.ack":
+        raise SchemaValidationError("native v0.2 ack has unknown or missing fields")
+    if frame.get("protocol") not in {None, V2_PROTOCOL_VERSION} or frame.get("profile") != V2_PROTOCOL_VERSION:
+        raise SchemaValidationError("native v0.2 ack profile is invalid")
+    if "protocol" in frame and frame["protocol"] is None:
+        raise SchemaValidationError("native v0.2 ack protocol must be omitted rather than null")
+    if not is_v2_native_uuid(frame.get("mesh_id")) or not is_v2_native_uuid(frame.get("session_id")):
+        raise SchemaValidationError("native v0.2 ack mesh_id and session_id must be UUIDv7")
+    if frame.get("compression") not in V2_NATIVE_COMPRESSION_ALGORITHMS:
+        raise SchemaValidationError("native v0.2 ack compression is invalid")
+    identity_keys = {key for key in ("agent_id", "instance_id") if key in frame}
+    if identity_keys and identity_keys != {"agent_id", "instance_id"}:
+        raise SchemaValidationError("native v0.2 ack broker identity must be complete")
+    if identity_keys:
+        _validate_v2_native_identity(
+            {"agent_id": frame.get("agent_id"), "instance_id": frame.get("instance_id")}, required_instance=True
+        )
+    result: JsonObject = {
+        "type": "v2.ack",
+        "profile": V2_PROTOCOL_VERSION,
+        "mesh_id": frame["mesh_id"],
+        "session_id": frame["session_id"],
+        "compression": frame["compression"],
+    }
+    for optional in ("protocol", "agent_id", "instance_id"):
+        if optional in frame:
+            result[optional] = frame[optional]
+    return result
+
+
+def validate_v2_error_frame(value: JsonValue | Mapping[str, Any]) -> JsonObject:
+    """Validate a bounded native-v2 pre-session error frame."""
+
+    validate_json_tree(value)
+    if not isinstance(value, Mapping):
+        raise SchemaValidationError("native v0.2 error must be an object")
+    frame = dict(value)
+    allowed = {"type", "protocol", "profile", "mesh_id", "session_id", "code", "message", "retryable"}
+    required = {"type", "profile", "code", "message"}
+    if set(frame) - allowed or not required.issubset(frame) or frame.get("type") != "v2.error":
+        raise SchemaValidationError("native v0.2 error has unknown or missing fields")
+    if frame.get("protocol") not in {None, V2_PROTOCOL_VERSION} or frame.get("profile") != V2_PROTOCOL_VERSION:
+        raise SchemaValidationError("native v0.2 error profile is invalid")
+    if "protocol" in frame and frame["protocol"] is None:
+        raise SchemaValidationError("native v0.2 error protocol must be omitted rather than null")
+    if "mesh_id" in frame and not is_v2_native_uuid(frame["mesh_id"]):
+        raise SchemaValidationError("native v0.2 error mesh_id must be UUIDv7")
+    if "session_id" in frame and not is_v2_native_uuid(frame["session_id"]):
+        raise SchemaValidationError("native v0.2 error session_id must be UUIDv7")
+    if not isinstance(frame.get("code"), str) or not frame["code"] or len(frame["code"]) > 128:
+        raise SchemaValidationError("native v0.2 error code is invalid")
+    if not isinstance(frame.get("message"), str) or not frame["message"] or len(frame["message"]) > 1024:
+        raise SchemaValidationError("native v0.2 error message is invalid")
+    if "retryable" in frame and not isinstance(frame["retryable"], bool):
+        raise SchemaValidationError("native v0.2 error retryable is invalid")
+    return frame
+
+
+def validate_v2_native_handshake_frame(value: JsonValue | Mapping[str, Any]) -> JsonObject:
+    """Validate one compact native-v2 handshake record by its closed type."""
+
+    if not isinstance(value, Mapping) or not isinstance(value.get("type"), str):
+        raise SchemaValidationError("native v0.2 handshake record must be an object")
+    if value["type"] == "v2.init":
+        return validate_v2_init_frame(value)
+    if value["type"] == "v2.ack":
+        return validate_v2_ack_frame(value)
+    if value["type"] == "v2.error":
+        return validate_v2_error_frame(value)
+    raise SchemaValidationError("unknown native v0.2 handshake record")
+
+
+def _native_v2_task_params_to_legacy(envelope_type: str, value: Any) -> JsonObject:
+    if not isinstance(value, Mapping):
+        raise SchemaValidationError("native v0.2 envelope params must be an object")
+    params = dict(value)
+    if envelope_type == "task.submit":
+        allowed = {"task_id", "capability", "capability_version", "capability_contract_digest", "input", "deadline"}
+        required = {"task_id", "capability", "input", "deadline"}
+        if set(params) - allowed or not required.issubset(params):
+            raise SchemaValidationError("native v0.2 task.submit params are invalid")
+        version = params.get("capability_version", "1.0.0")
+        if not isinstance(version, str):
+            raise SchemaValidationError("native v0.2 task.submit capability_version is invalid")
+        digest = params.get("capability_contract_digest")
+        if digest is None:
+            try:
+                digest = capability_contract_tuple(Capability(id=str(params["capability"]), version=version)).capability_contract_digest
+            except Exception as exc:
+                raise SchemaValidationError("native v0.2 task.submit capability contract is invalid") from exc
+        result: JsonObject = {
+            "task_id": params["task_id"],
+            "method": params["capability"],
+            "capability_version": version,
+            "capability_contract_digest": digest,
+            "params": params["input"],
+            "deadline": params["deadline"],
+        }
+        return result
+    if envelope_type in {"task.accepted", "task.completed"}:
+        required = {
+            "task.accepted": {"task_id", "event_seq", "accepted_at", "capability", "capability_version", "capability_contract_digest"},
+            "task.completed": {"task_id", "event_seq", "terminal", "capability", "capability_version", "capability_contract_digest"},
+        }[envelope_type]
+        if set(params) != required:
+            raise SchemaValidationError(f"native v0.2 {envelope_type} params are invalid")
+        return {
+            **{key: params[key] for key in required if key != "capability"},
+            "capability_id": params["capability"],
+        }
+    if envelope_type == "task.rejected":
+        required = {"task_id", "event_seq", "code", "message"}
+        if not required.issubset(params):
+            raise SchemaValidationError("native v0.2 task.rejected params are invalid")
+        return {key: params[key] for key in required}
+    if envelope_type == "task.progress":
+        required = {"task_id", "event_seq", "progress"}
+        if not required.issubset(params):
+            raise SchemaValidationError("native v0.2 task.progress params are invalid")
+        return {key: params[key] for key in required}
+    if envelope_type == "error":
+        allowed = {"code", "message", "retryable", "details"}
+        required = {"code", "message", "retryable"}
+        if set(params) - allowed or not required.issubset(params):
+            raise SchemaValidationError("native v0.2 error params are invalid")
+        result = {
+            "category": "protocol",
+            "code": params["code"],
+            "message": params["message"],
+            "retryable": params["retryable"],
+            "retry_after_ms": None,
+        }
+        if "details" in params:
+            result["details"] = params["details"]
+        return result
+    return params
+
+
+def _legacy_task_params_to_native(envelope_type: str, value: JsonObject) -> JsonObject:
+    params = copy.deepcopy(value)
+    if envelope_type == "task.submit":
+        return {
+            "task_id": params["task_id"],
+            "capability": params["method"],
+            "input": params["params"],
+            "deadline": params["deadline"],
+            **({"capability_version": params["capability_version"]} if "capability_version" in params else {}),
+            **({"capability_contract_digest": params["capability_contract_digest"]} if "capability_contract_digest" in params else {}),
+        }
+    if envelope_type == "error":
+        result: JsonObject = {
+            "code": params["code"],
+            "message": params["message"],
+            "retryable": params["retryable"],
+        }
+        if "details" in params:
+            result["details"] = params["details"]
+        return result
+    if envelope_type in {"task.accepted", "task.completed"}:
+        capability_id = params.pop("capability_id", None)
+        if capability_id is not None:
+            params["capability"] = capability_id
+    return params
+
+
+def validate_v2_native_envelope(value: JsonValue | Mapping[str, Any], *, mesh_id: str | None = None) -> JsonObject:
+    """Validate and normalize the compact native-v2 application envelope.
+
+    The selected native profile carries mesh scope once at the envelope root,
+    and its durable delivery ID is nested below ``delivery``.  A validated
+    temporary v0.1 view keeps the shared task lifecycle grammar exact without
+    allowing either profile's outer fields to bleed into the other.
+    """
+
+    validate_json_tree(value)
+    if not isinstance(value, Mapping):
+        raise SchemaValidationError("native v0.2 envelope must be an object")
+    frame = dict(value)
+    allowed = {
+        "protocol", "profile", "mesh_id", "type", "message_id", "timestamp", "source", "target",
+        "delivery", "in_reply_to", "params",
+    }
+    required = {"protocol", "profile", "mesh_id", "type", "message_id", "timestamp", "source", "target", "delivery", "params"}
+    if set(frame) - allowed or not required.issubset(frame):
+        raise SchemaValidationError("native v0.2 envelope has unknown or missing fields")
+    if frame.get("protocol") != V2_PROTOCOL_VERSION or frame.get("profile") != V2_PROTOCOL_VERSION:
+        raise SchemaValidationError("native v0.2 envelope profile is invalid")
+    if not is_v2_native_uuid(frame.get("mesh_id")) or (mesh_id is not None and frame["mesh_id"] != mesh_id):
+        raise SchemaValidationError("native v0.2 envelope mesh scope is invalid")
+    if not isinstance(frame.get("type"), str) or frame["type"] not in {
+        "card", "task.submit", "task.accepted", "task.rejected", "task.progress", "task.completed",
+        "task.cancel", "task.status", "ping", "pong", "receipt", "error",
+    }:
+        raise SchemaValidationError("native v0.2 envelope type is invalid")
+    if not is_v2_native_uuid(frame.get("message_id")) or ("in_reply_to" in frame and not is_v2_native_uuid(frame["in_reply_to"])):
+        raise SchemaValidationError("native v0.2 envelope message identifier is invalid")
+    try:
+        parse_timestamp(frame.get("timestamp"))
+    except Exception as exc:
+        raise SchemaValidationError("native v0.2 envelope timestamp is invalid") from exc
+    source = _validate_v2_native_identity(frame.get("source"), required_instance=True)
+    target = _validate_v2_native_identity(frame.get("target"), required_instance=False)
+    delivery = frame.get("delivery")
+    if not isinstance(delivery, Mapping) or set(delivery) != {"delivery_id", "mode", "idempotency_key", "deadline"}:
+        raise SchemaValidationError("native v0.2 delivery is invalid")
+    if not is_v2_native_uuid(delivery.get("delivery_id")) or delivery.get("mode") != "at_least_once":
+        raise SchemaValidationError("native v0.2 delivery identifier or mode is invalid")
+    if not isinstance(delivery.get("idempotency_key"), str) or not delivery["idempotency_key"] or len(delivery["idempotency_key"].encode("utf-8")) > 256:
+        raise SchemaValidationError("native v0.2 idempotency key is invalid")
+    try:
+        parse_timestamp(delivery.get("deadline"))
+    except Exception as exc:
+        raise SchemaValidationError("native v0.2 delivery deadline is invalid") from exc
+    params = _native_v2_task_params_to_legacy(str(frame["type"]), frame.get("params"))
+    if frame["type"] == "task.submit" and params.get("deadline") != delivery["deadline"]:
+        raise SchemaValidationError("native v0.2 task.submit deadline must match delivery deadline")
+    legacy: JsonObject = {
+        "protocol": PROTOCOL_VERSION,
+        "type": frame["type"],
+        "message_id": frame["message_id"],
+        "timestamp": frame["timestamp"],
+        "source": source,
+        "target": target,
+        "delivery": {
+            "mode": "at_least_once",
+            "idempotency_key": delivery["idempotency_key"],
+            "deadline": delivery["deadline"],
+        },
+        "params": params,
+    }
+    if "in_reply_to" in frame:
+        legacy["in_reply_to"] = frame["in_reply_to"]
+    try:
+        checked = validate_envelope(legacy)
+    except Exception as exc:
+        raise SchemaValidationError("native v0.2 envelope payload is invalid") from exc
+    result: JsonObject = {
+        "protocol": V2_PROTOCOL_VERSION,
+        "profile": V2_PROTOCOL_VERSION,
+        "mesh_id": frame["mesh_id"],
+        "type": checked.type,
+        "message_id": checked.message_id,
+        "timestamp": checked.timestamp,
+        "source": source,
+        "target": target,
+        "delivery": {
+            "delivery_id": delivery["delivery_id"],
+            "mode": "at_least_once",
+            "idempotency_key": checked.delivery.idempotency_key,
+            "deadline": checked.delivery.deadline,
+        },
+        "params": _legacy_task_params_to_native(checked.type, checked.params),
+    }
+    if checked.in_reply_to is not None:
+        result["in_reply_to"] = checked.in_reply_to
+    return result
+
+
+def native_v2_envelope_as_legacy(value: JsonValue | Mapping[str, Any], *, mesh_id: str | None = None) -> Envelope:
+    """Convert one validated native-v2 envelope to the internal lifecycle view."""
+
+    checked = validate_v2_native_envelope(value, mesh_id=mesh_id)
+    delivery = checked["delivery"]
+    assert isinstance(delivery, dict)
+    legacy: JsonObject = {
+        "protocol": PROTOCOL_VERSION,
+        "type": checked["type"],
+        "message_id": checked["message_id"],
+        "timestamp": checked["timestamp"],
+        "source": checked["source"],
+        "target": checked["target"],
+        "delivery": {
+            "mode": delivery["mode"],
+            "idempotency_key": delivery["idempotency_key"],
+            "deadline": delivery["deadline"],
+        },
+        "params": _native_v2_task_params_to_legacy(str(checked["type"]), checked["params"]),
+    }
+    if "in_reply_to" in checked:
+        legacy["in_reply_to"] = checked["in_reply_to"]
+    return validate_envelope(legacy)
+
+
+def native_v2_envelope_from_legacy(
+    envelope: Envelope | Mapping[str, Any], *, mesh_id: str, delivery_id: str | None = None
+) -> JsonObject:
+    """Encode the internal lifecycle view as a closed native-v2 envelope."""
+
+    if not is_v2_native_uuid(mesh_id):
+        raise ValueError("native v0.2 mesh_id must be UUIDv7")
+    legacy = envelope if isinstance(envelope, Envelope) else validate_envelope(envelope)
+    deadline = legacy.delivery.deadline or format_timestamp(datetime.now(UTC) + timedelta(seconds=60))
+    wire: JsonObject = {
+        "protocol": V2_PROTOCOL_VERSION,
+        "profile": V2_PROTOCOL_VERSION,
+        "mesh_id": mesh_id,
+        "type": legacy.type,
+        "message_id": legacy.message_id,
+        "timestamp": legacy.timestamp,
+        "source": legacy.source.model_dump(mode="json", exclude_none=True),
+        "target": legacy.target.model_dump(mode="json", exclude_none=True),
+        "delivery": {
+            "delivery_id": delivery_id or uuidv7(),
+            "mode": legacy.delivery.mode.value,
+            "idempotency_key": legacy.delivery.idempotency_key,
+            "deadline": deadline,
+        },
+        "params": _legacy_task_params_to_native(legacy.type, legacy.params),
+    }
+    if legacy.in_reply_to is not None:
+        wire["in_reply_to"] = legacy.in_reply_to
+    return validate_v2_native_envelope(wire, mesh_id=mesh_id)
+
+
+def is_v2_mesh_id(value: Any) -> bool:
+    """Return whether *value* is a bounded v0.2 mesh routing scope."""
+
+    return isinstance(value, str) and V2_MESH_ID_RE.fullmatch(value) is not None
+
+
+def derive_v2_session_id(initiator_nonce: str, responder_nonce: str) -> str:
+    """Derive the profile-domain-separated v0.2 session identifier."""
+
+    initiator = base64url_decode_exact(initiator_nonce, 32)
+    responder = base64url_decode_exact(responder_nonce, 32)
+    return base64url_encode(hashlib.sha256(b"polymesh.0.2\x00" + initiator + responder).digest())
+
+
+def validate_v2_hello_frame(value: JsonValue | Mapping[str, Any]) -> JsonObject:
+    """Validate one closed v0.2 hello frame without admitting v0.1 fields.
+
+    The current durable TypeScript broker intentionally reuses card/auth/ready
+    records after this profile-selecting hello.  Keeping this parser separate
+    from :func:`validate_handshake_frame` makes the selection explicit and
+    prevents an untrusted ``v`` member from being treated as an optional v0.1
+    extension.
+    """
+
+    validate_json_tree(value)
+    if not isinstance(value, Mapping):
+        raise SchemaValidationError("v0.2 hello frame must be an object")
+    frame = dict(value)
+    role = frame.get("role")
+    if frame.get("type") != "hello" or frame.get("v") != V2_HANDSHAKE_VERSION or role not in {"initiator", "responder"}:
+        raise SchemaValidationError("invalid v0.2 hello frame")
+    common = {"type", "v", "role", "agent_id", "instance_id", "nonce", "mesh_id", "security_profile"}
+    responder = common | {"echo", "sid"}
+    allowed = common if role == "initiator" else responder
+    required = {"type", "v", "role", "agent_id", "instance_id", "nonce"}
+    if role == "responder":
+        required |= {"echo", "sid"}
+    if set(frame) - allowed or not required.issubset(frame):
+        raise SchemaValidationError("invalid v0.2 hello frame")
+    try:
+        # These local models supply the exact bounded agent/instance/nonce
+        # grammar used by both profiles.  Do not use InitiatorHello here: its
+        # literal v field is intentionally fixed to 0.1.
+        AgentIdentity.model_validate({"agent_id": frame["agent_id"], "instance_id": frame["instance_id"]})
+        base64url_decode_exact(str(frame["nonce"]), 32)
+        if role == "responder":
+            base64url_decode_exact(str(frame["echo"]), 32)
+            base64url_decode_exact(str(frame["sid"]), 32)
+    except Exception as exc:
+        raise SchemaValidationError("invalid v0.2 hello frame") from exc
+    if frame.get("mesh_id") is not None and not is_v2_mesh_id(frame["mesh_id"]):
+        raise SchemaValidationError("invalid v0.2 mesh identity")
+    if frame.get("security_profile") is not None and frame["security_profile"] != SECURE_IDENTITY_PROFILE:
+        raise SchemaValidationError("unsupported v0.2 security profile")
+    # Optional members use omission rather than JSON null, matching v0.1.
+    if "mesh_id" in frame and frame["mesh_id"] is None:
+        raise SchemaValidationError("v0.2 mesh_id must be omitted rather than null")
+    if "security_profile" in frame and frame["security_profile"] is None:
+        raise SchemaValidationError("v0.2 security_profile must be omitted rather than null")
+    return frame
+
+
+def is_v2_hello_frame(value: Any) -> bool:
+    try:
+        validate_v2_hello_frame(value)
+        return True
+    except ProtocolError:
+        return False
+
+
+def validate_v2_envelope(value: JsonValue | Mapping[str, Any], *, mesh_id: str | None = None) -> JsonObject:
+    """Validate a legacy-broker-compatible v0.2 application envelope.
+
+    v0.2 adds mesh-scoped addresses and optional relay-owned ``delivery_id``
+    metadata while retaining the closed v0.1 task/control payload grammar.
+    The latter is validated through a temporary v0.1 view so both SDKs make
+    the same lifecycle decisions without allowing v0.2 fields into v0.1.
+    """
+
+    validate_json_tree(value)
+    if not isinstance(value, Mapping):
+        raise SchemaValidationError("v0.2 envelope must be an object")
+    frame = dict(value)
+    allowed = {
+        "protocol", "type", "message_id", "timestamp", "source", "target", "delivery",
+        "delivery_id", "in_reply_to", "params",
+    }
+    required = {"protocol", "type", "message_id", "timestamp", "source", "target", "delivery", "params"}
+    if frame.get("protocol") != V2_PROTOCOL_VERSION or set(frame) - allowed or not required.issubset(frame):
+        raise SchemaValidationError("invalid v0.2 envelope")
+    source = frame.get("source")
+    target = frame.get("target")
+    if not isinstance(source, Mapping) or not isinstance(target, Mapping):
+        raise SchemaValidationError("v0.2 envelope addresses are invalid")
+    if set(source) != {"mesh_id", "agent_id", "instance_id"} or set(target) - {"mesh_id", "agent_id", "instance_id"} or not {"mesh_id", "agent_id"}.issubset(target):
+        raise SchemaValidationError("v0.2 envelope addresses are invalid")
+    if not is_v2_mesh_id(source.get("mesh_id")) or not is_v2_mesh_id(target.get("mesh_id")):
+        raise SchemaValidationError("v0.2 envelope mesh identities are invalid")
+    if mesh_id is not None and (source["mesh_id"] != mesh_id or target["mesh_id"] != mesh_id):
+        raise SchemaValidationError("v0.2 envelope mesh scope does not match session")
+    if "delivery_id" in frame:
+        try:
+            # UUIDv7 is accepted by the legacy model's message_id field.
+            Envelope.model_validate({
+                "protocol": PROTOCOL_VERSION,
+                "type": "ping",
+                "message_id": frame["delivery_id"],
+                "timestamp": frame["timestamp"],
+                "source": {"agent_id": source.get("agent_id"), "instance_id": source.get("instance_id")},
+                "target": {"agent_id": target.get("agent_id")},
+                "delivery": {"mode": "at_least_once", "idempotency_key": "v2-delivery-id", "deadline": frame["timestamp"]},
+                "params": {"n": 0},
+            }, context={"polymesh.strict_wire": True})
+        except Exception as exc:
+            raise SchemaValidationError("v0.2 delivery_id must be UUIDv7") from exc
+    legacy = {
+        **{key: item for key, item in frame.items() if key != "delivery_id"},
+        "protocol": PROTOCOL_VERSION,
+        "source": {"agent_id": source.get("agent_id"), "instance_id": source.get("instance_id")},
+        "target": ({"agent_id": target.get("agent_id")} if target.get("instance_id") is None else {"agent_id": target.get("agent_id"), "instance_id": target.get("instance_id")}),
+    }
+    try:
+        checked = validate_envelope(legacy)
+    except Exception as exc:
+        raise SchemaValidationError("invalid v0.2 envelope") from exc
+    normalized = checked.model_dump(mode="json", exclude_none=True)
+    normalized["protocol"] = V2_PROTOCOL_VERSION
+    normalized["source"] = {"mesh_id": source["mesh_id"], **normalized["source"]}
+    normalized["target"] = {"mesh_id": target["mesh_id"], **normalized["target"]}
+    if "delivery_id" in frame:
+        normalized["delivery_id"] = frame["delivery_id"]
+    return normalized
+
+
+def is_v2_envelope(value: Any, *, mesh_id: str | None = None) -> bool:
+    try:
+        validate_v2_envelope(value, mesh_id=mesh_id)
+        return True
+    except ProtocolError:
+        return False
+
+
+def v2_envelope_as_legacy(value: JsonValue | Mapping[str, Any], *, mesh_id: str | None = None) -> Envelope:
+    """Return the validated v0.1 lifecycle view of one v0.2 envelope."""
+
+    checked = validate_v2_envelope(value, mesh_id=mesh_id)
+    source = checked["source"]
+    target = checked["target"]
+    assert isinstance(source, dict) and isinstance(target, dict)
+    legacy = {
+        **{key: item for key, item in checked.items() if key != "delivery_id"},
+        "protocol": PROTOCOL_VERSION,
+        "source": {"agent_id": source["agent_id"], "instance_id": source["instance_id"]},
+        "target": {key: item for key, item in target.items() if key != "mesh_id"},
+    }
+    return validate_envelope(legacy)
+
+
+def v2_envelope_from_legacy(envelope: Envelope | Mapping[str, Any], *, mesh_id: str, delivery_id: str | None = None) -> JsonObject:
+    """Create a mesh-scoped v0.2 wire view from a validated v0.1 envelope."""
+
+    if not is_v2_mesh_id(mesh_id):
+        raise ValueError("mesh_id is invalid")
+    legacy = envelope if isinstance(envelope, Envelope) else validate_envelope(envelope)
+    result: JsonObject = legacy.model_dump(mode="json", exclude_none=True)
+    result["protocol"] = V2_PROTOCOL_VERSION
+    result["source"] = {"mesh_id": mesh_id, **result["source"]}
+    result["target"] = {"mesh_id": mesh_id, **result["target"]}
+    if delivery_id is not None:
+        result["delivery_id"] = delivery_id
+    return validate_v2_envelope(result, mesh_id=mesh_id)
 
 
 def _model_json(model: BaseModel | Mapping[str, Any]) -> JsonObject:
@@ -967,6 +1562,68 @@ def auth_transcript(
         "tls_channel_binding": tls_channel_binding,
     }
     return b"PMX-AUTH/0.1\x00" + canonical_json(value).encode("utf-8")
+
+
+def v2_auth_transcript(
+    *,
+    initiator_hello: Mapping[str, Any],
+    responder_hello: Mapping[str, Any],
+    initiator_card_digest: str,
+    responder_card_digest: str,
+    tls_channel_binding: str,
+) -> bytes:
+    """Build the TLS-bound, domain-separated secure v0.2 transcript.
+
+    v0.2 deliberately reuses the concrete ``auth`` record shape, but not the
+    proof bytes.  The profile/version domain and v2 hello objects make a proof
+    from a v0.1 connection unusable here.
+    """
+
+    initiator = validate_v2_hello_frame(initiator_hello)
+    responder = validate_v2_hello_frame(responder_hello)
+    if initiator.get("role") != "initiator" or responder.get("role") != "responder":
+        raise AuthenticationError("invalid v0.2 secure handshake transcript")
+    if responder.get("echo") != initiator.get("nonce") or responder.get("sid") != derive_v2_session_id(str(initiator["nonce"]), str(responder["nonce"])):
+        raise AuthenticationError("invalid v0.2 secure handshake transcript")
+    if not isinstance(initiator_card_digest, str) or not isinstance(responder_card_digest, str) or (
+        re.fullmatch(r"[0-9a-fA-F]{64}", initiator_card_digest) is None
+        or re.fullmatch(r"[0-9a-fA-F]{64}", responder_card_digest) is None
+    ):
+        raise AuthenticationError("invalid v0.2 secure card digest")
+    base64url_decode_exact(tls_channel_binding, 32)
+    value: JsonObject = {
+        "protocol": V2_PROTOCOL_VERSION,
+        "handshake_version": V2_HANDSHAKE_VERSION,
+        "initiator_hello": initiator,
+        "responder_hello": responder,
+        "initiator_card_digest": initiator_card_digest,
+        "responder_card_digest": responder_card_digest,
+        "tls_channel_binding": tls_channel_binding,
+    }
+    return b"PMX-AUTH/0.2\x00" + canonical_json(value).encode("utf-8")
+
+
+def create_v2_auth_proof(
+    identity: CardIdentity,
+    agent_id: str,
+    sid: str,
+    transcript: bytes,
+    private_key: Any,
+) -> AuthFrame:
+    """Sign an already domain-separated v0.2 transcript."""
+
+    return create_auth_proof(identity, agent_id, sid, transcript, private_key)
+
+
+def verify_v2_auth_proof(
+    proof: AuthFrame | Mapping[str, Any],
+    transcript: bytes,
+    enrollments: EnrollmentStore | Sequence[Enrollment | Mapping[str, Any]],
+    now: datetime | float | None = None,
+) -> VerifiedPrincipal | None:
+    """Verify v0.2 proof possession against a preconfigured enrollment store."""
+
+    return verify_auth_proof(proof, transcript, enrollments, now)
 
 
 def create_auth_proof(

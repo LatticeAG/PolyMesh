@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.polymesh.dev/v2/envelope-v2.json",
+  "title": "PolyMesh native v2 envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "profile",
+    "mesh_id",
+    "type",
+    "message_id",
+    "timestamp",
+    "source",
+    "target",
+    "delivery",
+    "params"
+  ],
+  "properties": {
+    "protocol": {
+      "$ref": "common.json#/$defs/Profile"
+    },
+    "profile": {
+      "$ref": "common.json#/$defs/Profile"
+    },
+    "mesh_id": {
+      "$ref": "common.json#/$defs/MeshId"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "card",
+        "task.submit",
+        "task.accepted",
+        "task.rejected",
+        "task.progress",
+        "task.completed",
+        "task.cancel",
+        "task.status",
+        "ping",
+        "pong",
+        "receipt",
+        "error"
+      ]
+    },
+    "message_id": {
+      "$ref": "common.json#/$defs/UuidV7"
+    },
+    "timestamp": {
+      "$ref": "common.json#/$defs/DateTime"
+    },
+    "source": {
+      "$ref": "common.json#/$defs/AgentIdentity"
+    },
+    "target": {
+      "$ref": "common.json#/$defs/AgentRef"
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivery_id",
+        "mode",
+        "idempotency_key",
+        "deadline"
+      ],
+      "properties": {
+        "delivery_id": {
+          "$ref": "common.json#/$defs/UuidV7"
+        },
+        "mode": {
+          "const": "at_least_once"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "deadline": {
+          "$ref": "common.json#/$defs/DateTime"
+        }
+      }
+    },
+    "in_reply_to": {
+      "$ref": "common.json#/$defs/UuidV7"
+    },
+    "params": {
+      "$ref": "common.json#/$defs/JsonObject"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "task.submit"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/TaskSubmitParams"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "error"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "required": [
+          "in_reply_to"
+        ],
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ErrorParams"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "TaskSubmitParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "capability",
+        "input",
+        "deadline"
+      ],
+      "properties": {
+        "task_id": {
+          "$ref": "common.json#/$defs/UuidV7"
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "capability_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "capability_contract_digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "input": {
+          "$ref": "common.json#/$defs/JsonValue"
+        },
+        "deadline": {
+          "$ref": "common.json#/$defs/DateTime"
+        }
+      }
+    },
+    "ErrorParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "common.json#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "$ref": "common.json#/$defs/JsonObject"
+        }
+      }
+    }
+  }
+}

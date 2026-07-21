@@ -42,6 +42,12 @@ JsonObject: TypeAlias = dict[str, Any]
 PROTOCOL_VERSION: Final = "polymesh.0.1"
 HANDSHAKE_VERSION: Final = "0.1"
 CARD_VERSION: Final = "1.0"
+# ``polymesh.0.2`` is a separately selected wire profile.  It intentionally
+# does not change any of the v0.1 Pydantic models below: callers select it at
+# the transport/session boundary before a hello is sent.
+V2_PROTOCOL_VERSION: Final = "polymesh.0.2"
+V2_HANDSHAKE_VERSION: Final = "0.2"
+V2_SUBPROTOCOL: Final = V2_PROTOCOL_VERSION
 SECURE_IDENTITY_PROFILE: Final = "enrolled-ed25519-tls-1.3"
 ROUTED_PROVENANCE_VERSION: Final = "pmx.broker-provenance/1"
 
