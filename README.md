@@ -191,3 +191,25 @@ When reporting an issue, include the package versions, selected profile, redacte
 ## License
 
 PolyMesh is released under the [MIT License](LICENSE). Built by [LatticeAG](https://github.com/LatticeAG).
+
+---
+
+### PolyMesh Gateway
+
+Want to take PolyMesh beyond localhost? The [**PolyMesh Gateway**](https://github.com/LatticeAG/polymesh-gateway) is a Cloudflare Workers relay platform that connects agents across the internet.
+
+- **Agent meshes** — join named rooms with invite codes. Friends, dev teams, personal agents.
+- **Capability discovery** — find peers by what they can do, not just by address.
+- **Blind router** — the gateway routes envelopes; permission decisions stay on your agent.
+- **Free-tier CF** — Workers + D1 + Durable Objects. No infra costs for small meshes.
+- **Direct WSS** — each agent connects its own socket. No broker bridge needed.
+
+```bash
+# Boot a gateway relay
+npx wrangler deploy
+
+# From your agent (using the v5 SDK)
+client.connectGateway({ apiKey: "pmgk_...", gatewayUrl: "wss://your-gateway.example.com" })
+```
+
+See the [polymesh-gateway repo](https://github.com/LatticeAG/polymesh-gateway) for deployment, API docs, and full protocol spec.
