@@ -7,6 +7,7 @@ import base64
 import contextlib
 import copy
 import inspect
+import re
 import threading
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -87,6 +88,7 @@ from .transport import (
 )
 from .types import (
     AgentCard,
+    AgentCardBuilder,
     AgentIdentity,
     AgentRef,
     AuthFrame,
@@ -427,7 +429,7 @@ class PolyMeshClient:
     def __init__(
         self,
         *,
-        card: AgentCard,
+        card: AgentCard | None = None,
         broker_url: str | None = None,
         token: str | None = None,
         token_store: TokenStore | None = None,
@@ -448,26 +450,56 @@ class PolyMeshClient:
         replay_ledger: Any | None = None,
         transport_factory: Callable[[], Awaitable[WireTransport] | WireTransport] | None = None,
         clock: Any | None = None,
+        transport: str | None = None,
+        gateway_url: str | None = None,
+        api_key: str | None = None,
+        agent_id: str | None = None,
         **legacy: Any,
     ) -> None:
         if legacy:
             unknown = ", ".join(sorted(legacy))
             raise TypeError(f"unexpected PolyMeshClient option(s): {unknown}")
+
+        gateway_mode = transport == "gateway"
+        if transport is not None and transport != "gateway":
+            raise TypeError('transport must be "gateway" when set (broker mode omits transport)')
+        if not gateway_mode and (gateway_url is not None or api_key is not None):
+            raise TypeError('gateway_url/api_key require transport="gateway"')
+        if gateway_mode:
+            if identity is not None:
+                raise TypeError("Gateway transport cannot be combined with the enrolled identity profile")
+            if broker_url is not None or token is not None or token_store is not None:
+                raise TypeError("Gateway transport uses gateway_url/api_key rather than broker_url/token")
+            if transport_factory is not None:
+                raise TypeError("Gateway transport cannot be combined with a broker transport_factory")
+        self._gateway_mode = gateway_mode
+        self._gateway: Any | None = None
+
+        if card is None:
+            if not gateway_mode:
+                raise TypeError("card is required unless transport=\"gateway\"")
+            safe_id = (
+                agent_id
+                if isinstance(agent_id, str) and agent_id and re.fullmatch(r"^[a-zA-Z][a-zA-Z0-9._-]*$", agent_id)
+                else "gateway.agent"
+            )
+            card = AgentCardBuilder(safe_id).build()
         self.card = AgentCard.model_validate(card)
         if profile not in {PROTOCOL_VERSION, V2_PROTOCOL_VERSION}:
             raise ValueError("profile must be polymesh.0.1 or polymesh.0.2")
-        if mesh_id is not None and not is_v2_mesh_id(mesh_id):
-            raise ValueError("mesh_id is not a valid PolyMesh v2 mesh identity")
-        if profile == PROTOCOL_VERSION and mesh_id is not None:
-            raise ValueError("mesh_id is available only for profile='polymesh.0.2'")
+        if not gateway_mode:
+            if mesh_id is not None and not is_v2_mesh_id(mesh_id):
+                raise ValueError("mesh_id is not a valid PolyMesh v2 mesh identity")
+            if profile == PROTOCOL_VERSION and mesh_id is not None:
+                raise ValueError("mesh_id is available only for profile='polymesh.0.2'")
+            if mesh_id is not None and profile == V2_PROTOCOL_VERSION and v2_handshake != "legacy" and not is_v2_native_uuid(mesh_id):
+                raise ValueError("native polymesh.0.2 mesh_id must be a UUIDv7")
         if not isinstance(compression, bool):
             raise TypeError("compression must be a boolean")
         if v2_handshake not in {"auto", "native", "legacy"}:
             raise ValueError("v2_handshake must be 'auto', 'native', or 'legacy'")
         if profile == PROTOCOL_VERSION and v2_handshake != "auto":
             raise ValueError("v2_handshake is available only for profile='polymesh.0.2'")
-        if mesh_id is not None and profile == V2_PROTOCOL_VERSION and v2_handshake != "legacy" and not is_v2_native_uuid(mesh_id):
-            raise ValueError("native polymesh.0.2 mesh_id must be a UUIDv7")
         limits_source: Mapping[str, Any] = compression_limits or {
             "maxCompressedBytes": MAX_FRAME_BYTES,
             "maxUncompressedBytes": MAX_FRAME_BYTES,
@@ -569,6 +601,17 @@ class PolyMeshClient:
             for capability, handler in handlers.items():
                 self.set_handler(capability, handler)
 
+        if gateway_mode:
+            from .gateway_transport import GatewayTransport
+
+            self._gateway = GatewayTransport(
+                api_key=api_key,
+                gateway_url=gateway_url,
+                agent_id=agent_id,
+                mesh_id=mesh_id,
+            )
+            self._gateway._event_bridge = self._emit  # type: ignore[attr-defined]
+
     @property
     def phase(self) -> ClientPhase:
         return self._phase
@@ -579,7 +622,17 @@ class PolyMeshClient:
 
     @property
     def connected(self) -> bool:
+        if self._gateway_mode:
+            return bool(self._gateway is not None and self._gateway.connected)
         return self._phase is ClientPhase.ACTIVE and self._transport is not None and not self._transport.closed
+
+    @property
+    def is_gateway_transport(self) -> bool:
+        return self._gateway_mode
+
+    @property
+    def gateway(self) -> Any | None:
+        return self._gateway
 
     @property
     def broker_url(self) -> str | None:
@@ -633,10 +686,23 @@ class PolyMeshClient:
         return loop
 
     async def __aenter__(self) -> "PolyMeshClient":
+        if self._gateway_mode:
+            # Gateway mode: do not auto-connect (SPEC §4.2 / §3.4).
+            return self
         await self.connect()
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        if self._gateway_mode and self._gateway is not None:
+            try:
+                if self._gateway.current_mesh_id is not None:
+                    await self._gateway.leave_mesh()
+                else:
+                    await self._gateway.close()
+            finally:
+                self._phase = ClientPhase.CLOSED
+                self._connection_state = ConnectionState.CLOSED
+            return
         await self.disconnect()
 
     def set_handler(self, capability: str, handler: TaskHandler) -> "PolyMeshClient":
@@ -704,6 +770,8 @@ class PolyMeshClient:
             yield await self._envelope_queue.get()
 
     async def connect(self, url: str | None = None) -> "PolyMeshClient":
+        if self._gateway_mode:
+            return await self.connect_gateway()
         self._bind_loop()
         if url is not None:
             self._broker_url = url
@@ -772,6 +840,13 @@ class PolyMeshClient:
         }
 
     async def connect_transport(self, transport: WireTransport) -> "PolyMeshClient":
+        if self._gateway_mode:
+            from .gateway_transport import GatewayTransportError
+
+            raise GatewayTransportError(
+                "GATEWAY_MODE_ACTIVE",
+                'connect_transport() is not available when transport is "gateway"',
+            )
         self._bind_loop()
         if not isinstance(transport, WireTransport):
             raise TypeError("transport must implement async WireTransport")
@@ -826,6 +901,75 @@ class PolyMeshClient:
                 await self._start_v2_compression(generation)
         self._emit("ready", self)
         return self
+
+    def _require_gateway_mode(self, method: str) -> Any:
+        from .gateway_transport import GatewayTransportError
+
+        if not self._gateway_mode or self._gateway is None:
+            raise GatewayTransportError(
+                "GATEWAY_MODE_REQUIRED",
+                f'{method}() requires transport="gateway"',
+            )
+        return self._gateway
+
+    async def connect_gateway(
+        self,
+        api_key: str | None = None,
+        gateway_url: str | None = None,
+    ) -> "PolyMeshClient":
+        gateway = self._require_gateway_mode("connect_gateway")
+        self._bind_loop()
+        self._disconnecting = False
+        await gateway.connect_gateway(api_key, gateway_url)
+        self._phase = ClientPhase.ACTIVE
+        self._connection_state = ConnectionState.ACTIVE
+        self._emit("ready", self)
+        return self
+
+    async def join_mesh(
+        self,
+        mesh_id: str,
+        *,
+        invite_code: str | None = None,
+        capabilities: Any = None,
+        display_name: str | None = None,
+    ) -> Any:
+        gateway = self._require_gateway_mode("join_mesh")
+        result = await gateway.join_mesh(
+            mesh_id,
+            invite_code=invite_code,
+            capabilities=capabilities,
+            display_name=display_name,
+        )
+        joined_mesh = result.get("mesh_id") if isinstance(result, dict) else None
+        if isinstance(joined_mesh, str):
+            self._mesh_id = joined_mesh
+        return result
+
+    async def discover_agents(self, query: Any = None, /, **filters: Any) -> Any:
+        gateway = self._require_gateway_mode("discover_agents")
+        if query is None:
+            return await gateway.discover_agents(**filters)
+        return await gateway.discover_agents(query, **filters)
+
+    async def leave_mesh(self) -> None:
+        gateway = self._require_gateway_mode("leave_mesh")
+        await gateway.leave_mesh()
+        self._mesh_id = None
+        self._phase = ClientPhase.CLOSED
+        self._connection_state = ConnectionState.CLOSED
+        self._emit("close", {"code": 1000, "reason": "mesh.leave"})
+
+    async def submit_task(
+        self,
+        target: str,
+        capability: str,
+        payload: JsonValue,
+        *,
+        task_id: str | None = None,
+    ) -> str:
+        gateway = self._require_gateway_mode("submit_task")
+        return await gateway.submit_task(target, capability, payload, task_id=task_id)
 
     async def _handshake(self, transport: WireTransport, generation: int) -> None:
         if self._profile == V2_PROTOCOL_VERSION:
@@ -1149,6 +1293,20 @@ class PolyMeshClient:
         return await self.connect()
 
     async def disconnect(self, code: int = 1000, reason: str = "client closed", wait: bool = True) -> None:
+        if self._gateway_mode and self._gateway is not None:
+            self._bind_loop()
+            self._disconnecting = True
+            gateway = self._gateway
+            try:
+                if gateway.current_mesh_id is not None:
+                    await gateway.leave_mesh()
+                else:
+                    await gateway.close(code, reason)
+            finally:
+                self._phase = ClientPhase.CLOSED
+                self._connection_state = ConnectionState.CLOSED
+                self._emit("close", {"code": code, "reason": reason})
+            return
         self._bind_loop()
         self._disconnecting = True
         self._generation += 1

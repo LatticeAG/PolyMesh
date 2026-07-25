@@ -14,7 +14,7 @@ import {
   type AgentCard,
 } from "@latticeag/polymesh-broker";
 import { PolyMeshClient, type ClientOptions } from "./client.js";
-import { loadCliConfig, redactCliConfig, type CliConfigOverrides } from "./config.js";
+import { loadCliConfig, redactCliConfig, resolveGatewayApiKey, type CliConfigOverrides } from "./config.js";
 import { advertiseMdns, discoverMdns, type MdnsHandle, type MdnsPeer } from "./mdns.js";
 
 export interface CliIo {
@@ -48,10 +48,12 @@ interface ParsedArgs {
 const usage = `Usage:
   polymesh config show [--config FILE]
   polymesh start [--config FILE] [--port 7337] [--host 127.0.0.1] [--token-file FILE] [--insecure-loopback-dev] [--mdns]
-  polymesh connect [<wss-url>] [--config FILE] [--card FILE] [--token-file FILE] [--insecure-loopback-dev]
+  polymesh connect [<wss-url>] [--config FILE] [--card FILE] [--token-file FILE] [--gateway-url URL] [--api-key KEY] [--api-key-file FILE] [--mesh ID] [--insecure-loopback-dev]
   polymesh peers [--config FILE] [--mdns | --no-mdns]
   polymesh capabilities [--card FILE]
   polymesh call <agent> <capability> <json-input> [--config FILE] [--url URL] [--timeout MS] [--token-file FILE] [--insecure-loopback-dev]
+
+Broker --token-file is for runtime broker tokens only; gateway API keys use --api-key-file or [gateway].api_key_file.
 `;
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -133,6 +135,10 @@ function configOverridesFromFlags(parsed: ParsedArgs): CliConfigOverrides {
   const token = requiredFlagValue(parsed, "token-file");
   const timeout = numericFlagValue(parsed, "timeout");
   const mdnsInterval = numericFlagValue(parsed, "mdns-interval");
+  const gatewayUrl = requiredFlagValue(parsed, "gateway-url");
+  const apiKey = requiredFlagValue(parsed, "api-key");
+  const apiKeyFile = requiredFlagValue(parsed, "api-key-file");
+  const meshId = requiredFlagValue(parsed, "mesh");
   return {
     ...(host === undefined && port === undefined && token === undefined ? {} : {
       broker: {
@@ -147,6 +153,14 @@ function configOverridesFromFlags(parsed: ParsedArgs): CliConfigOverrides {
         ...(hasFlag(parsed, "mdns") ? { mdns_enabled: true } : {}),
         ...(hasFlag(parsed, "no-mdns") ? { mdns_enabled: false } : {}),
         ...(mdnsInterval === undefined ? {} : { mdns_interval: mdnsInterval }),
+      },
+    }),
+    ...(gatewayUrl === undefined && apiKey === undefined && apiKeyFile === undefined && meshId === undefined ? {} : {
+      gateway: {
+        ...(gatewayUrl === undefined ? {} : { url: gatewayUrl }),
+        ...(apiKey === undefined ? {} : { api_key: apiKey }),
+        ...(apiKeyFile === undefined ? {} : { api_key_file: apiKeyFile }),
+        ...(meshId === undefined ? {} : { mesh_id: meshId }),
       },
     }),
   };
@@ -239,6 +253,28 @@ export async function main(argv: string[] = process.argv.slice(2), deps: CliDeps
         return 0;
       }
       case "connect": {
+        const gatewayUrl = config.gateway?.url ?? flag(parsed, "gateway-url");
+        if (gatewayUrl !== undefined) {
+          const card = await loadCard(cardPath, deps);
+          const apiKey = await resolveGatewayApiKey(config.gateway, deps.readFile ?? nodeReadFile);
+          const client = createClient({
+            transport: "gateway",
+            gatewayUrl,
+            apiKey,
+            card,
+            defaultTimeoutMs: config.client.default_timeout,
+            ...(config.gateway?.request_timeout_ms === undefined ? {} : {
+              gateway: { requestTimeoutMs: config.gateway.request_timeout_ms },
+            }),
+          });
+          await client.connect();
+          if (config.gateway?.mesh_id !== undefined) {
+            await client.joinMesh(config.gateway.mesh_id);
+          }
+          write(io, { connected: true, transport: "gateway", gateway_url: gatewayUrl });
+          client.close();
+          return 0;
+        }
         const url = parsed.positionals[0] ?? flag(parsed, "url") ?? env.POLYMESH_URL ?? configuredBrokerUrl(config.broker);
         const card = await loadCard(cardPath, deps);
         const token = await loadRuntimeToken(tokenFile, deps);

@@ -31,6 +31,10 @@
       "types": "./dist/config.d.ts",
       "default": "./dist/config.js"
     },
+    "./gateway-transport": {
+      "types": "./dist/gateway-transport.d.ts",
+      "default": "./dist/gateway-transport.js"
+    },
     "./mdns": {
       "types": "./dist/mdns.d.ts",
       "default": "./dist/mdns.js"

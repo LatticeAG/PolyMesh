@@ -3,6 +3,7 @@ export * from "./client.js";
 export * from "./cli.js";
 export * from "./config.js";
 export * from "./deckagent-carrier.js";
+export * from "./gateway-transport.js";
 export * from "./mdns.js";
 export * from "./policy.js";
 export * from "./replay-ledger.js";

@@ -160,6 +160,10 @@ def _option_overrides(
     url: str | None,
     timeout: int | None,
     insecure_loopback_dev: bool | None,
+    gateway_url: str | None = None,
+    api_key: str | None = None,
+    api_key_file: str | None = None,
+    mesh_id: str | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {}
     client: dict[str, Any] = {}
@@ -185,6 +189,17 @@ def _option_overrides(
         broker["insecure_loopback_dev"] = insecure_loopback_dev
     if broker:
         data["broker"] = broker
+    gateway: dict[str, Any] = {}
+    if gateway_url is not None:
+        gateway["url"] = gateway_url
+    if api_key is not None:
+        gateway["api_key"] = api_key
+    if api_key_file is not None:
+        gateway["api_key_file"] = api_key_file
+    if mesh_id is not None:
+        gateway["mesh_id"] = mesh_id
+    if gateway:
+        data["gateway"] = gateway
     if output_format is not None:
         data["output"] = {"format": output_format}
     return data
@@ -204,10 +219,14 @@ def _reject_raw_credential(_ctx: click.Context, _param: click.Parameter, value: 
 @click.option("--config", "config_path", type=click.Path(path_type=Path, dir_okay=False), default=None, help="TOML config path")
 @click.option("--format", "output_format", type=click.Choice(["json", "table", "plain"]), default=None)
 @click.option("--card", type=click.Path(path_type=Path, dir_okay=False), default=None, help="Agent Card JSON path")
-@click.option("--token-file", type=click.Path(path_type=Path, dir_okay=False), default=None, help="Runtime token file path")
+@click.option("--token-file", type=click.Path(path_type=Path, dir_okay=False), default=None, help="Runtime token file path (broker only; not gateway API keys)")
 @click.option("--url", default=None, help="Broker WebSocket endpoint")
 @click.option("--timeout", type=click.IntRange(min=1, max=86_400_000), default=None, help="Call timeout in milliseconds")
 @click.option("--insecure-loopback-dev/--no-insecure-loopback-dev", default=None, help="Permit ws:// numeric loopback only")
+@click.option("--gateway-url", default=None, help="PolyMesh Gateway base URL (ws/wss/http/https)")
+@click.option("--api-key", default=None, help="Gateway API key (discouraged; prefer --api-key-file)")
+@click.option("--api-key-file", type=click.Path(path_type=Path, dir_okay=False), default=None, help="Gateway API key file path")
+@click.option("--mesh", "mesh_id", default=None, help="Default gateway mesh id")
 @click.option("--quiet", is_flag=True, default=False, help="Suppress non-result diagnostics")
 @click.option("--token", hidden=True, expose_value=False, callback=_reject_raw_credential)
 @click.option("--private-key", hidden=True, expose_value=False, callback=_reject_raw_credential)
@@ -222,6 +241,10 @@ def main(
     url: str | None,
     timeout: int | None,
     insecure_loopback_dev: bool | None,
+    gateway_url: str | None,
+    api_key: str | None,
+    api_key_file: Path | None,
+    mesh_id: str | None,
     quiet: bool,
 ) -> None:
     """PolyMesh v0.1 command-line tools."""
@@ -241,6 +264,10 @@ def main(
                 url=url,
                 timeout=timeout,
                 insecure_loopback_dev=insecure_loopback_dev,
+                gateway_url=gateway_url,
+                api_key=api_key,
+                api_key_file=str(api_key_file) if api_key_file is not None else None,
+                mesh_id=mesh_id,
             ),
         )
     except ConfigError as exc:

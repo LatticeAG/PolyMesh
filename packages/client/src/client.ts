@@ -23,6 +23,7 @@ import {
   createAuthProof,
   createCardIdentityFromPrivateKey,
   createEnvelope,
+  createAgentCard,
   V2ZstdStateMachine,
   decodeRuntimeToken,
   deriveSessionId,
@@ -85,6 +86,13 @@ import {
   type ReplayLedgerRecord,
   type ReplayPrincipal,
 } from "./replay-ledger.js";
+import {
+  GatewayTransport,
+  type GatewayDiscoverQuery,
+  type GatewayDiscoverResult,
+  type GatewayJoinMeshOptions,
+  type GatewayTransportOptions,
+} from "./gateway-transport.js";
 
 export type ClientPhase = "idle" | "await_hello" | "await_card" | "await_auth" | "await_ready" | "active" | "closed";
 
@@ -177,7 +185,11 @@ export interface SecureIdentityOptions {
 }
 
 export interface ClientOptions {
-  card: AgentCard;
+  /**
+   * Local agent card. Required for broker loopback/WSS sessions. Optional when
+   * `transport: "gateway"` — the gateway issues agent identity via JWT.
+   */
+  card?: AgentCard;
   /** Select native `polymesh.0.2`; v0.1 remains the default. */
   profile?: ClientProfile;
   /** Optional native-v2 broker mesh hint. The v2.ack selection is authoritative. */
@@ -199,7 +211,23 @@ export interface ClientOptions {
   identity?: SecureIdentityOptions;
   /** mTLS trust material used only with the enrolled-key WSS profile. */
   tls?: Pick<TlsConnectionOptions, "ca" | "cert" | "key" | "servername">;
-  transport?: ClientTransport | WireTransport;
+  /**
+   * Injected carrier, or the named `"gateway"` mode that speaks the PolyMesh
+   * Gateway relay protocol (auth → JWT → WSS). Existing loopback/WSS URL
+   * modes are unchanged.
+   */
+  transport?: ClientTransport | WireTransport | "gateway";
+  /** Gateway relay base URL (`wss://…` or `https://…`). Used when `transport: "gateway"`. */
+  gatewayUrl?: string;
+  /** Gateway API key (`pmgk_…`). Used when `transport: "gateway"`. */
+  apiKey?: string;
+  /** Optional gateway agent id override before JWT `sub` is known. */
+  agentId?: string;
+  /** Optional overrides forwarded to the gateway transport (tests/embedders). */
+  gateway?: Pick<
+    GatewayTransportOptions,
+    "fetch" | "createWebSocket" | "requestTimeoutMs" | "reconnect" | "tokenRefreshSkewMs"
+  >;
   handlers?: Record<string, TaskHandler>;
   defaultTimeoutMs?: number;
   /** Absolute client-side ceiling for submitted and accepted tasks. */
@@ -668,6 +696,13 @@ export class PolyMeshClient extends EventEmitter {
   private readonly createWebSocket: NonNullable<ClientOptions["createWebSocket"]>;
   private configuredUrl?: string;
   private configuredTransport?: ClientTransport;
+  private readonly gatewayMode: boolean;
+  private readonly gatewayUrl?: string;
+  private readonly gatewayApiKey?: string;
+  private readonly gatewayAgentId?: string;
+  private readonly gatewayMeshId?: string;
+  private readonly gatewayOverrides?: ClientOptions["gateway"];
+  private gatewayTransport?: GatewayTransport;
   private transport?: ClientTransport;
   private readyDeferred?: Deferred<this>;
   private handshakeTimer?: ReturnType<typeof setTimeout>;
@@ -700,15 +735,40 @@ export class PolyMeshClient extends EventEmitter {
 
   constructor(options: ClientOptions) {
     super();
-    if (!isAgentCard(options.card)) throw new TypeError("Client card is not a valid AgentCard");
+    this.gatewayMode = options.transport === "gateway";
+    this.gatewayUrl = options.gatewayUrl;
+    this.gatewayApiKey = options.apiKey;
+    this.gatewayAgentId = options.agentId;
+    this.gatewayOverrides = options.gateway;
+    if (this.gatewayMode) {
+      if (options.identity !== undefined) {
+        throw new TypeError("Gateway transport cannot be combined with the enrolled identity profile");
+      }
+      if (options.url !== undefined || options.token !== undefined) {
+        throw new TypeError("Gateway transport uses gatewayUrl/apiKey rather than broker url/token");
+      }
+      this.gatewayMeshId = options.meshId;
+    } else if (options.gatewayUrl !== undefined || options.apiKey !== undefined) {
+      throw new TypeError("gatewayUrl/apiKey require transport: \"gateway\"");
+    }
+    const cardInput = options.card ?? (this.gatewayMode
+      ? createAgentCard({
+        agent_id: options.agentId && /^[a-zA-Z][a-zA-Z0-9._-]*$/.test(options.agentId)
+          ? options.agentId
+          : "gateway.agent",
+        include_standard_capabilities: true,
+      })
+      : undefined);
+    if (!isAgentCard(cardInput)) throw new TypeError("Client card is not a valid AgentCard");
     this.profile = options.profile ?? PROTOCOL_VERSION;
     if (this.profile !== PROTOCOL_VERSION && this.profile !== V2_PROTOCOL_VERSION) {
       throw new TypeError(`Unsupported PolyMesh profile: ${String(options.profile)}`);
     }
-    if (options.meshId !== undefined && !isUuidV7(options.meshId)) {
+    // Gateway mesh ids are opaque names (e.g. "friends"); UUIDv7 applies only to native/broker meshes.
+    if (!this.gatewayMode && options.meshId !== undefined && !isUuidV7(options.meshId)) {
       throw new TypeError("meshId must be a UUIDv7 when selecting the native v2 profile");
     }
-    this.nativeMeshHint = options.meshId;
+    this.nativeMeshHint = this.gatewayMode ? undefined : options.meshId;
     const requestedCompression = options.compression ?? ["zstd", "none"];
     if (!Array.isArray(requestedCompression) || requestedCompression.length === 0 ||
       requestedCompression.some((algorithm) => algorithm !== "zstd" && algorithm !== "none") ||
@@ -723,7 +783,7 @@ export class PolyMeshClient extends EventEmitter {
       throw new TypeError("The compact native v2 profile does not support the enrolled v0.1 identity handshake");
     }
     this.now = options.now ?? Date.now;
-    let localCard = options.card;
+    let localCard = cardInput;
     if (options.identity) {
       const enrollments = options.identity.enrollments instanceof EnrollmentStore
         ? options.identity.enrollments
@@ -750,7 +810,7 @@ export class PolyMeshClient extends EventEmitter {
     this.card = localCard;
     this.cardDigest = cardDigest(localCard);
     this.configuredUrl = options.url;
-    this.configuredTransport = options.transport as ClientTransport | undefined;
+    this.configuredTransport = this.gatewayMode ? undefined : options.transport as ClientTransport | undefined;
     this.token = options.token;
     this.allowInsecureLoopbackDevelopment = options.allowInsecureLoopbackDevelopment === true;
     this.tlsOptions = options.tls;
@@ -809,14 +869,34 @@ export class PolyMeshClient extends EventEmitter {
     }
     this.createWebSocket = options.createWebSocket ?? ((url, protocols, connectionOptions) => new WebSocket(url, protocols, connectionOptions as WebSocketClientOptions));
     for (const [method, handler] of Object.entries(options.handlers ?? {})) this.setHandler(method, handler);
+    if (this.gatewayMode) {
+      this.gatewayTransport = new GatewayTransport({
+        apiKey: this.gatewayApiKey,
+        gatewayUrl: this.gatewayUrl,
+        agentId: this.gatewayAgentId,
+        meshId: this.gatewayMeshId,
+        eventTarget: this,
+        ...this.gatewayOverrides,
+      });
+    }
   }
 
   get connected(): boolean {
+    if (this.gatewayMode) return this.gatewayTransport?.connected === true;
     return this.phase === "active";
   }
 
   get url(): string | undefined {
-    return this.configuredUrl;
+    return this.configuredUrl ?? this.gatewayUrl;
+  }
+
+  /** True when this client was constructed with `transport: "gateway"`. */
+  get isGatewayTransport(): boolean {
+    return this.gatewayMode;
+  }
+
+  get gateway(): GatewayTransport | undefined {
+    return this.gatewayTransport;
   }
 
   get brokerCard(): AgentCard | undefined {
@@ -845,6 +925,10 @@ export class PolyMeshClient extends EventEmitter {
 
   /** Connect using a configured transport or URL and resolve after READY. */
   async connect(url = this.configuredUrl): Promise<this> {
+    if (this.gatewayMode) {
+      await this.connectGateway();
+      return this;
+    }
     if (this.phase === "active") return this;
     if (this.readyDeferred && !this.readyDeferred.settled) return this.readyDeferred.promise;
     if (this.configuredTransport) return this.connectTransport(this.configuredTransport);
@@ -899,8 +983,79 @@ export class PolyMeshClient extends EventEmitter {
     ));
   }
 
+  /**
+   * Gateway mode: exchange the API key for a JWT and open the relay WebSocket.
+   * Arguments override constructor `apiKey` / `gatewayUrl` when provided.
+   */
+  async connectGateway(apiKey?: string, gatewayUrl?: string): Promise<this>;
+  async connectGateway(options?: { apiKey?: string; gatewayUrl?: string }): Promise<this>;
+  async connectGateway(
+    apiKeyOrOptions?: string | { apiKey?: string; gatewayUrl?: string },
+    gatewayUrlArg?: string,
+  ): Promise<this> {
+    this.requireGatewayMode("connectGateway");
+    const apiKey = typeof apiKeyOrOptions === "string"
+      ? apiKeyOrOptions
+      : apiKeyOrOptions?.apiKey;
+    const gatewayUrl = typeof apiKeyOrOptions === "string"
+      ? gatewayUrlArg
+      : apiKeyOrOptions?.gatewayUrl;
+    await this.gatewayTransport!.connectGateway(apiKey, gatewayUrl);
+    this.phase = "active";
+    this.emit("ready", this);
+    return this;
+  }
+
+  /** Gateway mode: join a named mesh (sends `mesh.join` over WSS). */
+  async joinMesh(meshId: string, opts: GatewayJoinMeshOptions = {}) {
+    this.requireGatewayMode("joinMesh");
+    return this.gatewayTransport!.joinMesh(meshId, opts);
+  }
+
+  /** Gateway mode: discover agents in the current mesh. */
+  async discoverAgents(query: GatewayDiscoverQuery = {}): Promise<GatewayDiscoverResult> {
+    this.requireGatewayMode("discoverAgents");
+    return this.gatewayTransport!.discoverAgents(query);
+  }
+
+  /** Gateway mode: leave the mesh and close the gateway WebSocket. */
+  async leaveMesh(): Promise<void> {
+    this.requireGatewayMode("leaveMesh");
+    await this.gatewayTransport!.leaveMesh();
+    this.phase = "closed";
+    this.emit("close", { code: 1000, reason: "mesh.leave" });
+  }
+
+  /** Gateway mode: submit a task envelope through the relay. */
+  async submitTask(
+    target: string,
+    capability: string,
+    payload: JsonValue,
+    options: { taskId?: string; task_id?: string } = {},
+  ): Promise<string> {
+    this.requireGatewayMode("submitTask");
+    return this.gatewayTransport!.submitTask(target, capability, payload, options);
+  }
+
+  private requireGatewayMode(method: string): void {
+    if (!this.gatewayMode || !this.gatewayTransport) {
+      throw new PolyMeshError(
+        "GATEWAY_MODE_REQUIRED",
+        `${method}() requires transport: "gateway"`,
+        "transport",
+      );
+    }
+  }
+
   /** Connect an already-open WebSocket-shaped transport (ideal for unit tests). */
   connectTransport(transport: ClientTransport | WireTransport): Promise<this> {
+    if (this.gatewayMode) {
+      return Promise.reject(new PolyMeshError(
+        "GATEWAY_MODE_ACTIVE",
+        "connectTransport() is not available when transport is \"gateway\"",
+        "transport",
+      ));
+    }
     if (this.phase === "active") return Promise.resolve(this);
     if (this.readyDeferred && !this.readyDeferred.settled) return this.readyDeferred.promise;
     this.transport = transport as ClientTransport;
@@ -1043,6 +1198,9 @@ export class PolyMeshClient extends EventEmitter {
     const transport = this.transport;
     this.transport = undefined;
     if (this.phase !== "closed") this.phase = "closed";
+    if (this.gatewayTransport) {
+      void this.gatewayTransport.leaveMesh().catch(() => undefined);
+    }
     if (transport) {
       try {
         transport.close?.(safeCode, safeReason);

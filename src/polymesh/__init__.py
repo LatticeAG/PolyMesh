@@ -34,6 +34,9 @@ __all__ = [
     "Delivery",
     "DeliveryMode",
     "Envelope",
+    "GatewayDiscoverResult",
+    "GatewayTransport",
+    "GatewayTransportError",
     "PolyMeshClient",
     "PolyMeshError",
     "TaskContext",
@@ -51,6 +54,16 @@ def __getattr__(name: str) -> Any:
             "Client": Client,
             "TaskContext": TaskContext,
             "TaskHandle": TaskHandle,
+        }
+        globals().update(values)
+        return values[name]
+    if name in {"GatewayTransport", "GatewayTransportError", "GatewayDiscoverResult"}:
+        from .gateway_transport import GatewayDiscoverResult, GatewayTransport, GatewayTransportError
+
+        values = {
+            "GatewayTransport": GatewayTransport,
+            "GatewayTransportError": GatewayTransportError,
+            "GatewayDiscoverResult": GatewayDiscoverResult,
         }
         globals().update(values)
         return values[name]

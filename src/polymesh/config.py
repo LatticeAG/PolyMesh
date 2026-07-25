@@ -67,6 +67,40 @@ def _validate_url(value: str | None) -> str | None:
     return value
 
 
+def _validate_gateway_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise ValueError("gateway url must be an absolute ws, wss, http, or https endpoint") from exc
+    if parsed.scheme not in {"ws", "wss", "http", "https"} or not hostname:
+        raise ValueError("gateway url must be an absolute ws, wss, http, or https endpoint")
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "?" in value
+        or "#" in value
+    ):
+        raise ValueError("gateway url must not contain credentials, query, or fragment")
+    return value
+
+
+class GatewayConfig(_ConfigModel):
+    url: str | None = None
+    api_key: str | None = None
+    api_key_file: str | None = None
+    mesh_id: str | None = None
+    request_timeout_ms: int = Field(default=15_000, gt=0, le=86_400_000)
+    reconnect: bool = True
+
+    _api_key_file_path = field_validator("api_key_file")(_optional_path)
+    _gateway_url = field_validator("url")(_validate_gateway_url)
+
+
 class ClientConfig(_ConfigModel):
     url: str | None = None
     card_file: str | None = None
@@ -107,6 +141,7 @@ class SecurityConfig(_ConfigModel):
 class PolyMeshConfig(_ConfigModel):
     client: ClientConfig = Field(default_factory=ClientConfig)
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
@@ -209,7 +244,36 @@ def environment_overrides(env: Mapping[str, str | None] | None = None) -> dict[s
     set_value("security", "key_file", "POLYMESH_KEY_FILE")
     set_value("security", "identity_key_file", "POLYMESH_IDENTITY_KEY_FILE")
     set_value("security", "enrollments_file", "POLYMESH_ENROLLMENTS_FILE")
+    set_value("gateway", "url", "POLYMESH_GATEWAY_URL")
+    # ``api_key_file`` wins over inline ``api_key`` when both environment variables are set.
+    if values.get("POLYMESH_API_KEY_FILE") is not None:
+        set_value("gateway", "api_key_file", "POLYMESH_API_KEY_FILE", lambda value, _: _optional_path(value))
+    elif values.get("POLYMESH_API_KEY") is not None:
+        set_value("gateway", "api_key", "POLYMESH_API_KEY")
+    set_value("gateway", "mesh_id", "POLYMESH_MESH_ID")
+    set_value(
+        "gateway",
+        "request_timeout_ms",
+        "POLYMESH_GATEWAY_TIMEOUT_MS",
+        lambda value, _: _positive_int(value, "POLYMESH_GATEWAY_TIMEOUT_MS"),
+    )
+    set_value("gateway", "reconnect", "POLYMESH_GATEWAY_RECONNECT", _parse_bool)
     return data
+
+
+def resolve_gateway_api_key(
+    config: GatewayConfig,
+    read_file: Any | None = None,
+) -> str | None:
+    """Return the effective gateway API key; ``api_key_file`` wins over ``api_key``."""
+
+    if config.api_key_file:
+        reader = read_file or (lambda path: Path(path).read_text(encoding="utf-8"))
+        key = reader(config.api_key_file).strip()
+        if not key:
+            raise ConfigError("gateway api key file must not be empty")
+        return key
+    return config.api_key
 
 
 def _positive_int(value: str, name: str) -> int:
@@ -288,10 +352,12 @@ __all__ = [
     "BrokerConfig",
     "ClientConfig",
     "ConfigError",
+    "GatewayConfig",
     "OutputConfig",
     "PolyMeshConfig",
     "SecurityConfig",
     "discover_config_path",
     "environment_overrides",
     "load_config",
+    "resolve_gateway_api_key",
 ]

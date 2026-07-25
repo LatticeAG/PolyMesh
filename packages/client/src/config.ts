@@ -34,16 +34,27 @@ export interface DiscoveryCliConfig {
   mdns_interval: number;
 }
 
+export interface GatewayCliConfig {
+  url?: string;
+  api_key?: string;
+  api_key_file?: string;
+  mesh_id?: string;
+  request_timeout_ms?: number;
+  reconnect?: boolean;
+}
+
 export interface CliConfig {
   broker: BrokerCliConfig;
   client: ClientCliConfig;
   discovery: DiscoveryCliConfig;
+  gateway?: GatewayCliConfig;
 }
 
 export interface CliConfigOverrides {
   broker?: Partial<BrokerCliConfig>;
   client?: Partial<ClientCliConfig>;
   discovery?: Partial<DiscoveryCliConfig>;
+  gateway?: Partial<GatewayCliConfig>;
 }
 
 export interface LoadedCliConfig {
@@ -157,6 +168,25 @@ function tokenFilePath(value: unknown, location: string, home: string): string |
   return expandHome(path, home);
 }
 
+function validateGatewayUrl(url: string, location: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    fail(`${location} must be an absolute URL with scheme ws, wss, http, or https`);
+  }
+  const scheme = parsed.protocol.slice(0, -1);
+  if (!["ws", "wss", "http", "https"].includes(scheme) || !parsed.hostname) {
+    fail(`${location} must be an absolute URL with scheme ws, wss, http, or https`);
+  }
+}
+
+function gatewayApiKeyFilePath(value: unknown, location: string, home: string): string | undefined {
+  const path = optionalString(value, location);
+  if (path === undefined) return undefined;
+  return expandHome(path, home);
+}
+
 function validateBrokerHost(host: string): void {
   // Broker host is later used both as a listen address and, when no explicit
   // URL is supplied, to construct a local WebSocket URL. Do not allow URL
@@ -172,7 +202,7 @@ function validateBrokerHost(host: string): void {
 
 function parsePartialConfig(value: unknown, source: string, home: string): CliConfigOverrides {
   if (!isPlainObject(value)) fail(`${source} must be a TOML table`);
-  assertAllowedKeys(value, ["broker", "client", "discovery"], source);
+  assertAllowedKeys(value, ["broker", "client", "discovery", "gateway"], source);
   const result: CliConfigOverrides = {};
 
   const broker = value.broker;
@@ -214,14 +244,48 @@ function parsePartialConfig(value: unknown, source: string, home: string): CliCo
     };
   }
 
+  const gateway = value.gateway;
+  if (gateway !== undefined) {
+    if (!isPlainObject(gateway)) fail(`${source}.gateway must be a TOML table`);
+    assertAllowedKeys(
+      gateway,
+      ["url", "api_key", "api_key_file", "mesh_id", "request_timeout_ms", "reconnect"],
+      `${source}.gateway`,
+    );
+    const url = optionalString(gateway.url, "gateway.url");
+    if (url !== undefined) validateGatewayUrl(url, "gateway.url");
+    const apiKey = optionalString(gateway.api_key, "gateway.api_key");
+    const apiKeyFile = gatewayApiKeyFilePath(gateway.api_key_file, "gateway.api_key_file", home);
+    const meshId = optionalString(gateway.mesh_id, "gateway.mesh_id");
+    const requestTimeoutMs = integer(gateway.request_timeout_ms, "gateway.request_timeout_ms", 1, MAX_TIMEOUT_MS);
+    const reconnect = boolean(gateway.reconnect, "gateway.reconnect");
+    result.gateway = {
+      ...(url === undefined ? {} : { url }),
+      ...(apiKey === undefined ? {} : { api_key: apiKey }),
+      ...(apiKeyFile === undefined ? {} : { api_key_file: apiKeyFile }),
+      ...(meshId === undefined ? {} : { mesh_id: meshId }),
+      ...(requestTimeoutMs === undefined ? {} : { request_timeout_ms: requestTimeoutMs }),
+      ...(reconnect === undefined ? {} : { reconnect }),
+    };
+  }
+
   return result;
 }
 
+function mergedGatewaySection(base: CliConfig, override: CliConfigOverrides): GatewayCliConfig | undefined {
+  if (base.gateway === undefined && override.gateway === undefined) return undefined;
+  const gateway = { ...base.gateway, ...override.gateway };
+  if (Object.values(gateway).every((value) => value === undefined)) return undefined;
+  return gateway;
+}
+
 function mergeConfig(base: CliConfig, override: CliConfigOverrides): CliConfig {
+  const gateway = mergedGatewaySection(base, override);
   return {
     broker: { ...base.broker, ...override.broker },
     client: { ...base.client, ...override.client },
     discovery: { ...base.discovery, ...override.discovery },
+    ...(gateway === undefined ? {} : { gateway }),
   };
 }
 
@@ -267,6 +331,7 @@ export function environmentConfigOverrides(env: CliEnvironment = process.env, ho
   const broker: Partial<BrokerCliConfig> = {};
   const client: Partial<ClientCliConfig> = {};
   const discovery: Partial<DiscoveryCliConfig> = {};
+  const gateway: Partial<GatewayCliConfig> = {};
   const host = firstEnvironmentValue(env, ["POLYMESH_HOST", "POLYMESH_BROKER_HOST"]);
   const port = firstEnvironmentValue(env, ["POLYMESH_PORT", "POLYMESH_BROKER_PORT"]);
   const token = env.POLYMESH_TOKEN_FILE;
@@ -285,12 +350,31 @@ export function environmentConfigOverrides(env: CliEnvironment = process.env, ho
     discovery.mdns_interval = parseIntegerEnvironment(mdnsInterval, "POLYMESH_MDNS_INTERVAL", 0, MAX_MDNS_INTERVAL_MS);
   }
 
+  const gatewayUrl = env.POLYMESH_GATEWAY_URL;
+  const gatewayApiKeyFile = env.POLYMESH_API_KEY_FILE;
+  const gatewayApiKey = env.POLYMESH_API_KEY;
+  const gatewayMeshId = env.POLYMESH_MESH_ID;
+  const gatewayTimeout = env.POLYMESH_GATEWAY_TIMEOUT_MS;
+  const gatewayReconnect = env.POLYMESH_GATEWAY_RECONNECT;
+  if (gatewayUrl !== undefined) gateway.url = gatewayUrl;
+  // ``api_key_file`` wins over inline ``api_key`` when both are set (TOML or env).
+  if (gatewayApiKeyFile !== undefined) gateway.api_key_file = gatewayApiKeyFile;
+  if (gatewayApiKey !== undefined && gatewayApiKeyFile === undefined) gateway.api_key = gatewayApiKey;
+  if (gatewayMeshId !== undefined) gateway.mesh_id = gatewayMeshId;
+  if (gatewayTimeout !== undefined) {
+    gateway.request_timeout_ms = parseIntegerEnvironment(gatewayTimeout, "POLYMESH_GATEWAY_TIMEOUT_MS", 1, MAX_TIMEOUT_MS);
+  }
+  if (gatewayReconnect !== undefined) {
+    gateway.reconnect = parseBooleanEnvironment(gatewayReconnect, "POLYMESH_GATEWAY_RECONNECT");
+  }
+
   // Validate paths/host strings and ensure aliases cannot bypass the same
   // strict validation as TOML.  TOML parsing itself is not involved here.
   return parsePartialConfig({
     ...(Object.keys(broker).length === 0 ? {} : { broker }),
     ...(Object.keys(client).length === 0 ? {} : { client }),
     ...(Object.keys(discovery).length === 0 ? {} : { discovery }),
+    ...(Object.keys(gateway).length === 0 ? {} : { gateway }),
   }, "environment", home);
 }
 
@@ -372,7 +456,30 @@ export function redactCliConfig(config: CliConfig): CliConfig {
     },
     client: { ...config.client },
     discovery: { ...config.discovery },
+    ...(config.gateway === undefined ? {} : {
+      gateway: {
+        ...config.gateway,
+        ...(config.gateway.api_key === undefined ? {} : { api_key: "[redacted]" }),
+      },
+    }),
   };
+}
+
+/**
+ * Resolve the gateway API key from config. When both ``api_key`` and
+ * ``api_key_file`` are present, the file contents win.
+ */
+export async function resolveGatewayApiKey(
+  gateway: GatewayCliConfig | undefined,
+  readFile: (path: string, encoding: BufferEncoding) => Promise<string> = nodeReadFile,
+): Promise<string | undefined> {
+  if (gateway === undefined) return undefined;
+  if (gateway.api_key_file !== undefined) {
+    const key = (await readFile(gateway.api_key_file, "utf8")).trim();
+    if (key.length === 0) fail("gateway.api_key_file must not be empty");
+    return key;
+  }
+  return gateway.api_key;
 }
 
 /** Backwards-friendly concise name for callers that only need the merge. */

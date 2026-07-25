@@ -341,6 +341,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+gateway = [
+    { name = "httpx" },
+    { name = "websockets" },
+]
 http = [
     { name = "httpx" },
 ]
@@ -366,6 +370,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1,<9" },
     { name = "cryptography", specifier = ">=42,<46" },
+    { name = "httpx", marker = "extra == 'gateway'", specifier = ">=0.27,<1" },
     { name = "httpx", marker = "extra == 'http'", specifier = ">=0.27,<1" },
     { name = "platformdirs", specifier = ">=4,<5" },
     { name = "pydantic", specifier = ">=2.7,<3" },
@@ -374,9 +379,10 @@ requires-dist = [
     { name = "pyyaml", marker = "extra == 'yaml'", specifier = ">=6,<7" },
     { name = "pyzstd", specifier = ">=0.15,<1" },
     { name = "websockets", specifier = ">=13,<16" },
+    { name = "websockets", marker = "extra == 'gateway'", specifier = ">=13,<16" },
     { name = "zeroconf", marker = "extra == 'mdns'", specifier = ">=0.132,<1" },
 ]
-provides-extras = ["http", "mdns", "yaml", "secure-carrier", "test"]
+provides-extras = ["http", "gateway", "mdns", "yaml", "secure-carrier", "test"]
 
 [package.metadata.requires-dev]
 dev = [
