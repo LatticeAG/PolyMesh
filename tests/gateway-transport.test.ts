@@ -7,6 +7,7 @@ import {
   gatewayWsUrl,
   PolyMeshClient,
   type GatewayFetch,
+  type GatewayTransportOptions,
   type GatewayWsSocket,
 } from "@latticeag/polymesh-client";
 
@@ -200,7 +201,7 @@ interface HarnessOptions {
   autoDiscover?: boolean;
   requestTimeoutMs?: number;
   tokenRefreshSkewMs?: number;
-  reconnect?: ConstructorParameters<typeof GatewayTransport>[0]["reconnect"];
+  reconnect?: GatewayTransportOptions["reconnect"];
   tokenClaims?: Record<string, unknown>;
   fetchOverride?: FetchHandler;
 }
