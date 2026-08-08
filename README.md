@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/github/stars/LatticeAG/PolyMesh?style=for-the-badge" alt="GitHub stars" />
   </a>
   <a href="https://github.com/LatticeAG/PolyMesh/issues">
-    <img src="https://img.shields.io/github/issues/LatticeAG/PolyMesh?style=for-the-badge" alt="GitHub issues" />
+    <img src="https://img.shields.io/github/issues/LatticeAG/PolyMesh?style=for-the-badge&label=Issues" alt="GitHub issues" />
   </a>
   <a href="https://github.com/LatticeAG/PolyMesh">
     <img src="https://img.shields.io/github/languages/top/LatticeAG/PolyMesh?style=for-the-badge" alt="Top language" />
@@ -27,25 +27,31 @@
   </a>
 </p>
 
+<blockquote>
+<p><strong>MCP gave agents tools. A2A gave agents a phone book. PolyMesh gives them a neighborhood - routing, rooms, permissions, and it works offline.</strong></p>
+</blockquote>
+
 <p align="center">
-  <b>An open protocol for agent-to-agent communication.</b><br/>
-  Local-first, framework-agnostic, internet-optional.
+  Local-first agent mesh. TypeScript + Python. Internet optional.
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
   <a href="#packages">Packages</a> ·
+  <a href="#speak-a2a-wire-vs-product">Speak A2A</a> ·
+  <a href="docs/positioning.md">Positioning</a> ·
+  <a href="#offline-re-route-demo">Offline demo</a> ·
   <a href="#how-it-works">How It Works</a> ·
-  <a href="#support-matrix">Support Matrix</a> ·
-  <a href="#verification">Verification</a> ·
   <a href="#architecture">Architecture</a>
 </p>
 
 ---
 
-PolyMesh is an open, local-first protocol for agents to declare capabilities and exchange bounded tasks. Agents discover each other through a lightweight broker, negotiate capability contracts, and execute tasks with verified lifecycle events -- no cloud required.
+PolyMesh is an open, local-first protocol for agents to declare capabilities and exchange bounded tasks. Agents discover each other through a lightweight broker, negotiate capability contracts, and execute tasks with verified lifecycle events. No cloud required for the local path.
 
 Built as the LatticeAG Poly series protocol layer. Works with any framework, any language, any runtime.
+
+Full competitive matrix, four locked positioning statements, honest limits, and FAQ: **[docs/positioning.md](docs/positioning.md)**.
 
 ## Quick Start
 
@@ -71,13 +77,53 @@ It prints the broker, Alice, and Bob lifecycle and exits when Alice receives Bob
 
 ## Packages
 
-| Package | Purpose | Language |
+| Package | Layer | Purpose | Language |
+| --- | --- | --- | --- |
+| `@latticeag/polymesh-broker` | PRODUCT | WebSocket broker and local registry | TypeScript |
+| `@latticeag/polymesh-client` | PRODUCT | Client SDK, CLI, capability router | TypeScript |
+| `@latticeag/polymesh-a2a` | WIRE (leaf dialect) | A2A adapter; ships with M5 | TypeScript |
+| `@latticeag/polymesh-gateway` | WIRE / relay | Blind native REST/SSE/WSS relay | TypeScript |
+| `@latticeag/create-polymesh-app` | app | Starter generator for the ping/pong example | TypeScript |
+| `latticeag-polymesh` | PRODUCT | Python SDK; import as `polymesh` | Python |
+
+PRODUCT owns routing, rooms, permissions, task lifecycle, and local-first runtime. WIRE speaks standards as dialects at the leaf. The gateway stays a blind pipe.
+
+## Speak A2A (WIRE vs PRODUCT)
+
+> We don't compete with A2A. We speak it. The mesh routes by capability; the wire is whatever the ecosystem speaks.
+
+| Layer | What it is | PolyMesh role |
 | --- | --- | --- |
-| `@latticeag/polymesh-broker` | WebSocket broker and local registry | TypeScript |
-| `@latticeag/polymesh-client` | Client SDK, CLI, and constrained mDNS discovery | TypeScript |
-| `@latticeag/polymesh-gateway` | REST/SSE gateway reference adapter | TypeScript |
-| `@latticeag/create-polymesh-app` | Starter generator for the ping/pong example | TypeScript |
-| `latticeag-polymesh` | Python SDK; import as `polymesh` | Python |
+| STANDARDS | A2A, MCP, ACP | Adopted. Never competed with. |
+| WIRE | Native envelopes + A2A JSON-RPC as a dialect | Leaf translation in `@latticeag/polymesh-a2a` / `polymesh-a2a` |
+| PRODUCT | Capability routing, rooms, permissions, offline re-route | Where PolyMesh differentiates |
+
+A2A WIRE is point-to-point. Multi-agent runtimes on top of A2A exist independently (ADK, community routers). PolyMesh's differentiation is integrated routing + rooms + local-first in one product layer.
+
+If you already have two known HTTPS agents and a static topology, use A2A alone. Use PolyMesh when you need capability dispatch across a changing membership set, rooms, offline operation, or bounded re-route when a worker fails. Details: [docs/positioning.md](docs/positioning.md).
+
+### Short comparison
+
+| Capability | PolyMesh | A2A | ACP | AgentChat | Caspian |
+| --- | --- | --- | --- | --- | --- |
+| Agent-to-agent | YES | YES | n/a (UI) | YES | no (A2H) |
+| Capability-based routing | YES | no (address) | n/a | no (address) | no |
+| Multi-agent topology / rooms | YES | no (wire P2P; runtimes on top exist) | n/a | DMs + @mention groups; no capability re-route; hosted | no |
+| Local-first, offline | YES | no (needs endpoints) | n/a | no (hosted) | no |
+| Structured task lifecycle | YES | YES (endpoint-local); distributed re-route n/a | n/a | chat | no |
+| Interops with A2A | YES (v6 spec; ships with M5) | native | n/a | via A2A | via A2A |
+
+Bold product-layer cells are the only fair "we win" claims. Full matrix + evidence: [docs/positioning.md](docs/positioning.md).
+
+## Offline re-route demo
+
+Three agents on a laptop, no internet. One drops mid-task. The mesh re-routes to a peer with the same capability. Zero config, no public endpoints.
+
+```bash
+./scripts/demo-offline-reroute.sh
+```
+
+This is also an executable conformance test (`tests/demo-offline-reroute.test.ts`) that asserts all nine §D.3.6 observations in order. See [scripts/offline-reroute/README.md](scripts/offline-reroute/README.md).
 
 The TypeScript CLI is provided by `@latticeag/polymesh-client`:
 
@@ -175,14 +221,19 @@ For the full architectural overview and dependency graph, see [ARCHITECTURE.md](
 
 ## Scope and Limitations
 
-PolyMesh v0.4.0 does **not** claim:
+PolyMesh does **not** claim:
 
+- A competing wire format, or "A2A alternative / killer"
+- Hosted DM identity / WhatsApp-for-agents (AgentChat's lane)
+- Editor UI protocol leadership in v6 (ACP deferred to v7)
+- Agent-to-human channel suite (Caspian's lane)
 - Generic end-to-end envelope signing or delegated authorization grants
 - Continuous task-output streaming or generic pub/sub
-- Automatic multi-hop routing or MCP/framework adapters
-- A hosted Worker relay or production hosting
+- A hosted Worker relay inside this repository (see [polymesh-gateway](https://github.com/LatticeAG/polymesh-gateway))
 
 Gateway SSE is task-event observation, not general streaming or a topic system.
+
+Messaging bans and reviewer checklist: [docs/positioning.md](docs/positioning.md#messaging-bans).
 
 ## Development Feedback
 
