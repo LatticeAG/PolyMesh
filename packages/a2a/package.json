@@ -1,0 +1,55 @@
+{
+  "name": "@latticeag/polymesh-a2a",
+  "version": "0.4.0",
+  "description": "PolyMesh A2A dialect adapter (outbound, M2)",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./adapter": {
+      "types": "./dist/adapter.d.ts",
+      "default": "./dist/adapter.js"
+    },
+    "./card-mapper": {
+      "types": "./dist/card-mapper.d.ts",
+      "default": "./dist/card-mapper.js"
+    },
+    "./task-translator": {
+      "types": "./dist/task-translator.d.ts",
+      "default": "./dist/task-translator.js"
+    },
+    "./poller": {
+      "types": "./dist/poller.d.ts",
+      "default": "./dist/poller.js"
+    },
+    "./auth-boundary": {
+      "types": "./dist/auth-boundary.d.ts",
+      "default": "./dist/auth-boundary.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "default": "./dist/errors.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    }
+  },
+  "dependencies": {
+    "@latticeag/polymesh-broker": "^0.4.0",
+    "@latticeag/polymesh-client": "^0.4.0"
+  }
+}

@@ -17,7 +17,9 @@
       "@latticeag/polymesh-client": ["packages/client/src/index.ts"],
       "@latticeag/polymesh-client/*": ["packages/client/src/*"],
       "@latticeag/polymesh-gateway": ["packages/gateway/src/index.ts"],
-      "@latticeag/polymesh-gateway/*": ["packages/gateway/src/*"]
+      "@latticeag/polymesh-gateway/*": ["packages/gateway/src/*"],
+      "@latticeag/polymesh-a2a": ["packages/a2a/src/index.ts"],
+      "@latticeag/polymesh-a2a/*": ["packages/a2a/src/*"]
     }
   },
   "include": ["packages/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]

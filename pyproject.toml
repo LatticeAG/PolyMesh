@@ -30,6 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+a2a = ["httpx>=0.27,<1"]
 http = ["httpx>=0.27,<1"]
 gateway = [
   "httpx>=0.27,<1",

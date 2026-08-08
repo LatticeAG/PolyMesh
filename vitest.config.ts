@@ -6,12 +6,14 @@ export default defineConfig({
     alias: {
       "@latticeag/polymesh-broker/protocol": fileURLToPath(new URL("./packages/broker/src/protocol.ts", import.meta.url)),
       "@latticeag/polymesh-broker": fileURLToPath(new URL("./packages/broker/src/index.ts", import.meta.url)),
+      "@latticeag/polymesh-client/router": fileURLToPath(new URL("./packages/client/src/router.ts", import.meta.url)),
       "@latticeag/polymesh-client": fileURLToPath(new URL("./packages/client/src/index.ts", import.meta.url)),
       "@latticeag/polymesh-gateway": fileURLToPath(new URL("./packages/gateway/src/index.ts", import.meta.url)),
+      "@latticeag/polymesh-a2a": fileURLToPath(new URL("./packages/a2a/src/index.ts", import.meta.url)),
     },
   },
   test: {
-    include: ["tests/**/*.test.ts"],
+    include: ["tests/**/*.test.ts", "packages/a2a/test/**/*.test.ts"],
     testTimeout: 10_000,
     hookTimeout: 10_000
   }
