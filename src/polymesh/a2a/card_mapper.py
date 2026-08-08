@@ -20,6 +20,40 @@ FIDELITY_CLAUSE = "PolyMesh capability id: "
 #: Reverse-DNS-looking prefixes that must never be re-prefixed on the way back.
 REVERSE_DNS_PREFIXES = ("org.", "com.", "io.", "net.", "dev.", "custom.")
 
+#: Capabilities that MUST NOT be published inbound without operator opt-in (§A.5.3).
+INBOUND_PUBLISH_DENYLIST: frozenset[str] = frozenset(
+    {
+        "org.polymesh.shell.exec",
+        "org.polymesh.file.write",
+    }
+)
+
+
+def is_publishable_skill(capability: Mapping[str, Any]) -> bool:
+    """§A.5.3 publish gate for inbound AgentCard skills."""
+
+    name = str(capability.get("name") or capability.get("capability") or "")
+    if name in INBOUND_PUBLISH_DENYLIST:
+        return False
+    if capability.get("approval") == "always":
+        return False
+    if capability.get("side_effects") == "approval":
+        return False
+    return True
+
+
+def map_capabilities_to_skills(
+    capabilities: Sequence[Mapping[str, Any]],
+    *,
+    enforce_publish_gate: bool = True,
+) -> list[A2ASkill]:
+    skills: list[A2ASkill] = []
+    for capability in capabilities:
+        if enforce_publish_gate and not is_publishable_skill(capability):
+            continue
+        skills.append(map_capability_to_skill(capability))
+    return skills
+
 
 def skill_name_from_capability_name(name: str) -> str:
     """Strip the ``org.polymesh.`` prefix only (§A.5.1 normative algorithm)."""
@@ -86,18 +120,23 @@ def map_capability_to_skill(capability: Mapping[str, Any]) -> A2ASkill:
     return skill
 
 
-def map_card_to_a2a(card: Mapping[str, Any], *, url: str | None = None) -> A2AAgentCard:
+def map_card_to_a2a(
+    card: Mapping[str, Any],
+    *,
+    url: str | None = None,
+    enforce_publish_gate: bool = False,
+) -> A2AAgentCard:
     """Minimal PolyMesh AgentCard -> A2A AgentCard projection.
 
     Mesh topology, scope, and room membership are never copied (§A.16.3).
+    Pass ``enforce_publish_gate=True`` for inbound AgentCard publishing (§A.5.3).
     """
 
     capabilities = card.get("capabilities")
     skills: list[A2ASkill] = []
     if isinstance(capabilities, Sequence) and not isinstance(capabilities, (str, bytes)):
-        for capability in capabilities:
-            if isinstance(capability, Mapping):
-                skills.append(map_capability_to_skill(capability))
+        caps = [c for c in capabilities if isinstance(c, Mapping)]
+        skills = map_capabilities_to_skills(caps, enforce_publish_gate=enforce_publish_gate)
     a2a_card: A2AAgentCard = {
         "name": str(card.get("display_name") or card.get("agent_id") or "polymesh-agent"),
         "description": str(card.get("description") or "PolyMesh agent exposed over the A2A dialect"),
@@ -160,9 +199,12 @@ def map_card_from_a2a(card: Mapping[str, Any], *, a2a_url: str | None = None) ->
 
 __all__ = [
     "FIDELITY_CLAUSE",
+    "INBOUND_PUBLISH_DENYLIST",
     "POLYMESH_CAPABILITY_PREFIX",
     "REVERSE_DNS_PREFIXES",
     "capability_name_from_skill_name",
+    "is_publishable_skill",
+    "map_capabilities_to_skills",
     "map_capability_to_skill",
     "map_card_from_a2a",
     "map_card_to_a2a",

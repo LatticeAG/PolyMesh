@@ -20,8 +20,11 @@ export {
   skill_name_from_capability_name,
   skillDescriptionFromCapability,
   mapCapabilityToSkill,
+  mapCapabilitiesToSkills,
+  isPublishableSkill,
   fidelityClause,
   capabilityToA2ASkill,
+  INBOUND_PUBLISH_DENYLIST,
 } from "./card-mapper.js";
 export {
   translateTaskEvent,
@@ -46,7 +49,13 @@ export {
   POLL_BASE_MS,
   POLL_MAX_MS,
 } from "./poller.js";
-export { A2AAuthBoundary, redactCredentialPatterns, REDACTED } from "./auth-boundary.js";
+export {
+  A2AAuthBoundary,
+  redactCredentialPatterns,
+  REDACTED,
+  mapToMeshTrustScope,
+  MESH_CREDENTIAL_HEADERS,
+} from "./auth-boundary.js";
 export {
   A2AError,
   A2ADialectError,
@@ -62,10 +71,29 @@ export {
 export { OutboundClient } from "./outbound-client.js";
 export { IdempotencyStore } from "./idempotency.js";
 export { AdapterEventLog } from "./event-log.js";
-export { InboundHandler, createInboundHandler } from "./inbound-handler.js";
-export { RateLimit, createRateLimit } from "./rate-limit.js";
+export {
+  InboundHandler,
+  createInboundHandler,
+  projectMeshToA2aTask,
+  CAPABILITIES_LIST,
+} from "./inbound-handler.js";
+export {
+  RateLimit,
+  createRateLimit,
+  TokenBucket,
+  HierarchicalRateLimiter,
+  KeyedRateLimiter,
+  IP_CAPACITY,
+  IP_REFILL_PER_SEC,
+  PRINCIPAL_CAPACITY,
+  PRINCIPAL_REFILL_PER_SEC,
+  CAPABILITY_CAPACITY,
+  CAPABILITY_REFILL_PER_SEC,
+} from "./rate-limit.js";
 export {
   buildJsonRpcRequest,
+  buildJsonRpcResult,
+  buildJsonRpcError,
   parseJsonRpcBody as parseJsonRpcResponse,
   unwrapJsonRpcResult,
 } from "./jsonrpc.js";

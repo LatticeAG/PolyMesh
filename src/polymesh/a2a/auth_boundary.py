@@ -202,6 +202,74 @@ class A2AAuthBoundary:
                 self._on_redaction({"path": event.path, "pattern": event.pattern, "task_id": task_id})
         return result
 
+    def terminate_inbound_auth(
+        self,
+        headers: Mapping[str, str] | None = None,
+        *,
+        auth: Mapping[str, Any] | None = None,
+        allow_public_unauthenticated: bool | None = None,
+    ) -> dict[str, Any]:
+        """Terminate A2A credentials and mint a mesh-local trust scope (§A.13.1–2).
+
+        Mesh credential headers on the inbound request are ignored (never
+        forwarded). Missing/invalid A2A credentials fail closed unless the
+        operator explicitly allows unauthenticated public bind.
+        """
+
+        hdrs = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        cfg = dict(auth) if auth is not None else dict(self._default_auth or {})
+        mode = str(cfg.get("mode") or "none")
+        allow_public = (
+            bool(allow_public_unauthenticated)
+            if allow_public_unauthenticated is not None
+            else bool(False)
+        )
+        expected = resolve_auth_token(cfg)
+
+        subject = "anonymous"
+        if mode == "none" or not expected:
+            if not allow_public and mode != "none":
+                raise A2AError("AUTHENTICATION_FAILED", "Authentication failed")
+            subject = "anonymous-public" if allow_public or mode == "none" else "anonymous"
+        elif mode == "bearer":
+            header_name = str(cfg.get("header_name") or "Authorization").lower()
+            provided = hdrs.get(header_name, "")
+            if provided != f"Bearer {expected}" and provided != expected:
+                raise A2AError("AUTHENTICATION_FAILED", "Authentication failed")
+            subject = f"bearer:{credential_thumbprint(expected)}"
+        else:
+            header_name = str(cfg.get("header_name") or "X-API-Key").lower()
+            provided = hdrs.get(header_name, "")
+            if provided != expected:
+                raise A2AError("AUTHENTICATION_FAILED", "Authentication failed")
+            subject = f"apikey:{credential_thumbprint(expected)}"
+
+        return map_to_mesh_trust_scope(subject)
+
+    def strip_mesh_credentials_from_headers(self, headers: Mapping[str, str]) -> dict[str, str]:
+        """Return a copy of headers with mesh credential names removed (§A.13.1)."""
+
+        return {
+            str(k): str(v)
+            for k, v in headers.items()
+            if str(k).lower() not in MESH_CREDENTIAL_HEADERS
+        }
+
+
+def map_to_mesh_trust_scope(a2a_subject: str, *, capabilities_allowed: Sequence[str] | None = None) -> dict[str, Any]:
+    """Mint the adapter-local trust scope for an A2A principal (§A.13.2)."""
+
+    digest = hashlib.sha256(str(a2a_subject).encode("utf-8")).hexdigest()[:16]
+    return {
+        "kind": "a2a_remote",
+        "principal_id": f"a2a:{digest}",
+        "subject": str(a2a_subject),
+        "capabilities_allowed": list(capabilities_allowed) if capabilities_allowed is not None else None,
+        "rooms": [],
+        "topology_read": False,
+        "dialect": "a2a",
+    }
+
 
 __all__ = [
     "A2AAuthBoundary",
@@ -212,5 +280,6 @@ __all__ = [
     "REDACTED",
     "Redaction",
     "credential_thumbprint",
+    "map_to_mesh_trust_scope",
     "redact_credentials",
 ]

@@ -14,6 +14,7 @@ export const MESH_CREDENTIAL_HEADERS: readonly string[] = Object.freeze([
   "x-polymesh-token",
   "x-polymesh-session",
   "x-polymesh-ticket",
+  "x-polymesh-mesh-token",
   "x-mesh-token",
   "x-gateway-jwt",
   "x-room-token",
@@ -171,6 +172,92 @@ export class A2AAuthBoundary {
     }
     return result;
   }
+
+  /**
+   * Terminate inbound A2A credentials and mint a mesh-local trust scope
+   * (§A.13.1–§A.13.2). Mesh credential headers are ignored, never forwarded.
+   */
+  terminateInboundAuth(
+    headers: Record<string, string | string[] | undefined> = {},
+    options?: { auth?: A2AAuthConfig; allowPublicUnauthenticated?: boolean },
+  ): MeshTrustScope {
+    const hdrs = normalizeHeaders(headers);
+    const auth = options?.auth ?? this.defaultAuth ?? { mode: "none" as const };
+    const mode = auth.mode ?? "none";
+    const allowPublic = options?.allowPublicUnauthenticated ?? false;
+    const expected = auth.token;
+
+    let subject = "anonymous";
+    if (mode === "none" || !expected) {
+      subject = allowPublic || mode === "none" ? "anonymous-public" : "anonymous";
+    } else if (mode === "bearer") {
+      const headerName = (auth.header_name ?? "Authorization").toLowerCase();
+      const provided = hdrs[headerName] ?? "";
+      if (provided !== `Bearer ${expected}` && provided !== expected) {
+        throw new A2ADialectError("AUTHENTICATION_FAILED", "Authentication failed");
+      }
+      subject = `bearer:${credentialThumbprint(expected)}`;
+    } else {
+      const headerName = (auth.header_name ?? "X-API-Key").toLowerCase();
+      const provided = hdrs[headerName] ?? "";
+      if (provided !== expected) {
+        throw new A2ADialectError("AUTHENTICATION_FAILED", "Authentication failed");
+      }
+      subject = `apikey:${credentialThumbprint(expected)}`;
+    }
+    return mapToMeshTrustScope(subject);
+  }
+
+  /** Drop mesh credential headers from a header map (§A.13.1). */
+  stripMeshCredentialsFromHeaders(
+    headers: Record<string, string | string[] | undefined>,
+  ): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      if (MESH_CREDENTIAL_HEADERS.includes(key.toLowerCase())) continue;
+      if (value === undefined) continue;
+      out[key] = Array.isArray(value) ? (value[0] ?? "") : value;
+    }
+    return out;
+  }
+}
+
+export interface MeshTrustScope {
+  kind: "a2a_remote";
+  principal_id: string;
+  subject: string;
+  capabilities_allowed: string[] | null;
+  rooms: [];
+  topology_read: false;
+  dialect: "a2a";
+}
+
+/** Mint the adapter-local trust scope for an A2A principal (§A.13.2). */
+export function mapToMeshTrustScope(
+  a2aSubject: string,
+  capabilitiesAllowed?: string[] | null,
+): MeshTrustScope {
+  const digest = createHash("sha256").update(String(a2aSubject), "utf8").digest("hex").slice(0, 16);
+  return {
+    kind: "a2a_remote",
+    principal_id: `a2a:${digest}`,
+    subject: String(a2aSubject),
+    capabilities_allowed: capabilitiesAllowed ?? null,
+    rooms: [],
+    topology_read: false,
+    dialect: "a2a",
+  };
+}
+
+function normalizeHeaders(
+  headers: Record<string, string | string[] | undefined>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    out[key.toLowerCase()] = Array.isArray(value) ? (value[0] ?? "") : value;
+  }
+  return out;
 }
 
 function matchesEndpoint(parsed: URL, endpoint: TrustedEndpoint): boolean {

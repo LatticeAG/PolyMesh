@@ -144,14 +144,19 @@ export function mapCapabilityToSkill(capability: PolyMeshCapability): A2ASkill {
   return capabilityToA2ASkill(capability);
 }
 
-export function mapCardToA2a(card: Record<string, unknown>): Record<string, unknown> {
+export function mapCardToA2a(
+  card: Record<string, unknown>,
+  options?: { enforcePublishGate?: boolean },
+): Record<string, unknown> {
   const caps = Array.isArray(card.capabilities)
     ? (card.capabilities as PolyMeshCapability[])
     : [];
   return {
     name: card.agent_id,
     version: card.card_version ?? "0.0.0",
-    skills: mapCapabilitiesToSkills(caps, { enforcePublishGate: false }),
+    skills: mapCapabilitiesToSkills(caps, {
+      enforcePublishGate: options?.enforcePublishGate ?? false,
+    }),
   };
 }
 

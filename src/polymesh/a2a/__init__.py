@@ -20,12 +20,16 @@ from .auth_boundary import (
     MESH_CREDENTIAL_HEADERS,
     A2AAuthBoundary,
     credential_thumbprint,
+    map_to_mesh_trust_scope,
     redact_credentials,
 )
 from .card_mapper import (
     FIDELITY_CLAUSE,
+    INBOUND_PUBLISH_DENYLIST,
     POLYMESH_CAPABILITY_PREFIX,
     capability_name_from_skill_name,
+    is_publishable_skill,
+    map_capabilities_to_skills,
     map_capability_to_skill,
     map_card_from_a2a,
     map_card_to_a2a,
@@ -52,12 +56,21 @@ from .errors import (
 )
 from .event_log import AdapterEventLog
 from .idempotency import IdempotencyStore, canonical_json, compute_fingerprint, fingerprint_payload
-from .inbound_handler import InboundHandler, create_inbound_handler
+from .inbound_handler import InboundHandler, create_inbound_handler, project_mesh_to_a2a_task
 from .jsonrpc import build_request, extract_result, parse_response_body
 from .mock_server import MockA2AServer, create_mock_a2a_server
 from .outbound_client import OutboundClient
 from .poller import POLL_BASE_MS, POLL_JITTER_RATIO, POLL_MAX_MS, compute_poll_delay, poll_until_terminal
-from .rate_limit import RateLimit, create_rate_limit
+from .rate_limit import (
+    CAPABILITY_CAPACITY,
+    CAPABILITY_REFILL_PER_SEC,
+    IP_CAPACITY,
+    IP_REFILL_PER_SEC,
+    PRINCIPAL_CAPACITY,
+    PRINCIPAL_REFILL_PER_SEC,
+    RateLimit,
+    create_rate_limit,
+)
 from .task_translator import (
     A2A_STATE_TO_POLYMESH,
     POLYMESH_STATE_TO_A2A,
@@ -80,11 +93,16 @@ __all__ = [
     "A2ADialectError",
     "A2AError",
     "AdapterEventLog",
+    "CAPABILITY_CAPACITY",
+    "CAPABILITY_REFILL_PER_SEC",
     "DEFAULT_CONFIG",
     "ERROR_TABLE",
     "EVENT_LOG_CAP",
     "FIDELITY_CLAUSE",
     "IDEMPOTENCY_RETENTION_MS",
+    "INBOUND_PUBLISH_DENYLIST",
+    "IP_CAPACITY",
+    "IP_REFILL_PER_SEC",
     "IdempotencyStore",
     "InboundHandler",
     "MESH_CREDENTIAL_HEADERS",
@@ -95,6 +113,8 @@ __all__ = [
     "POLL_MAX_MS",
     "POLYMESH_CAPABILITY_PREFIX",
     "POLYMESH_STATE_TO_A2A",
+    "PRINCIPAL_CAPACITY",
+    "PRINCIPAL_REFILL_PER_SEC",
     "OutboundBridge",
     "OutboundClient",
     "RateLimit",
@@ -118,19 +138,23 @@ __all__ = [
     "extract_artifact_result",
     "extract_result",
     "fingerprint_payload",
+    "is_publishable_skill",
     "is_retryable_code",
     "is_terminal_a2a_state",
     "is_uuidv7",
     "json_rpc_code_for",
     "load_a2a_config",
+    "map_capabilities_to_skills",
     "map_capability_to_skill",
     "map_card_from_a2a",
     "map_card_to_a2a",
     "map_outbound_task_id",
+    "map_to_mesh_trust_scope",
     "normalize_code",
     "normalize_trusted_endpoint",
     "parse_response_body",
     "poll_until_terminal",
+    "project_mesh_to_a2a_task",
     "redact_config",
     "redact_credentials",
     "skill_name_from_capability_name",
