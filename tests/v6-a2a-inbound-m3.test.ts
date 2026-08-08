@@ -296,7 +296,7 @@ describe("v6 M3 A2A inbound", () => {
         },
       ],
     });
-    expect(() => h.joinRoom("room-1")).toThrow(A2ADialectError);
+    expect(() => h.joinRoom()).toThrow(A2ADialectError);
     expect(() => h.listMeshMembers()).toThrow(A2ADialectError);
 
     const res = await h.handle({
