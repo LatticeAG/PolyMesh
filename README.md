@@ -174,7 +174,7 @@ Supported TOML sections are `[broker]`, `[client]`, and `[discovery]`. Keep cred
 
 ## Support Matrix
 
-| Capability | Status in v0.4.0 | Notes |
+| Capability | Status in v0.5.0 | Notes |
 | --- | --- | --- |
 | v0.1 local task lifecycle | Supported | TypeScript broker/client and Python SDK are covered by shared compatibility vectors |
 | `polymesh.0.2` native SDK profile | Experimental | Explicit opt-in with profile negotiation and optional zstd framing |
@@ -196,7 +196,7 @@ Supported TOML sections are `[broker]`, `[client]`, and `[discovery]`. Keep cred
 
 ## Verification
 
-The v0.4.0 release gate runs clean installs, TypeScript type checking/build/tests, Python tests/builds, package artifact smoke tests, and shared compatibility fixtures.
+The v0.5.0 release gate runs clean installs, TypeScript type checking/build/tests, Python tests/builds, package artifact smoke tests, and shared compatibility fixtures.
 
 From a source checkout:
 

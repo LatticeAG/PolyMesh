@@ -1,7 +1,7 @@
 {
   "name": "@latticeag/polymesh-a2a",
-  "version": "0.4.0",
-  "description": "PolyMesh A2A dialect adapter (outbound, M2)",
+  "version": "0.5.0",
+  "description": "PolyMesh A2A dialect adapter (outbound + inbound leaf)",
   "type": "module",
   "types": "./dist/index.d.ts",
   "files": [
@@ -49,7 +49,7 @@
     }
   },
   "dependencies": {
-    "@latticeag/polymesh-broker": "^0.4.0",
-    "@latticeag/polymesh-client": "^0.4.0"
+    "@latticeag/polymesh-broker": "^0.5.0",
+    "@latticeag/polymesh-client": "^0.5.0"
   }
 }
