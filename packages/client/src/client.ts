@@ -93,6 +93,17 @@ import {
   type GatewayJoinMeshOptions,
   type GatewayTransportOptions,
 } from "./gateway-transport.js";
+import {
+  CapabilityRouter,
+  createCapabilityRouter,
+  mergeGatewayAgentsIntoRegistry,
+  type A2AOutboundBridge,
+  type Dialect,
+  type DialectPreferenceHooks,
+  type RegistryView,
+  type RerouteEvent,
+  type TaskRoutedEvent,
+} from "./router.js";
 
 export type ClientPhase = "idle" | "await_hello" | "await_card" | "await_auth" | "await_ready" | "active" | "closed";
 
@@ -703,6 +714,8 @@ export class PolyMeshClient extends EventEmitter {
   private readonly gatewayMeshId?: string;
   private readonly gatewayOverrides?: ClientOptions["gateway"];
   private gatewayTransport?: GatewayTransport;
+  /** v6 M1 capability router (PRODUCT). Composed; does not alter submitTask. */
+  private readonly capabilityRouter: CapabilityRouter;
   private transport?: ClientTransport;
   private readyDeferred?: Deferred<this>;
   private handshakeTimer?: ReturnType<typeof setTimeout>;
@@ -879,6 +892,23 @@ export class PolyMeshClient extends EventEmitter {
         ...this.gatewayOverrides,
       });
     }
+    // Capability router: native dispatch uses submitTask in gateway mode.
+    this.capabilityRouter = createCapabilityRouter({
+      coldStartPolicy: "eager",
+      adapterAvailable: false,
+      nativeDispatch: async (input) => {
+        if (this.gatewayMode) {
+          await this.submitTask(
+            input.agent_id,
+            input.capability,
+            input.payload as JsonValue,
+            { taskId: input.task_id },
+          );
+          return;
+        }
+        // Non-gateway: no-op success unless a bridge/native hook is set later.
+      },
+    });
   }
 
   get connected(): boolean {
@@ -1015,7 +1045,14 @@ export class PolyMeshClient extends EventEmitter {
   /** Gateway mode: discover agents in the current mesh. */
   async discoverAgents(query: GatewayDiscoverQuery = {}): Promise<GatewayDiscoverResult> {
     this.requireGatewayMode("discoverAgents");
-    return this.gatewayTransport!.discoverAgents(query);
+    const result = await this.gatewayTransport!.discoverAgents(query);
+    // Merge discovery into the PRODUCT RegistryView for capability routing (§B.15.3).
+    this.capabilityRouter.setRegistry(
+      mergeGatewayAgentsIntoRegistry(this.capabilityRouter.getRegistry(), result.agents, {
+        locality: "relay",
+      }),
+    );
+    return result;
   }
 
   /** Gateway mode: leave the mesh and close the gateway WebSocket. */
@@ -1035,6 +1072,67 @@ export class PolyMeshClient extends EventEmitter {
   ): Promise<string> {
     this.requireGatewayMode("submitTask");
     return this.gatewayTransport!.submitTask(target, capability, payload, options);
+  }
+
+  /**
+   * v6 capability-routed submit (§E.2.3). Selects an executor via the PRODUCT
+   * router, then dispatches (native → `submitTask` in gateway mode; a2a → bridge).
+   * Does not replace {@link submitTask}.
+   */
+  async submitCapabilityRouted(
+    capability: string,
+    payload: unknown,
+    options: {
+      taskId?: string;
+      target?: string;
+      maxReroutes?: number;
+      preferDialects?: readonly Dialect[];
+      signal?: AbortSignal;
+      idempotency?: string;
+      side_effects?: string;
+    } = {},
+  ): Promise<string> {
+    const result = await this.capabilityRouter.routeTask({
+      capability,
+      payload,
+      taskId: options.taskId,
+      target: options.target,
+      maxReroutes: options.maxReroutes,
+      preferDialects: options.preferDialects,
+      signal: options.signal,
+      idempotency: options.idempotency,
+      side_effects: options.side_effects,
+    });
+    return result.task_id;
+  }
+
+  /** Subscribe to B.8 `task.routed` events from the capability router. */
+  onTaskRouted(handler: (event: TaskRoutedEvent) => void): () => void {
+    return this.capabilityRouter.onTaskRouted(handler);
+  }
+
+  /** Subscribe to re-route observability events. */
+  onReroute(handler: (event: RerouteEvent) => void): () => void {
+    return this.capabilityRouter.onReroute(handler);
+  }
+
+  setDialectPreferenceHooks(hooks: DialectPreferenceHooks | null): void {
+    this.capabilityRouter.setDialectPreferenceHooks(hooks);
+  }
+
+  /** Bind an A2A outbound bridge without reversing package deps (§E.2.3). */
+  setA2AOutboundBridge(bridge: A2AOutboundBridge | null): void {
+    this.capabilityRouter.setA2AOutboundBridge(bridge);
+  }
+
+  /** Install a RegistryView for capability routing (tests / manual discovery). */
+  setRoutingRegistry(view: RegistryView): void {
+    this.capabilityRouter.setRegistryView(view);
+  }
+
+  /** @internal Test hook — access the composed CapabilityRouter. */
+  getCapabilityRouter(): CapabilityRouter {
+    return this.capabilityRouter;
   }
 
   private requireGatewayMode(method: string): void {

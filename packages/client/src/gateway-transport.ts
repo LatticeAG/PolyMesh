@@ -28,6 +28,10 @@ export interface GatewayCapability {
   schema?: JsonObject;
   scope?: string;
   security?: string;
+  /** v6 dialect tag; default `"native"` when omitted (§B.12). */
+  dialect?: "native" | "a2a";
+  /** Required when `dialect` is `"a2a"` (§B.11.2). */
+  a2a_url?: string;
   [key: string]: JsonValue | undefined;
 }
 
@@ -37,6 +41,16 @@ export interface GatewayAgentInfo {
   capabilities: GatewayCapability[] | JsonValue[];
   last_seen?: string | null;
   metadata?: JsonObject;
+  /** v6 health enum (§B.5.1); discovery MAY omit (router treats absent as healthy when merging). */
+  health?: "healthy" | "degraded" | "unhealthy" | "offline" | "unknown";
+  /** v6 locality tier (§B.11.4); gateway-only peers default to `relay` at merge time. */
+  locality?: "same_host" | "lan" | "relay" | "unknown";
+  /** False for A2A-only leaf registrations (§B.11.1). */
+  mesh_member?: boolean;
+  /** Present when known from mesh handshake; used in exclusion keys (§B.7.2.5.1). */
+  instance_id?: string;
+  /** Caller-side permission hint (§B.6.1 / §C.8). */
+  perm_hint?: "allow" | "deny" | "absent";
 }
 
 export interface GatewayTokenResponse {

@@ -1,0 +1,7 @@
+{"id":"H.native_over_a2a","capability":"calendar.check","expected":{"chosen_agent":"org.polymesh.dual","dialect":"native"}}
+{"id":"H.locality_same_host","capability":"ping","expected":{"chosen_agent":"org.polymesh.local","dialect":"native","locality_tier":"same_host"}}
+{"id":"H.freshness_bucket","capability":"echo","expected":{"chosen_agent":"org.polymesh.a","dialect":"native","note":"same Pref1-3 bucket → Pref4 RR"}}
+{"id":"H.rr_three_tied","capability":"work","expected":{"chosen_agent":"org.polymesh.worker-a","dialect":"native","cursor_after":1}}
+{"id":"H.exclusion_reroute","capability":"job","exclude":["org.polymesh.flaky"],"reroute_count":1,"expected":{"chosen_agent":"org.polymesh.stable","dialect":"native"}}
+{"id":"H.explicit_cap_missing","capability":"missing.cap","target":"org.polymesh.target","expected":{"error":"CAPABILITY_NOT_ADVERTISED"}}
+{"id":"H.explicit_ambiguous","capability":"greet","target":"alice","expected":{"error":"AMBIGUOUS_TARGET"}}

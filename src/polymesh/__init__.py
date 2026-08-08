@@ -30,6 +30,7 @@ __all__ = [
     "AgentRef",
     "Capability",
     "CapabilityBuilder",
+    "CapabilityRouter",
     "Client",
     "Delivery",
     "DeliveryMode",
@@ -39,9 +40,20 @@ __all__ = [
     "GatewayTransportError",
     "PolyMeshClient",
     "PolyMeshError",
+    "ROUTING_ERROR_CODES",
+    "RoutingError",
     "TaskContext",
     "TaskHandle",
     "TaskStatus",
+    "capability_exact_match",
+    "capability_glob_match",
+    "collect_candidates",
+    "filter_health",
+    "filter_permission",
+    "freeze_registry_view",
+    "freshness_bucket",
+    "is_retryable_failure",
+    "stable_rank",
 ]
 
 
@@ -65,6 +77,38 @@ def __getattr__(name: str) -> Any:
             "GatewayTransportError": GatewayTransportError,
             "GatewayDiscoverResult": GatewayDiscoverResult,
         }
+        globals().update(values)
+        return values[name]
+    if name in {
+        "CapabilityRouter",
+        "ROUTING_ERROR_CODES",
+        "RoutingError",
+        "capability_exact_match",
+        "capability_glob_match",
+        "collect_candidates",
+        "filter_health",
+        "filter_permission",
+        "freeze_registry_view",
+        "freshness_bucket",
+        "is_retryable_failure",
+        "stable_rank",
+    }:
+        from . import router as _router
+
+        values = {key: getattr(_router, key) for key in (
+            "CapabilityRouter",
+            "ROUTING_ERROR_CODES",
+            "RoutingError",
+            "capability_exact_match",
+            "capability_glob_match",
+            "collect_candidates",
+            "filter_health",
+            "filter_permission",
+            "freeze_registry_view",
+            "freshness_bucket",
+            "is_retryable_failure",
+            "stable_rank",
+        )}
         globals().update(values)
         return values[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

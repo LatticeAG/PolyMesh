@@ -83,6 +83,8 @@ class GatewayCapability(TypedDict, total=False):
     schema: JsonObject
     scope: str
     security: str
+    dialect: str  # "native" | "a2a"
+    a2a_url: str
 
 
 class GatewayAgentInfo(TypedDict, total=False):
@@ -91,6 +93,11 @@ class GatewayAgentInfo(TypedDict, total=False):
     capabilities: list[GatewayCapability] | list[JsonValue]
     last_seen: str | None
     metadata: JsonObject
+    health: str  # healthy|degraded|unhealthy|offline|unknown
+    locality: str  # same_host|lan|relay|unknown
+    mesh_member: bool
+    instance_id: str
+    perm_hint: str  # allow|deny|absent
 
 
 class GatewayTokenResponse(TypedDict):

@@ -7,5 +7,6 @@ export * from "./gateway-transport.js";
 export * from "./mdns.js";
 export * from "./policy.js";
 export * from "./replay-ledger.js";
+export * from "./router.js";
 
 export { PolyMeshClient as default } from "./client.js";

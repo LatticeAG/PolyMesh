@@ -38,6 +38,10 @@
     "./mdns": {
       "types": "./dist/mdns.d.ts",
       "default": "./dist/mdns.js"
+    },
+    "./router": {
+      "types": "./dist/router.d.ts",
+      "default": "./dist/router.js"
     }
   },
   "bin": {

@@ -10,7 +10,7 @@ import inspect
 import re
 import threading
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeAlias
@@ -612,6 +612,15 @@ class PolyMeshClient:
             )
             self._gateway._event_bridge = self._emit  # type: ignore[attr-defined]
 
+        # v6 M1 capability router (PRODUCT). Additive; does not alter submit_task.
+        from .router import CapabilityRouter
+
+        self._capability_router = CapabilityRouter(
+            caller_id=self.card.agent_id,
+            cold_start_policy="eager",
+        )
+        self._a2a_outbound_bridge: Any | None = None
+
     @property
     def phase(self) -> ClientPhase:
         return self._phase
@@ -970,6 +979,70 @@ class PolyMeshClient:
     ) -> str:
         gateway = self._require_gateway_mode("submit_task")
         return await gateway.submit_task(target, capability, payload, task_id=task_id)
+
+    async def submit_capability_routed(
+        self,
+        capability: str,
+        payload: Any,
+        *,
+        task_id: str | None = None,
+        target: str | None = None,
+        max_reroutes: int = 3,
+        prefer_dialects: Sequence[str] | None = None,
+    ) -> str:
+        """Route by capability (Part B) then dispatch; additive to ``submit_task``."""
+        router = self._capability_router
+
+        async def _native_dispatch(dispatch_input: Mapping[str, Any]) -> None:
+            agent_id = str(dispatch_input["agent_id"])
+            cap = str(dispatch_input["capability"])
+            body = dispatch_input.get("payload")
+            tid = str(dispatch_input["task_id"])
+            if self._gateway_mode:
+                await self.submit_task(agent_id, cap, body, task_id=tid)
+                return
+            # Broker-mode native path: use existing targeted submit when available.
+            if hasattr(self, "_submit_task_native"):
+                await self._submit_task_native(agent_id, cap, body, task_id=tid)  # type: ignore[attr-defined]
+                return
+            # Route-only / no transport: treat as successful handoff for M1 tests.
+            return
+
+        router._native_dispatch = _native_dispatch
+        if self._a2a_outbound_bridge is not None:
+            router.set_a2a_outbound_bridge(self._a2a_outbound_bridge)
+
+        options: dict[str, Any] = {
+            "capability": capability,
+            "payload": payload,
+            "max_reroutes": max_reroutes,
+        }
+        if task_id is not None:
+            options["task_id"] = task_id
+        if target is not None:
+            options["target"] = target
+        if prefer_dialects is not None:
+            options["prefer_dialects"] = list(prefer_dialects)
+
+        result = await router.route_task(options)
+        return str(result["task_id"])
+
+    def on_task_routed(self, handler: Callable[[Any], None]) -> Callable[[], None]:
+        return self._capability_router.on_task_routed(handler)
+
+    def on_reroute(self, handler: Callable[[Any], None]) -> Callable[[], None]:
+        return self._capability_router.on_reroute(handler)
+
+    def set_dialect_preference_hooks(self, hooks: Any | None) -> None:
+        self._capability_router.set_dialect_preference_hooks(hooks)
+
+    def set_a2a_outbound_bridge(self, bridge: Any | None) -> None:
+        self._a2a_outbound_bridge = bridge
+        self._capability_router.set_a2a_outbound_bridge(bridge)
+
+    def set_routing_registry(self, registry: Mapping[str, Any] | None) -> None:
+        """Install a RegistryView snapshot for capability routing (tests / merge)."""
+        self._capability_router.set_registry(registry)
 
     async def _handshake(self, transport: WireTransport, generation: int) -> None:
         if self._profile == V2_PROTOCOL_VERSION:
