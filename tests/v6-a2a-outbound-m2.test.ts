@@ -360,6 +360,69 @@ describe("v6 M2 A2A outbound", () => {
       await mock.close();
     }
   });
+
+  it("outbound_bridge_unbound_router_still_fails_dialect_unsupported", async () => {
+    const router = createCapabilityRouter({
+      registry: {
+        agents: [
+          {
+            agent_id: "org.remote.a2a",
+            health: "healthy",
+            locality: "lan",
+            last_seen: new Date().toISOString(),
+            capabilities: [
+              {
+                name: "org.polymesh.agent.ping",
+                dialect: "a2a",
+                a2a_url: "https://unreachable.test/a2a",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    await expect(
+      router.routeTask({ capability: "org.polymesh.agent.ping", payload: { ping: true } }),
+    ).rejects.toMatchObject({ code: "DIALECT_UNSUPPORTED" });
+  });
+
+  it("outbound_bridge_surfaces_remote_failure_to_router", async () => {
+    const mock = await createMockA2AServer({ dropNPolls: 0 });
+    try {
+      mock.setOptions({ httpErrorStatus: 503 });
+      const adapter = new A2AAdapter({
+        config: { outbound_enabled: true, trusted_endpoints: [mock.url] },
+        random: () => 0.5,
+      });
+      const router = createCapabilityRouter({
+        registry: {
+          agents: [
+            {
+              agent_id: "org.remote.a2a",
+              health: "healthy",
+              locality: "lan",
+              last_seen: new Date().toISOString(),
+              capabilities: [
+                { name: "org.polymesh.agent.ping", dialect: "a2a", a2a_url: mock.url },
+              ],
+            },
+          ],
+        },
+        a2aBridge: adapter.createOutboundBridge(),
+        adapterAvailable: true,
+      });
+
+      // TARGET_UNAVAILABLE is retryable, so the single candidate is retried and
+      // the attempt terminates as exhausted rather than succeeding (§B.7).
+      await expect(
+        router.routeTask({ capability: "org.polymesh.agent.ping", payload: { ping: true } }),
+      ).rejects.toMatchObject({ code: "ALL_CANDIDATES_EXHAUSTED" });
+      expect(mock.requests.length).toBeGreaterThan(0);
+    } finally {
+      await mock.close();
+    }
+  });
 });
 
 // silence unused import if tree-shaken oddly

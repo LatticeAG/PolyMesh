@@ -1,199 +1,256 @@
-"""In-process mock A2A peer for tests and local demos.
+"""Threaded mock A2A JSON-RPC server for outbound conformance tests (§E.4.4).
 
-Exposes an ASGI application so tests can drive the real outbound client over
-``httpx.ASGITransport`` without binding a socket.  Every request is captured
-verbatim so tests can assert what actually crossed the wire.
+It speaks just enough of the dialect to drive the adapter: ``tasks/send``,
+``tasks/get`` with a configurable number of non-terminal polls, ``tasks/cancel``,
+plus knobs for HTTP-level and JSON-RPC-level failures.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+import threading
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .jsonrpc import JSONRPC_VERSION
+from ..protocol import uuidv7
 
-DEFAULT_URL = "https://mock-a2a.test/a2a"
+
+@dataclass
+class MockA2AOptions:
+    """Behaviour switches; every field is live-patchable via ``set_options``."""
+
+    #: Non-terminal ``tasks/get`` responses before the task completes.
+    drop_polls: int = 0
+    #: JSON-RPC error returned for ``tasks/send`` (``True`` uses TARGET_UNAVAILABLE).
+    fail_on_send: bool | dict[str, Any] | None = None
+    #: HTTP status returned for every request, with a non JSON-RPC body.
+    http_error_status: int | None = None
+    #: When set, requests without this exact Authorization header get 401.
+    require_auth_header: str | None = None
+    #: Reject every request with a JSON-RPC AUTHENTICATION_FAILED body.
+    auth_reject: bool = False
+    #: Artifact data attached to the completed task.
+    complete_result: Any = field(default_factory=lambda: {"ok": True})
+    #: Terminal state the task lands in once polling finishes.
+    terminal_state: str = "completed"
+    #: Task-level error object used when ``terminal_state`` is ``failed``.
+    terminal_error: dict[str, Any] | None = None
 
 
 class MockA2AServer:
-    """Scriptable A2A peer.
+    """Runs a :class:`ThreadingHTTPServer` on a loopback port in a daemon thread."""
 
-    ``states`` is the sequence of ``status.state`` values returned by
-    ``tasks/get``; the last value repeats once exhausted.
-    """
-
-    def __init__(
-        self,
-        *,
-        send_state: str = "submitted",
-        states: Sequence[str] | None = None,
-        result: Any = None,
-        http_status: int | None = None,
-        json_rpc_error: Mapping[str, Any] | None = None,
-        error_after_sends: int = 0,
-        task_error: Mapping[str, Any] | None = None,
-        require_auth: str | None = None,
-        progress: float | None = None,
-    ) -> None:
-        self.send_state = send_state
-        self.states = list(states or ["completed"])
-        self.result = result if result is not None else {"ok": True}
-        self.http_status = http_status
-        self.json_rpc_error = dict(json_rpc_error) if json_rpc_error is not None else None
-        self.error_after_sends = int(error_after_sends)
-        self.task_error = dict(task_error) if task_error is not None else None
-        self.require_auth = require_auth
-        self.progress = progress
-
+    def __init__(self, host: str = "127.0.0.1", port: int = 0, **options: Any) -> None:
+        self.options = MockA2AOptions(**options)
         self.requests: list[dict[str, Any]] = []
-        self.send_count = 0
-        self.get_count = 0
-        self.cancel_count = 0
-        self._tasks: dict[str, dict[str, Any]] = {}
-        self._get_index: dict[str, int] = {}
-
-    # -- introspection -------------------------------------------------
+        self.tasks: dict[str, dict[str, Any]] = {}
+        self.polls: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._server = ThreadingHTTPServer((host, port), _make_handler(self))
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, name="mock-a2a", daemon=True)
+        self._thread.start()
 
     @property
-    def last_request(self) -> dict[str, Any]:
-        if not self.requests:
-            raise AssertionError("mock A2A server received no requests")
-        return self.requests[-1]
+    def port(self) -> int:
+        return int(self._server.server_address[1])
 
-    def raw_bodies(self) -> list[str]:
-        return [entry["raw_body"] for entry in self.requests]
+    @property
+    def host(self) -> str:
+        return str(self._server.server_address[0])
 
-    def header_values(self) -> list[str]:
-        values: list[str] = []
-        for entry in self.requests:
-            values.extend(str(value) for value in entry["headers"].values())
-        return values
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}/a2a"
 
-    # -- protocol ------------------------------------------------------
+    @property
+    def origin(self) -> str:
+        return f"http://{self.host}:{self.port}"
 
-    def _task_snapshot(self, task_id: str, state: str) -> dict[str, Any]:
-        status: dict[str, Any] = {"state": state}
-        if self.progress is not None and state == "working":
-            status["progress"] = self.progress
-        if state == "completed":
-            status["progress"] = 1
-        if state == "failed":
-            status["error"] = self.task_error or {"code": "EXECUTION_FAILED", "message": "remote failure"}
-        task: dict[str, Any] = {"id": task_id, "status": status, "metadata": {}}
-        if state == "completed":
-            task["artifacts"] = [{"name": "result", "parts": [{"type": "data", "data": self.result}]}]
-        return task
+    def set_options(self, **patch: Any) -> None:
+        for key, value in patch.items():
+            if not hasattr(self.options, key):
+                raise AttributeError(f"unknown mock option {key!r}")
+            setattr(self.options, key, value)
 
-    def handle(self, request: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
-        method = request.get("method")
-        params = request.get("params") if isinstance(request.get("params"), Mapping) else {}
-        request_id = request.get("id")
+    def force_state(self, remote_task_id: str, state: str, *, artifacts: Any = None) -> None:
+        """Push a task into ``state`` directly (used by monotonicity tests)."""
 
-        if method == "tasks/send":
-            self.send_count += 1
-            if self.json_rpc_error is not None and self.send_count > self.error_after_sends:
-                return 200, {"jsonrpc": JSONRPC_VERSION, "id": request_id, "error": dict(self.json_rpc_error)}
-            task_id = str(params.get("id") or f"remote-{self.send_count}")
-            self._tasks[task_id] = dict(params)
-            self._get_index[task_id] = 0
-            return 200, {
-                "jsonrpc": JSONRPC_VERSION,
-                "id": request_id,
-                "result": self._task_snapshot(task_id, self.send_state),
-            }
+        with self._lock:
+            task = self.tasks.get(remote_task_id)
+            if task is None:
+                return
+            task["status"] = {"state": state}
+            if artifacts is not None:
+                task["artifacts"] = artifacts
 
-        if method == "tasks/get":
-            self.get_count += 1
-            task_id = str(params.get("id") or "")
-            if task_id not in self._tasks:
-                return 200, {
-                    "jsonrpc": JSONRPC_VERSION,
-                    "id": request_id,
-                    "error": {"code": -32004, "message": "Task not found", "data": {"polymesh_code": "TASK_NOT_FOUND"}},
-                }
-            index = self._get_index.get(task_id, 0)
-            state = self.states[min(index, len(self.states) - 1)]
-            self._get_index[task_id] = index + 1
-            return 200, {"jsonrpc": JSONRPC_VERSION, "id": request_id, "result": self._task_snapshot(task_id, state)}
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
 
-        if method == "tasks/cancel":
-            self.cancel_count += 1
-            task_id = str(params.get("id") or "")
-            return 200, {
-                "jsonrpc": JSONRPC_VERSION,
-                "id": request_id,
-                "result": self._task_snapshot(task_id, "canceled"),
-            }
+    def __enter__(self) -> MockA2AServer:
+        return self
 
-        return 200, {
-            "jsonrpc": JSONRPC_VERSION,
-            "id": request_id,
-            "error": {"code": -32601, "message": "Method not found", "data": {"polymesh_code": "UNSUPPORTED_METHOD"}},
-        }
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
 
-    # -- ASGI ----------------------------------------------------------
 
-    async def __call__(self, scope: Mapping[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http":  # pragma: no cover - transport only speaks http
-            raise AssertionError("mock A2A server only speaks HTTP")
+def create_mock_a2a_server(**options: Any) -> MockA2AServer:
+    return MockA2AServer(**options)
 
-        chunks: list[bytes] = []
-        while True:
-            message = await receive()
-            if message.get("type") != "http.request":
-                break
-            chunks.append(message.get("body") or b"")
-            if not message.get("more_body"):
-                break
-        raw_body = b"".join(chunks).decode("utf-8", errors="replace")
-        headers = {
-            key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope.get("headers") or []
-        }
-        try:
-            parsed = json.loads(raw_body) if raw_body else {}
-        except ValueError:
-            parsed = {}
-        self.requests.append(
-            {
-                "path": scope.get("path", "/"),
-                "headers": headers,
-                "raw_body": raw_body,
-                "body": parsed if isinstance(parsed, dict) else {},
-            }
-        )
 
-        if self.require_auth is not None and headers.get("authorization") != self.require_auth:
-            await _respond(send, 401, {"error": "unauthorized"})
-            return
-        if self.http_status is not None and self.http_status >= 400:
-            await _respond(send, self.http_status, {"error": "mock failure"})
+def _make_handler(mock: MockA2AServer) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args: Any) -> None:  # keep pytest output clean
             return
 
-        status, body = self.handle(parsed if isinstance(parsed, dict) else {})
-        await _respond(send, status, body)
+        def _write(self, status: int, body: bytes, content_type: str = "application/json") -> None:
+            self.send_response(status)
+            self.send_header("content-type", content_type)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    def transport(self) -> Any:
-        """Return an ``httpx.ASGITransport`` bound to this mock."""
+        def _write_json(self, status: int, payload: dict[str, Any]) -> None:
+            self._write(status, json.dumps(payload).encode("utf-8"))
 
-        import httpx
+        def _reply(self, request_id: Any, result: Any) -> None:
+            self._write_json(200, {"jsonrpc": "2.0", "id": request_id, "result": result})
 
-        return httpx.ASGITransport(app=self)
+        def _fail(
+            self,
+            request_id: Any,
+            code: int,
+            message: str,
+            data: dict[str, Any] | None = None,
+            status: int = 200,
+        ) -> None:
+            error: dict[str, Any] = {"code": code, "message": message}
+            if data is not None:
+                error["data"] = data
+            self._write_json(status, {"jsonrpc": "2.0", "id": request_id, "error": error})
+
+        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            length = int(self.headers.get("content-length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            options = mock.options
+
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else None
+            except (ValueError, UnicodeDecodeError):
+                self._fail(None, -32700, "Parse error")
+                return
+
+            with mock._lock:
+                mock.requests.append(
+                    {
+                        "path": self.path,
+                        "headers": {key.lower(): value for key, value in self.headers.items()},
+                        "body": body,
+                    }
+                )
+
+            if options.http_error_status:
+                self._write(options.http_error_status, b"upstream failure", content_type="text/plain")
+                return
+
+            request_id = body.get("id") if isinstance(body, dict) else None
+
+            if options.auth_reject or options.require_auth_header is not None:
+                provided = self.headers.get("authorization")
+                expected = options.require_auth_header
+                if options.auth_reject or expected is None or provided != expected:
+                    self._fail(
+                        request_id,
+                        -32001,
+                        "Authentication failed",
+                        {"polymesh_code": "AUTHENTICATION_FAILED"},
+                        status=401,
+                    )
+                    return
+
+            method = body.get("method") if isinstance(body, dict) else None
+            params = body.get("params") if isinstance(body, dict) else None
+            params = params if isinstance(params, dict) else {}
+
+            if method == "tasks/send":
+                self._handle_send(request_id, params, options)
+            elif method == "tasks/get":
+                self._handle_get(request_id, params, options)
+            elif method == "tasks/cancel":
+                self._handle_cancel(request_id, params)
+            else:
+                self._fail(request_id, -32601, "Method not found")
+
+        def _handle_send(self, request_id: Any, params: dict[str, Any], options: MockA2AOptions) -> None:
+            if options.fail_on_send:
+                spec = options.fail_on_send if isinstance(options.fail_on_send, dict) else {}
+                self._fail(
+                    request_id,
+                    int(spec.get("code", -32008)),
+                    str(spec.get("message", "Target unavailable")),
+                    spec.get("data", {"polymesh_code": "TARGET_UNAVAILABLE"}),
+                    status=int(spec.get("status", 200)),
+                )
+                return
+
+            remote_id = params.get("id") if isinstance(params.get("id"), str) else uuidv7()
+            task = {
+                "id": remote_id,
+                "status": {"state": "working"},
+                "metadata": dict(params.get("metadata") or {}),
+            }
+            with mock._lock:
+                mock.tasks[remote_id] = task
+                mock.polls[remote_id] = 0
+            self._reply(request_id, task)
+
+        def _handle_get(self, request_id: Any, params: dict[str, Any], options: MockA2AOptions) -> None:
+            remote_id = str(params.get("id") or "")
+            with mock._lock:
+                task = mock.tasks.get(remote_id)
+                if task is None:
+                    self._fail(request_id, -32004, "Task not found", {"polymesh_code": "TASK_NOT_FOUND"})
+                    return
+                polls = mock.polls.get(remote_id, 0) + 1
+                mock.polls[remote_id] = polls
+                state = task.get("status", {}).get("state")
+                if state not in {"completed", "failed", "canceled"}:
+                    if polls > int(options.drop_polls):
+                        task["status"] = {"state": options.terminal_state, "progress": 1.0}
+                        if options.terminal_state == "failed":
+                            task["status"]["error"] = options.terminal_error or {
+                                "code": "EXECUTION_FAILED",
+                                "message": "remote handler failed",
+                            }
+                        else:
+                            task["artifacts"] = [
+                                {
+                                    "name": "result",
+                                    "parts": [{"type": "data", "data": options.complete_result}],
+                                }
+                            ]
+                    else:
+                        task["status"] = {"state": "working", "progress": min(0.9, polls * 0.1)}
+                snapshot = json.loads(json.dumps(task))
+            self._reply(request_id, snapshot)
+
+        def _handle_cancel(self, request_id: Any, params: dict[str, Any]) -> None:
+            remote_id = str(params.get("id") or "")
+            with mock._lock:
+                task = mock.tasks.get(remote_id)
+                if task is None:
+                    self._fail(request_id, -32004, "Task not found", {"polymesh_code": "TASK_NOT_FOUND"})
+                    return
+                task["status"] = {"state": "canceled"}
+                snapshot = json.loads(json.dumps(task))
+            self._reply(request_id, snapshot)
+
+    return Handler
 
 
-async def _respond(send: Any, status: int, body: Mapping[str, Any]) -> None:
-    payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    await send(
-        {
-            "type": "http.response.start",
-            "status": status,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(payload)).encode("latin-1")),
-            ],
-        }
-    )
-    await send({"type": "http.response.body", "body": payload})
-
-
-__all__ = ["DEFAULT_URL", "MockA2AServer"]
+__all__ = ["MockA2AOptions", "MockA2AServer", "create_mock_a2a_server"]

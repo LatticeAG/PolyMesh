@@ -207,7 +207,6 @@ class A2AAdapter:
             "state": event["state"],
             "a2a_state": event["a2a_state"],
             "poll_count": poll_count,
-            "event_seq": self.event_log.last_seq(task_id) + 1,
             "cached": False,
         }
         if "result" in event:
@@ -215,13 +214,14 @@ class A2AAdapter:
         if event.get("error") is not None:
             result["error"] = event["error"]
 
-        self.event_log.append(
+        terminal_event = self.event_log.append(
             task_id,
             "outbound.terminal",
             state=event["state"],
             terminal=True,
             payload=result.get("error") or result.get("result"),
         )
+        result["event_seq"] = terminal_event["event_seq"]
         self.idempotency.complete(keys.dedup_key, result)
         return result
 

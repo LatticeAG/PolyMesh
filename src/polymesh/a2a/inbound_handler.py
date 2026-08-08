@@ -1,8 +1,7 @@
-"""Inbound A2A ingress (``tasks/send``, ``tasks/get``, ``tasks/cancel``).
+"""Inbound A2A JSON-RPC handler -- M3.
 
-Deliberately unimplemented in M2: the outbound milestone ships no listening
-socket.  The inbound JSON-RPC surface, AgentCard publication, and rate-limit
-binding land in M3.
+The module exists in M2 so the package tree matches §E.1 and so callers get a
+coded failure instead of an ``ImportError`` if they wire inbound too early.
 """
 
 from __future__ import annotations
@@ -10,22 +9,26 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-_M3 = "M3"
+from .errors import A2ADialectError
+
+M3_MESSAGE = "inbound A2A serving arrives in M3; only the outbound path is implemented"
 
 
-class A2AInboundHandler:
-    """Placeholder for the M3 inbound JSON-RPC handler."""
+class InboundHandler:
+    """Placeholder for the inbound JSON-RPC surface (§A.8)."""
 
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        raise NotImplementedError(_M3)
+        self.enabled = False
+
+    async def handle(self, _request: Mapping[str, Any] | None = None) -> Any:
+        raise A2ADialectError("UNSUPPORTED_METHOD", M3_MESSAGE)
+
+    async def handle_card_request(self) -> Any:
+        raise A2ADialectError("UNSUPPORTED_METHOD", M3_MESSAGE)
 
 
-async def handle_json_rpc(_request: Mapping[str, Any], **_kwargs: Any) -> dict[str, Any]:
-    raise NotImplementedError(_M3)
+def create_inbound_handler(*args: Any, **kwargs: Any) -> InboundHandler:
+    return InboundHandler(*args, **kwargs)
 
 
-async def start_inbound_server(*_args: Any, **_kwargs: Any) -> None:
-    raise NotImplementedError(_M3)
-
-
-__all__ = ["A2AInboundHandler", "handle_json_rpc", "start_inbound_server"]
+__all__ = ["InboundHandler", "M3_MESSAGE", "create_inbound_handler"]

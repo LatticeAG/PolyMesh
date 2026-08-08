@@ -1,11 +1,10 @@
-"""PolyMesh v6 M2 — A2A outbound adapter tests."""
+"""PolyMesh v6 M2 - A2A outbound adapter tests (rewritten against real API)."""
 
 from __future__ import annotations
 
-import asyncio
+import json
 from typing import Any
 
-import httpx
 import pytest
 
 from polymesh.a2a import (
@@ -13,7 +12,6 @@ from polymesh.a2a import (
     A2AError,
     AdapterEventLog,
     ERROR_TABLE,
-    IdempotencyStore,
     MockA2AServer,
     MonotonicStateGate,
     TaskIdBijection,
@@ -23,6 +21,7 @@ from polymesh.a2a import (
     map_outbound_task_id,
     skill_name_from_capability_name,
 )
+from polymesh.a2a.errors import error_from_http_status, error_from_json_rpc
 from polymesh.a2a.poller import POLL_BASE_MS, POLL_MAX_MS
 from polymesh.protocol import uuidv7
 
@@ -37,45 +36,38 @@ class _FixedRng:
 
 @pytest.fixture
 def mock_server() -> MockA2AServer:
-    return MockA2AServer(states=["completed"], result={"ok": True})
+    # Defaults: drop_polls=0 (terminal on first poll), terminal_state="completed",
+    # complete_result={"ok": True}
+    return MockA2AServer()
 
 
 def _adapter(mock: MockA2AServer, **overrides: Any) -> A2AAdapter:
-    url = MockA2AServer.__dict__.get  # placate linters
-    del url
-    config = {
-        "outbound_enabled": True,
-        "trusted_endpoints": [mock.__class__.__module__ and "https://mock-a2a.test/a2a"],
-        **overrides,
-    }
-    # Prefer DEFAULT_URL from mock module
-    from polymesh.a2a.mock_server import DEFAULT_URL
+    config = {"outbound_enabled": True, "trusted_endpoints": [mock.url], **overrides}
+    return A2AAdapter(config, rng=_FixedRng(0.5))
 
-    config["trusted_endpoints"] = [DEFAULT_URL]
-    return A2AAdapter(config, transport=mock.transport(), rng=_FixedRng(0.5))
+
+def _send_count(mock: MockA2AServer) -> int:
+    return sum(1 for entry in mock.requests if entry.get("body", {}).get("method") == "tasks/send")
 
 
 @pytest.mark.asyncio
 async def test_outbound_send_mock_completion(mock_server: MockA2AServer) -> None:
-    from polymesh.a2a.mock_server import DEFAULT_URL
-
     adapter = _adapter(mock_server)
     result = await adapter.execute_outbound(
-        a2a_url=DEFAULT_URL,
+        a2a_url=mock_server.url,
         capability="org.polymesh.calendar.check",
         payload={"day": "2026-08-08"},
         task_id=uuidv7(),
-        deadline=__import__("time").time() * 1000 + 5000,
+        deadline_ms=_now_plus_ms(5000),
     )
-    assert result["status"] == "SUCCEEDED"
+    assert result["state"] == "SUCCEEDED"
     assert result["result"] == {"ok": True}
-    body = next(
-        entry["raw_body"]
-        for entry in mock_server.requests
-        if '"method":"tasks/send"' in entry["raw_body"] or '"method": "tasks/send"' in entry["raw_body"]
-    )
-    assert "calendar.check" in body
-    assert "org.polymesh.calendar.check" in body
+
+    # The wire carries the stripped skill name AND the full capability id in metadata
+    bodies = [json.dumps(entry.get("body", {})) for entry in mock_server.requests]
+    joined = "\n".join(bodies)
+    assert '"skill": "calendar.check"' in joined or '"skill":"calendar.check"' in joined
+    assert "org.polymesh.calendar.check" in joined
 
 
 def test_outbound_skill_name_strip() -> None:
@@ -112,28 +104,26 @@ def test_outbound_jitter_bounds() -> None:
 
 @pytest.mark.asyncio
 async def test_outbound_deadline(mock_server: MockA2AServer) -> None:
-    from polymesh.a2a.mock_server import DEFAULT_URL
-
-    mock_server.states = ["working"] * 50
+    # Keep the remote permanently non-terminal so the poller burns through the deadline
+    mock_server.set_options(drop_polls=1_000_000)
     now = {"t": 0}
 
     async def fake_sleep(seconds: float) -> None:
         now["t"] += int(seconds * 1000)
 
     adapter = A2AAdapter(
-        {"outbound_enabled": True, "trusted_endpoints": [DEFAULT_URL]},
-        transport=mock_server.transport(),
+        {"outbound_enabled": True, "trusted_endpoints": [mock_server.url]},
         sleep=fake_sleep,
         now_ms=lambda: now["t"],
         rng=_FixedRng(0.5),
     )
     with pytest.raises(A2AError) as exc:
         await adapter.execute_outbound(
-            a2a_url=DEFAULT_URL,
+            a2a_url=mock_server.url,
             capability="org.polymesh.agent.ping",
             payload={},
             task_id=uuidv7(),
-            deadline=800,
+            deadline_ms=800,
         )
     assert exc.value.code == "DEADLINE"
 
@@ -161,35 +151,35 @@ async def test_outbound_credential_allowlist() -> None:
 
 @pytest.mark.asyncio
 async def test_outbound_mesh_token_never_on_wire(mock_server: MockA2AServer) -> None:
-    from polymesh.a2a.mock_server import DEFAULT_URL
-
-    jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJtZXNoLXVzZXIifQ.signaturepartgoesherexx"
+    jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJtZXNoLWFnZW50Iiwicm9sZSI6Im93bmVyIn0.MTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5"
     adapter = _adapter(mock_server)
     await adapter.execute_outbound(
-        a2a_url=DEFAULT_URL,
+        a2a_url=mock_server.url,
         capability="org.polymesh.agent.ping",
         payload={"token": jwt, "note": f"Bearer {jwt}"},
         task_id=uuidv7(),
-        deadline=__import__("time").time() * 1000 + 5000,
+        deadline_ms=_now_plus_ms(5000),
     )
-    joined = "\n".join(mock_server.raw_bodies())
+    joined = json.dumps([entry.get("body", {}) for entry in mock_server.requests])
     assert jwt not in joined
     assert "[REDACTED]" in joined
-    assert adapter.get_redaction_log()
+    assert adapter.redactions
 
 
 def test_outbound_error_http_503() -> None:
-    from polymesh.a2a.errors import error_from_http_status
-
     err = error_from_http_status(503)
     assert err.code == "TARGET_UNAVAILABLE"
     assert err.retryable is True
     assert err.json_rpc_code == -32008
 
 
-def test_outbound_error_jsonrpc_auth() -> None:
-    from polymesh.a2a.errors import error_from_json_rpc
+def test_outbound_error_http_429() -> None:
+    err = error_from_http_status(429)
+    assert err.code == "RATE_LIMITED"
+    assert err.retryable is True
 
+
+def test_outbound_error_jsonrpc_auth() -> None:
     err = error_from_json_rpc(
         {"code": -32001, "message": "Authentication failed", "data": {"polymesh_code": "AUTHENTICATION_FAILED"}}
     )
@@ -200,22 +190,20 @@ def test_outbound_error_jsonrpc_auth() -> None:
 
 @pytest.mark.asyncio
 async def test_outbound_idempotency_cached(mock_server: MockA2AServer) -> None:
-    from polymesh.a2a.mock_server import DEFAULT_URL
-
     adapter = _adapter(mock_server)
     kwargs = {
-        "a2a_url": DEFAULT_URL,
+        "a2a_url": mock_server.url,
         "capability": "org.polymesh.calendar.check",
         "payload": {"day": "x"},
         "idempotency_key": "idem-1",
-        "deadline": __import__("time").time() * 1000 + 5000,
+        "deadline_ms": _now_plus_ms(5000),
     }
     first = await adapter.execute_outbound(task_id=uuidv7(), **kwargs)
-    sends_before = mock_server.send_count
+    sends_before = _send_count(mock_server)
     second = await adapter.execute_outbound(task_id=uuidv7(), **kwargs)
-    assert second["status"] == first["status"]
-    assert second.get("from_cache") is True
-    assert mock_server.send_count == sends_before
+    assert second["state"] == first["state"]
+    assert second.get("cached") is True
+    assert _send_count(mock_server) == sends_before
 
 
 def test_outbound_idempotency_fingerprint_excludes_task_id() -> None:
@@ -260,3 +248,9 @@ def test_outbound_event_log_cap() -> None:
     terminal = [e for e in events if e.get("terminal")]
     assert len(non_terminal) <= 1000
     assert len(terminal) == 1
+
+
+def _now_plus_ms(ms: int) -> int:
+    import time
+
+    return int(time.time() * 1000) + ms
