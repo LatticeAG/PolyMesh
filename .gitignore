@@ -13,6 +13,9 @@ AGENTS.md
 *prompt*.md
 *REVIEW*.md
 *review*.md
+*.err
+GROK-*.md
+.v6-rewrite/
 *.log
 *.tmp
 build/
