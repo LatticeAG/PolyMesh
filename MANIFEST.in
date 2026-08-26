@@ -1,0 +1,30 @@
+# PolyMesh - release artifact hygiene
+# Ship only the client library and its metadata. Prune dev-only content
+# so the sdist is clean (matches verify_release_artifacts.py gate).
+
+# Essentials auto-included by setuptools, but be explicit:
+include README.md
+include LICENSE
+include pyproject.toml
+include src/polymesh/py.typed
+
+# Package data (schemas live outside the package dir tree under src/polymesh/schemas)
+recursive-include src/polymesh *.json
+
+# Prune development-only directories that must never reach a release archive
+prune tests
+prune conformance
+prune docs
+prune scripts
+prune templategen
+prune templates
+prune packages
+prune .github
+prune node_modules
+
+# Prune VCS + build noise
+global-exclude __pycache__/*
+global-exclude *.py[cod]
+global-exclude *.map
+global-exclude *.tsbuildinfo
+global-exclude .DS_Store
