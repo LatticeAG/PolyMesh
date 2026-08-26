@@ -210,8 +210,8 @@ jobs:
           shopt -s nullglob
           assets=(release-artifacts/npm/*.tgz release-artifacts/python/*.whl)
           test "${#assets[@]}" -gt 0
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          if gh release view "$RELEASE_TAG" -R LatticeAG/PolyMesh >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber -R LatticeAG/PolyMesh
           else
-            gh release create "$RELEASE_TAG" "${assets[@]}" --target "$GITHUB_SHA" --generate-notes
+            gh release create "$RELEASE_TAG" "${assets[@]}" --target "$GITHUB_SHA" --generate-notes -R LatticeAG/PolyMesh
           fi
