@@ -37,12 +37,15 @@
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
+  <a href="#why-polymesh">Why PolyMesh</a> ·
   <a href="#packages">Packages</a> ·
   <a href="#speak-a2a-wire-vs-product">Speak A2A</a> ·
   <a href="docs/positioning.md">Positioning</a> ·
   <a href="#offline-re-route-demo">Offline demo</a> ·
   <a href="#how-it-works">How It Works</a> ·
-  <a href="#architecture">Architecture</a>
+  <a href="#configuration-precedence">Configuration</a> ·
+  <a href="#file-tree">File Tree</a> ·
+  <a href="#known-issues">Known Issues</a>
 </p>
 
 ---
@@ -52,6 +55,18 @@ PolyMesh is an open, local-first protocol for agents to declare capabilities and
 Built as the LatticeAG Poly series protocol layer. Works with any framework, any language, any runtime.
 
 Full competitive matrix, four locked positioning statements, honest limits, and FAQ: **[docs/positioning.md](docs/positioning.md)**.
+
+## Why PolyMesh
+
+- **Capability routing, not hardcoded addresses** - agents declare what they can do in Agent Cards; the broker dispatches tasks to registered capabilities across a changing membership set.
+- **Local-first, works offline** - the full task lifecycle runs over loopback WebSocket with no cloud, no accounts, no public endpoints. Three agents on a laptop can lose a worker mid-task and re-route to a peer (see [Offline demo](#offline-re-route-demo)).
+- **Framework-agnostic** - TypeScript broker/client/CLI plus a Python SDK speaking the same protocol, pinned by shared compatibility vectors. Any language, any runtime, any agent framework.
+- **Bounded tasks with verified lifecycle** - validated envelopes, contract-aligned payloads, accepted -> progress -> terminal completion or rejection. No fire-and-forget JSON over the wall.
+- **Security fails closed** - loopback-only by default for local dev; remote transport is explicitly configured WSS with mutual enrollment and TLS; mDNS is opt-in hints that convey no trust and never auto-enroll.
+
+### How PolyMesh is different
+
+MCP gave agents tools and A2A gave them a wire protocol between known endpoints. PolyMesh is the product layer above the wire: integrated capability routing, rooms, permissions, and offline re-route in one local-first runtime - while still speaking A2A as a leaf dialect where the ecosystem requires it. Full matrix and locked positioning: [docs/positioning.md](docs/positioning.md).
 
 ## Quick Start
 
@@ -172,6 +187,17 @@ defaults < TOML config file < environment variables < command-line flags
 
 Supported TOML sections are `[broker]`, `[client]`, and `[discovery]`. Keep credentials in the configured token file, not in command arguments, URLs, or source code.
 
+Verified defaults (from `polymesh config show` against the stock config):
+
+| Setting | Default |
+| --- | --- |
+| `broker.host` / `broker.port` | `127.0.0.1` / `7337` |
+| `client.default_timeout` | `60000` ms |
+| `client.reconnect` | `false` |
+| `discovery.mdns_enabled` | `false` (opt-in hints only) |
+
+Full command surface (from `polymesh --help`): `config show`, `start`, `connect`, `peers`, `capabilities`, `call`. `connect` also accepts `--gateway-url` / `--api-key` for the internet relay (see [PolyMesh Gateway](#polymesh-gateway)).
+
 ## Support Matrix
 
 | Capability | Status in v0.5.0 | Notes |
@@ -217,7 +243,7 @@ For the full architectural overview and dependency graph, see [ARCHITECTURE.md](
 
 ### Test Report
 
-36 TypeScript test suites (181 tests) + 69 Python tests pass against a shared compatibility vector suite that covers both v0.1 and `polymesh.0.2` profiles. See [TEST-REPORT.md](TEST-REPORT.md) for detailed coverage.
+41 TypeScript test files (262 tests) + 129 Python tests pass, including the shared compatibility vectors covering both v0.1 and `polymesh.0.2` profiles and the offline re-route conformance test. TypeScript typecheck (`tsc --noEmit`) is clean. See [TEST-REPORT.md](TEST-REPORT.md) for the per-file breakdown.
 
 ## Scope and Limitations
 
@@ -235,6 +261,32 @@ Gateway SSE is task-event observation, not general streaming or a topic system.
 
 Messaging bans and reviewer checklist: [docs/positioning.md](docs/positioning.md#messaging-bans).
 
+## File Tree
+
+```text
+polymesh/
+├── packages/
+│   ├── broker/            # @latticeag/polymesh-broker - WebSocket broker + registry
+│   ├── client/            # @latticeag/polymesh-client - SDK, CLI (polymesh), router
+│   ├── a2a/               # @latticeag/polymesh-a2a - A2A leaf dialect adapter
+│   └── gateway/           # @latticeag/polymesh-gateway - local v2 REST/SSE adapter
+├── templategen/packages/create-polymesh-app/  # starter generator (template/ has demo.js)
+├── src/polymesh/          # latticeag-polymesh - Python SDK
+├── tests/                 # 41 Vitest suites incl. compat vectors + offline re-route
+├── conformance/           # shared compatibility vectors (TS + Python)
+├── schemas/               # capability contract schemas
+├── scripts/               # incl. demo-offline-reroute.sh + offline-reroute/
+├── docs/                  # positioning.md + design docs
+├── ARCHITECTURE.md  TEST-REPORT.md  SECURITY.md  AGENTS.md
+└── docker-compose.yml     # Alice/Bob/broker process-boundary demo
+```
+
+## Known Issues
+
+- **better-sqlite3 needs a native rebuild on some machines** - if durable-store suites fail with `Module did not self-register`, run `npm rebuild better-sqlite3` inside `packages/broker` and re-run `npm test`. All failures observed to date were this environment issue, never protocol regressions.
+- **No hosted relay in this repository** - anything beyond loopback/WSS needs the separate [polymesh-gateway](#polymesh-gateway) deployment. This is intentional (local-first), not a missing feature.
+- **mDNS is hints only** - discovery conveys no trust and never auto-enrolls; WSS still requires explicit mutual enrollment.
+
 ## Development Feedback
 
 When reporting an issue, include the package versions, selected profile, redacted command output, and a minimal reproduction. Do not include runtime tokens, private keys, certificates, raw task data, or confidential specifications.
@@ -247,7 +299,9 @@ PolyMesh is released under the [MIT License](LICENSE). Built by [LatticeAG](http
 
 ### PolyMesh Gateway
 
-Want to take PolyMesh beyond localhost? The [**PolyMesh Gateway**](https://github.com/LatticeAG/polymesh-gateway) is a Cloudflare Workers relay platform that connects agents across the internet.
+**Product vs infra, in one line: this repo is the product (protocol, broker, SDKs, local runtime). The gateway repo is the infra (hosted internet relay you deploy yourself).**
+
+Want to take PolyMesh beyond localhost? The [**polymesh-gateway**](https://github.com/LatticeAG/polymesh-gateway) is a separate Cloudflare Workers relay (Workers + D1 + one Durable Object per mesh) that connects agents across the internet. Same task envelopes and lifecycle events - only the transport changes.
 
 - **Agent meshes** — join named rooms with invite codes. Friends, dev teams, personal agents.
 - **Capability discovery** — find peers by what they can do, not just by address.
@@ -256,11 +310,16 @@ Want to take PolyMesh beyond localhost? The [**PolyMesh Gateway**](https://githu
 - **Direct WSS** — each agent connects its own socket. No broker bridge needed.
 
 ```bash
-# Boot a gateway relay
+# Deploy your own relay (in a checkout of LatticeAG/polymesh-gateway)
 npx wrangler deploy
+```
 
-# From your agent (using the v5 SDK)
-client.connectGateway({ apiKey: "pmgk_...", gatewayUrl: "wss://your-gateway.example.com" })
+```ts
+// From your agent (client.connectGateway supports apiKey + gatewayUrl)
+await client.connectGateway({
+  apiKey: "<pmgk_...>",
+  gatewayUrl: "wss://your-gateway.workers.dev",
+});
 ```
 
 See the [polymesh-gateway repo](https://github.com/LatticeAG/polymesh-gateway) for deployment, API docs, and full protocol spec.
