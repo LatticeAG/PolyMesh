@@ -283,7 +283,7 @@ polymesh/
 
 ## Known Issues
 
-- **better-sqlite3 needs a native rebuild on some machines** - if durable-store suites fail with `Module did not self-register`, run `npm rebuild better-sqlite3` inside `packages/broker` and re-run `npm test`. All failures observed to date were this environment issue, never protocol regressions.
+- **better-sqlite3 needs a native rebuild on some machines** - the broker's `postinstall` probes the native binding at install time and rebuilds it automatically when it fails to load. If durable-store suites still fail with `Module did not self-register` (e.g. a `node_modules` reused across a Node version change), run `npm rebuild better-sqlite3` inside `packages/broker` and re-run `npm test`. All failures observed to date were this environment issue, never protocol regressions.
 - **No hosted relay in this repository** - anything beyond loopback/WSS needs the separate [polymesh-gateway](#polymesh-gateway) deployment. This is intentional (local-first), not a missing feature.
 - **mDNS is hints only** - discovery conveys no trust and never auto-enrolls; WSS still requires explicit mutual enrollment.
 

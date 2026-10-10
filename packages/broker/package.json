@@ -8,7 +8,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "postinstall": "node -e \"try{new(require('better-sqlite3'))(':memory:')}catch(e){process.exit(1)}\" || npm rebuild better-sqlite3"
   },
   "exports": {
     ".": {
