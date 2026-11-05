@@ -83,10 +83,10 @@ The demo starts a local broker and client, exchanges a safe ping/pong, and exits
 For a process-boundary demonstration with multiple agents:
 
 ```bash
-docker compose up --build
+npm run demo:compose
 ```
 
-It prints the broker, Alice, and Bob lifecycle and exits when Alice receives Bob's echo result.
+It prints the broker, Alice, and Bob lifecycle and exits when Alice receives Bob's echo result. The script checks Docker daemon access first. On Linux, if `/var/run/docker.sock` denies access, ask an administrator to run `sudo usermod -aG docker "$USER"`, then log out and back in (or start a session with the new group). Alternatively, an administrator can grant the user read/write permission to the socket using the system's socket configuration. Docker group membership grants root-equivalent privileges. For a source checkout, run `npm ci` before the root `npm run demo` or `npm run demo:offline` commands.
 
 > **Experimental software**: Review [SECURITY.md](SECURITY.md) before exposing a listener or allowing any side-effecting capability. PolyMesh does not provide a hosted relay in this repository.
 

@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "build": "npm run build --workspace=@latticeag/polymesh-broker && npm run build --workspace=@latticeag/polymesh-client && npm run build --workspace=@latticeag/polymesh-gateway && npm run build --workspace=@latticeag/polymesh-a2a",
     "demo": "npm run build --workspace=@latticeag/polymesh-broker && npm run build --workspace=@latticeag/polymesh-client && npm run demo --prefix templategen/packages/create-polymesh-app/template",
-    "demo:offline": "./scripts/demo-offline-reroute.sh"
+    "demo:offline": "./scripts/demo-offline-reroute.sh",
+    "demo:compose": "./scripts/demo-compose.sh"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
