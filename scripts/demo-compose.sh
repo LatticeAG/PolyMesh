@@ -5,6 +5,10 @@ if ! command -v docker >/dev/null 2>&1; then
   echo 'Docker is required for the Compose demo.' >&2
   exit 1
 fi
+if ! docker compose version >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1; then
+  echo 'The Compose demo requires Docker Compose v2 and the Docker Buildx plugin; see README.md.' >&2
+  exit 1
+fi
 if ! output=$(docker info 2>&1); then
   echo 'Cannot connect to the Docker daemon:' >&2
   echo "$output" >&2
