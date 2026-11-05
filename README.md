@@ -78,7 +78,7 @@ npm install
 npm run demo
 ```
 
-The demo starts a local broker and client, exchanges a safe ping/pong, and exits cleanly.
+The generated project installs published PolyMesh packages and starts a local broker and client to exchange a safe ping/pong. In a source checkout, `npm ci && npm run demo` builds the workspace broker and client before running the template demo; remove any separately installed template `node_modules` to use the workspace packages.
 
 For a process-boundary demonstration with multiple agents:
 
