@@ -12,11 +12,9 @@ fi
 if docker buildx version >/dev/null 2>&1; then
   echo 'DEMO_BUILD_BACKEND=buildx'
 else
-  # Honest degraded path: no buildx plugin for this user or for root.
-  # Compose would otherwise warn that Bake is configured but unavailable.
   export COMPOSE_BAKE=false
-  echo 'DEMO_BUILD_BACKEND=classic'
-  echo 'buildx plugin unavailable; building with the classic Docker builder (COMPOSE_BAKE=false).' >&2
+  echo 'DEMO_BUILD_BACKEND=compose'
+  echo 'buildx plugin unavailable; using Compose builds without Bake (COMPOSE_BAKE=false).' >&2
 fi
 if ! output=$(docker info 2>&1); then
   echo 'Cannot connect to the Docker daemon:' >&2
