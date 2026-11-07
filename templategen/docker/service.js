@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Broker, createAgentCard, generateRuntimeToken } from "@latticeag/polymesh-broker";
 import { PolyMeshClient } from "@latticeag/polymesh-client";
 
-const runtimeDirectory = "/run/polymesh";
+const runtimeDirectory = process.env.POLYMESH_DEMO_RUNTIME_DIR || "/run/polymesh";
 const tokenFile = join(runtimeDirectory, "runtime-token");
 const brokerReadyFile = join(runtimeDirectory, "broker-ready");
 const bobReadyFile = join(runtimeDirectory, "bob-ready");

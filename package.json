@@ -9,6 +9,7 @@
     "templategen/packages/*"
   ],
   "scripts": {
+    "demo": "npm run build --workspace=@latticeag/polymesh-broker && npm run build --workspace=@latticeag/polymesh-client && node scripts/demo.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
