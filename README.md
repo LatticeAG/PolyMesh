@@ -78,9 +78,9 @@ npm install
 npm run demo
 ```
 
-The generated project installs published PolyMesh packages and starts a local broker and client to exchange a safe ping/pong. In a source checkout, `npm ci && npm run demo` builds the workspace broker and client before running the template demo; remove any separately installed template `node_modules` to use the workspace packages.
+The generated project installs published PolyMesh packages and starts a local broker and client to exchange a safe ping/pong; the repository root exposes that template run as `npm run demo:template`. In a source checkout, `npm ci && npm run demo` builds the workspace broker and client and runs a two-agent exchange in-process: the broker starts, Bob registers an echo capability, and Alice calls it, printing `DEMO RESULT: PASSED (two-agent echo)`. Remove any separately installed template `node_modules` before using `demo:template` with the workspace packages.
 
-For a process-boundary demonstration with multiple agents, use Docker Engine 24 or newer with the Compose v2 plugin (2.39 or newer) and the Buildx plugin installed. Check with `docker compose version` and `docker buildx version`. A missing Buildx plugin can cause Compose's Bake warning; install the plugin for your Docker distribution before running `docker compose build`.
+For a process-boundary demonstration with multiple agents, use Docker Engine 24 or newer with the Compose v2 plugin (2.39 or newer) and the Buildx plugin installed. Check with `docker compose version` and `docker buildx version`. If the Buildx plugin is missing, `npm run demo:compose` prints `DEMO_BUILD_BACKEND=classic`, sets `COMPOSE_BAKE=false`, and builds with the classic Docker builder instead of claiming Buildx support.
 
 From the repository root:
 
