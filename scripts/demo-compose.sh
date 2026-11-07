@@ -5,9 +5,18 @@ if ! command -v docker >/dev/null 2>&1; then
   echo 'Docker is required for the Compose demo.' >&2
   exit 1
 fi
-if ! docker compose version >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1; then
-  echo 'The Compose demo requires Docker Compose v2 and the Docker Buildx plugin; see README.md.' >&2
+if ! docker compose version >/dev/null 2>&1; then
+  echo 'The Compose demo requires Docker Compose v2; see README.md.' >&2
   exit 1
+fi
+if docker buildx version >/dev/null 2>&1; then
+  echo 'DEMO_BUILD_BACKEND=buildx'
+else
+  # Honest degraded path: no buildx plugin for this user or for root.
+  # Compose would otherwise warn that Bake is configured but unavailable.
+  export COMPOSE_BAKE=false
+  echo 'DEMO_BUILD_BACKEND=classic'
+  echo 'buildx plugin unavailable; building with the classic Docker builder (COMPOSE_BAKE=false).' >&2
 fi
 if ! output=$(docker info 2>&1); then
   echo 'Cannot connect to the Docker daemon:' >&2
