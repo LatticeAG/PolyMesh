@@ -3,8 +3,8 @@
  * (PM-V6-SPEC.md §D.3.6 observations, §E.4.6 demo-as-conformance-test).
  *
  * Spawns scripts/demo-offline-reroute.sh and asserts that all nine
- * normative OBSERVATION markers appear in stdout, strictly in order, and
- * that the final `DEMO RESULT: PASSED` line is present.
+ * observation markers appear in order, the skipped probe is labeled, and
+ * the routing result and isolation status are reported accurately.
  */
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -28,7 +28,7 @@ const EXPECTED_OBSERVATIONS = [
 
 describe("PolyMesh v6 M4 — offline re-route demo (§D.3.6)", () => {
   it(
-    "prints all nine normative observations in order and reports PASSED",
+    "reports routing observations and the actual isolation status",
     () => {
       const result = spawnSync("bash", [scriptPath], {
         cwd: root,
@@ -46,6 +46,17 @@ describe("PolyMesh v6 M4 — offline re-route demo (§D.3.6)", () => {
         result.status,
         `demo script exited non-zero.\n--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}`,
       ).toBe(0);
+
+      // The first marker is explicitly marked skipped: the script reports
+      // isolation separately and does not claim an outbound probe ran.
+      expect(result.stdout).toContain("SKIPPED: OBSERVATION 1/9:");
+      if (result.stdout.includes("PROOF_LEVEL=simulation")) {
+        expect(result.stdout).toContain("DEMO ISOLATION: UNVERIFIED (simulation)");
+        expect(combinedOutput).toContain("SKIPPED: Network isolation and outbound connectivity checks");
+      } else {
+        expect(result.stdout).toMatch(/PROOF_LEVEL=(network-namespace|docker-network-none)/);
+        expect(result.stdout).toContain("DEMO ISOLATION: VERIFIED");
+      }
 
       let previousIndex = -1;
       for (const marker of EXPECTED_OBSERVATIONS) {

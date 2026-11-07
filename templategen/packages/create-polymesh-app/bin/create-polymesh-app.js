@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { access, cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -39,6 +39,16 @@ async function createProject(targetArgument) {
   const destination = resolve(process.cwd(), targetArgument);
   if (await exists(destination)) {
     throw new Error(`Refusing to overwrite the existing path: ${destination}`);
+  }
+
+  for (const file of ["package.json", "README.md", "demo.js", "broker.js", "client.js"]) {
+    const source = resolve(templateDirectory, file);
+    try {
+      if (!(await stat(source)).isFile()) throw new Error("not a file");
+      await access(source);
+    } catch {
+      throw new Error(`Incomplete PolyMesh template: missing or unreadable ${source}. Reinstall the generator or restore the template source tree.`);
+    }
   }
 
   await mkdir(dirname(destination), { recursive: true });

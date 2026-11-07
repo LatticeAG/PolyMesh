@@ -55,26 +55,16 @@ demo itself.
 
 ## Offline-proof modes
 
-`scripts/demo-offline-reroute.sh` tries progressively weaker proofs that the
-demo runs without internet access, and documents on stdout which one fired:
+The script reports `PROOF_LEVEL=network-namespace` when the entire demo runs
+in a new network namespace, or `PROOF_LEVEL=docker-network-none` when it runs
+in a Docker container with networking disabled. The Docker image
+`node:24-bookworm-slim` must already be available locally.
 
-1. **`unshare -n`** — run a ping inside a fresh, interface-less network
-   namespace. Strongest proof when the sandbox permits creating namespaces
-   (requires `CAP_SYS_ADMIN` / unprivileged user namespaces).
-2. **`docker run --network none`** — run the ping (and, if available, the
-   *entire demo process*) inside a container with no network stack at all.
-   This is the default in most sandboxed CI/dev-container environments where
-   `unshare -n` is not permitted.
-3. **Offline-simulation fallback** — if neither is available, the script
-   sets `POLYMESH_OFFLINE_MODE=simulation` and documents that the demo
-   process itself never opens a socket (loopback/in-process only); the
-   demo's own internal check (§D.3.6 observation 9) is the substitute proof.
-
-When Docker is usable, the script runs the **whole demo** (not just the
-proof step) inside a `--network none` container using `node:24-bookworm-slim`
-with the repo and `node_modules` bind-mounted, which is the strongest
-available proof in this workspace: the demo process has no network stack for
-its entire lifetime.
+When neither isolation method is available, `PROOF_LEVEL=simulation` and
+`DEMO ISOLATION: UNVERIFIED` explicitly indicate that the host process was
+not network-isolated. The routing checks still run and report their result.
+The outbound connectivity probe is skipped in all modes; isolation is assessed
+by the mechanism used to run the entire process.
 
 ## Files
 

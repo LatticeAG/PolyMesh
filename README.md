@@ -78,15 +78,17 @@ npm install
 npm run demo
 ```
 
-The demo starts a local broker and client, exchanges a safe ping/pong, and exits cleanly.
+The generated project installs published PolyMesh packages and starts a local broker and client to exchange a safe ping/pong; the repository root exposes that template run as `npm run demo:template`. In a source checkout, `npm ci && npm run demo` builds the workspace broker and client and runs a two-agent exchange in separate local processes: the broker starts, Bob registers an echo capability, and Alice calls it, printing `DEMO RESULT: PASSED (two-agent echo)`. Remove any separately installed template `node_modules` before using `demo:template` with the workspace packages.
 
-For a process-boundary demonstration with multiple agents:
+For a container demonstration with multiple agents, use Docker Engine 24 or newer and the Compose v2 plugin (2.39 or newer). The project `.env` disables Compose Bake by default, so direct Compose commands also work without a Buildx plugin. This setting controls Compose's build orchestration; Docker selects the underlying builder. Set `COMPOSE_BAKE=true` in the environment to opt in to Bake when Buildx is installed. The demo script falls back to Compose builds if Buildx is unavailable.
+
+From the repository root:
 
 ```bash
-docker compose up --build
+npm run demo:compose
 ```
 
-It prints the broker, Alice, and Bob lifecycle and exits when Alice receives Bob's echo result.
+It prints the broker, Alice, and Bob lifecycle and exits when Alice receives Bob's echo result. The script checks Docker daemon access first. On Linux, if `/var/run/docker.sock` denies access, ask an administrator to run `sudo usermod -aG docker "$USER"`, then log out and back in (or start a session with the new group). Alternatively, an administrator can grant the user read/write permission to the socket using the system's socket configuration. Docker group membership grants root-equivalent privileges. For a source checkout, run `npm ci` before the root `npm run demo` or `npm run demo:offline` commands.
 
 > **Experimental software**: Review [SECURITY.md](SECURITY.md) before exposing a listener or allowing any side-effecting capability. PolyMesh does not provide a hosted relay in this repository.
 

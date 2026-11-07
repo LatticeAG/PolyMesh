@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { Broker, createAgentCard, generateRuntimeToken } from "@latticeag/polymesh-broker";
 import { PolyMeshClient } from "@latticeag/polymesh-client";
 
-const runtimeDirectory = "/run/polymesh";
+const runtimeDirectory = process.env.POLYMESH_DEMO_RUNTIME_DIR || "/run/polymesh";
 const tokenFile = join(runtimeDirectory, "runtime-token");
+const portFile = join(runtimeDirectory, "broker-port");
 const brokerReadyFile = join(runtimeDirectory, "broker-ready");
 const bobReadyFile = join(runtimeDirectory, "bob-ready");
 const completedFile = join(runtimeDirectory, "demo-complete");
@@ -56,6 +57,7 @@ async function resetRuntimeDirectory() {
   await mkdir(runtimeDirectory, { recursive: true, mode: 0o700 });
   await Promise.all([
     rm(tokenFile, { force: true }),
+    rm(portFile, { force: true }),
     rm(brokerReadyFile, { force: true }),
     rm(bobReadyFile, { force: true }),
     rm(completedFile, { force: true }),
@@ -63,10 +65,10 @@ async function resetRuntimeDirectory() {
   ]);
 }
 
-function developmentClient(card, token, handlers = {}) {
+function developmentClient(card, token, port, handlers = {}) {
   return new PolyMeshClient({
     card,
-    url: "ws://127.0.0.1:7337/polymesh",
+    url: `ws://127.0.0.1:${port}/polymesh`,
     token,
     allowInsecureLoopbackDevelopment: true,
     handlers,
@@ -80,13 +82,14 @@ async function runBroker() {
   await writeFile(tokenFile, `${token}\n`, { mode: 0o600 });
   const broker = new Broker({
     host: "127.0.0.1",
-    port: 7337,
+    port: 0,
     token,
     allowInsecureLoopbackDevelopment: true,
   });
 
   try {
     await broker.start();
+    await writeFile(portFile, `${broker.port}\n`, { mode: 0o600 });
     await writeMarker(brokerReadyFile);
     process.stdout.write("[broker] ready on its development-only loopback endpoint\n");
     const outcome = await waitForAny([completedFile, failedFile]);
@@ -99,7 +102,7 @@ async function runBroker() {
     await broker.close();
     // The token is runtime-only and is removed even when the named Docker
     // volume survives after the demonstration exits.
-    await Promise.all([rm(tokenFile, { force: true }), rm(brokerReadyFile, { force: true })]);
+    await Promise.all([rm(tokenFile, { force: true }), rm(portFile, { force: true }), rm(brokerReadyFile, { force: true })]);
   }
 }
 
@@ -116,6 +119,7 @@ async function runBob() {
         capabilities: [{ id: "org.example.echo", version: "1.0.0" }],
       }),
       token,
+      (await readFile(portFile, "utf8")).trim(),
       {
         "org.example.echo": (input) => {
           const message = typeof input.message === "string" ? input.message : "";
@@ -146,7 +150,7 @@ async function runAlice() {
     if (await fileExists(failedFile)) throw new Error("broker did not become ready");
     await waitForAny([bobReadyFile, failedFile]);
     if (await fileExists(failedFile)) throw new Error("bob did not become ready");
-    client = developmentClient(createAgentCard({ agent_id: "com.example.alice" }), await readToken());
+    client = developmentClient(createAgentCard({ agent_id: "com.example.alice" }), await readToken(), (await readFile(portFile, "utf8")).trim());
     await client.connect();
     process.stdout.write("[alice] calling bob's echo capability\n");
     const result = await client.call("com.example.bob", "org.example.echo", { message: "hello from alice" });
